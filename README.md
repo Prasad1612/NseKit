@@ -1,4 +1,4 @@
-# NseData
+# NseKit
 
 A Python package to fetch data from the National Stock Exchange (NSE) of India, including market data, IPOs, indices, and more.
 
@@ -8,7 +8,7 @@ A Python package to fetch data from the National Stock Exchange (NSE) of India, 
 pip install NseKit
 ```
 
-## Usage
+## Useage (Useage.py)
 
 ```python
 from NseKit import Nse
@@ -31,7 +31,6 @@ print(nifty_data)
 ## Requirements
 
 - Python 3.7+
-- See `requirements.txt` for dependencies
 
 ## License
 
