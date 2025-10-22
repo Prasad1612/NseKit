@@ -166,10 +166,12 @@ class Nse:
 
     def nse_is_market_open(self, market: str = "Capital Market") -> Text:
         """
-        Fetch NSE Market Status and return a Rich Text object with colored formatting.
-
-        Open → green, Closed → red
+        Fetch NSE Market Status and return a Rich Text object with segmented color formatting.
+        
+        Example output:
+        [Capital Market] → Normal Market has Closed (red) | Status: Open (green)
         """
+
         self.rotate_user_agent()
 
         ref_url = "https://www.nseindia.com/market-data/live-equity-market"
@@ -190,21 +192,33 @@ class Nse:
             selected = next((m for m in markets if m.get("market") == market), None)
 
             if not selected:
-                text = Text(f"[{market}] → Market data not found.", style="bold yellow")
-                return text
+                return Text(f"[{market}] → Market data not found.", style="bold yellow")
 
-            status = selected.get('marketStatus', '').lower()
-            message = selected.get('marketStatusMessage', '')
+            status = selected.get('marketStatus', '').strip()
+            message = selected.get('marketStatusMessage', '').strip()
 
-            if "open" in status:
-                text = Text(f"[{market}] → {message} | Status: {selected.get('marketStatus')}", style="bold green")
+            # Create a styled Text object
+            text = Text(f"[{market}] → ", style="bold white")
+
+            # Add message (red if contains 'Closed' or 'Halted')
+            if any(word in message.lower() for word in ["closed", "halted", "suspended"]):
+                text.append(message, style="bold red")
             else:
-                text = Text(f"[{market}] → {message} | Status: {selected.get('marketStatus')}", style="bold red")
+                text.append(message, style="bold green")
+
+            # text.append(" | Today's Market: ", style="bold white")
+
+            # # Add status (green if open, red otherwise)
+            # if "open" in status.lower():
+            #     text.append(status, style="bold green")
+            # else:
+            #     text.append(status, style="bold red")
 
             return text
 
         except Exception as e:
             return Text(f"Error fetching NSE Market Status: {e}", style="bold red")
+
 
     def nse_trading_holidays(self, list_only=False):
         self.rotate_user_agent()
@@ -3555,29 +3569,405 @@ class Nse:
             return df if not df.empty else None
         except (requests.RequestException, ValueError):
             return None
+    
 
-    def fno_expiry_dates(self,symbol="NIFTY"):
+
+    def fno_live_most_active_underlying(self):
+        """
+        Fetches most active F&O underlyings from NSE.
+        Renames, drops unnecessary columns, and reorders cleanly.
+        """
         self.rotate_user_agent()
+
+        ref_url = 'https://www.nseindia.com/market-data/most-active-underlying'
+        ref = requests.get(ref_url, headers=self.headers)
+
+        url = 'https://www.nseindia.com/api/live-analysis-most-active-underlying'
+        try:
+            response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
+            response.raise_for_status()
+            data = response.json()
+
+            df = pd.DataFrame(data['data'])
+            if df.empty:
+                return None
+
+            # --- Rename columns to readable short names ---
+            df.rename(columns={
+                'symbol': 'Symbol',
+                'futVolume': 'Fut Vol (Cntr)',
+                'optVolume': 'Opt Vol (Cntr)',
+                'totVolume': 'Total Vol (Cntr)',
+                'futTurnover': 'Fut Val (₹ Lakhs)',
+                'preTurnover': 'Opt Val (₹ Lakhs)(Premium)',
+                'totTurnover': 'Total Val (₹ Lakhs)',
+                'latestOI': 'OI (Cntr)',
+                'underlying': 'Underlying'
+            }, inplace=True)
+
+            # --- Drop unnecessary columns ---
+            df.drop(columns=[c for c in ['optTurnover'] if c in df.columns], inplace=True, errors='ignore')
+
+            # --- Reorder columns logically ---
+            ordered_cols = ['Symbol', 'Fut Vol (Cntr)', 'Opt Vol (Cntr)', 'Total Vol (Cntr)',
+                            'Fut Val (₹ Lakhs)', 'Opt Val (₹ Lakhs)(Premium)', 'Total Val (₹ Lakhs)',
+                            'OI (Cntr)', 'Underlying']
+            df = df[[c for c in ordered_cols if c in df.columns]]
+
+            # # --- Sort by Total Volume descending ---
+            # df.sort_values(by='Total Vol (Cntr)', ascending=False, inplace=True, ignore_index=True)
+
+            return df
+
+        except (requests.RequestException, ValueError, KeyError) as e:
+            print("⚠️ Error fetching most active underlyings:", e)
+            return None
+        
+
+    def fno_live_change_in_oi(self):
+
+        self.rotate_user_agent()
+
+        ref_url = 'https://www.nseindia.com/market-data/oi-spurts'
+        ref = requests.get(ref_url, headers=self.headers)
+
+        url = 'https://www.nseindia.com/api/live-analysis-oi-spurts-underlyings'
+        try:
+            response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
+            response.raise_for_status()
+            data = response.json()
+
+            df = pd.DataFrame(data['data'])
+            if df.empty:
+                return None
+
+            # --- Rename columns to readable short names ---
+            df.rename(columns={
+                'symbol'        : 'Symbol',
+                'latestOI'      : 'Latest OI',
+                'prevOI'        : 'Prev OI',
+                'changeInOI'    : 'chng in OI',
+                'avgInOI'       : 'chng in OI %',
+                'volume'        : 'Vol (Cntr)',
+                'futValue'      : 'Fut Val (₹ Lakhs)',
+                'premValue'     : 'Opt Val (₹ Lakhs)(Premium)',
+                'total'         : 'Total Val (₹ Lakhs)',
+                'underlyingValue': 'Price'
+            }, inplace=True)
+
+            # --- Drop unnecessary columns ---
+            df.drop(columns=[c for c in ['optValue'] if c in df.columns], inplace=True, errors='ignore')
+
+            # --- Reorder columns logically ---
+            ordered_cols = ['Symbol','Latest OI','Prev OI','chng in OI','chng in OI %','Vol (Cntr)',
+                            'Fut Val (₹ Lakhs)','Opt Val (₹ Lakhs)(Premium)','Total Val (₹ Lakhs)','Price']
+            df = df[[c for c in ordered_cols if c in df.columns]]
+
+            # # --- Sort by Total Volume descending ---
+            # df.sort_values(by='Total Vol (Cntr)', ascending=False, inplace=True, ignore_index=True)
+
+            return df
+
+        except (requests.RequestException, ValueError, KeyError) as e:
+            print("⚠️ Error fetching most active underlyings:", e)
+            return None
+
+    # def fno_expiry_dates(self, symbol="NIFTY"):
+    #     import requests
+    #     import pandas as pd
+    #     from datetime import datetime, time
+
+    #     # Rotate user agent
+    #     self.rotate_user_agent()
+    #     ref_url = 'https://www.nseindia.com/option-chain'
+    #     ref = requests.get(ref_url, headers=self.headers)
+    #     url = f'https://www.nseindia.com/api/option-chain-contract-info?symbol={symbol}'
+
+    #     try:
+    #         response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
+    #         data = response.json()
+    #         expiry_dates = pd.to_datetime(data['expiryDates'], format='%d-%b-%Y')
+    #         expiry_dates = pd.Series(expiry_dates)  # ensure Series for .iloc
+    #     except Exception as e:
+    #         print("Error:", e)
+    #         return None
+
+    #     # -------------------------------------------------
+    #     # Remove today's expiry if after 3:30 PM
+    #     # -------------------------------------------------
+    #     now = datetime.now()
+    #     if expiry_dates.iloc[0].date() == now.date() and now.time() > time(15, 30):
+    #         expiry_dates = expiry_dates.iloc[1:].reset_index(drop=True)
+
+    #     # -------------------------------------------------
+    #     # Identify Expiry Type: Weekly vs Monthly
+    #     # -------------------------------------------------
+    #     expiry_info = []
+    #     for i, date in enumerate(expiry_dates):
+    #         if i + 1 < len(expiry_dates):
+    #             next_month = expiry_dates.iloc[i + 1].month
+    #             expiry_type = "Monthly Expiry" if next_month != date.month else "Weekly Expiry"
+    #         else:
+    #             expiry_type = "Monthly Expiry"
+    #         expiry_info.append(expiry_type)
+
+    #     # -------------------------------------------------
+    #     # Build DataFrame
+    #     # -------------------------------------------------
+    #     df = pd.DataFrame({
+    #         "Expiry Date": expiry_dates.dt.strftime("%d-%b-%Y"),
+    #         "Expiry Type": expiry_info
+    #     })
+
+    #     # -------------------------------------------------
+    #     # Label Current, Next Weekly, Next Monthly
+    #     # -------------------------------------------------
+    #     df["Label"] = ""  # initialize
+
+    #     if len(df) > 0:
+    #         df.loc[0, "Label"] = "Current"
+
+    #     # Weekly expiry after current
+    #     weekly_idx = df[df["Expiry Type"] == "Weekly Expiry"].index
+    #     weekly_after_current = [i for i in weekly_idx if i > 0]  # first weekly after current
+    #     if weekly_after_current:
+    #         df.loc[weekly_after_current[0], "Label"] = "Next Week"
+
+    #     # Monthly expiry after current
+    #     monthly_idx = df[df["Expiry Type"] == "Monthly Expiry"].index
+    #     monthly_after_current = [i for i in monthly_idx if i > 0]  # first monthly after current
+    #     if monthly_after_current:
+    #         df.loc[monthly_after_current[0], "Label"] = "Month"
+
+    #     # -------------------------------------------------
+    #     # Add Days Remaining
+    #     # -------------------------------------------------
+    #     df["Days Remaining"] = (expiry_dates - pd.Timestamp(now.date())).dt.days
+
+    #     # -------------------------------------------------
+    #     # Add Contract Zone (Current Month / Next Month / Quarterly / Far Month)
+    #     # -------------------------------------------------
+    #     def contract_zone(expiry):
+    #         if expiry.month == now.month and expiry.year == now.year:
+    #             return "Current Month"
+    #         elif expiry.month == ((now.month % 12) + 1) and (expiry.year == now.year or expiry.year == now.year + 1):
+    #             return "Next Month"
+    #         elif expiry.month in [3, 6, 9, 12]:
+    #             return "Quarterly"
+    #         else:
+    #             return "Far Month"
+
+    #     df["Contract Zone"] = expiry_dates.apply(contract_zone)
+
+    #     # Reorder columns
+    #     return df[["Expiry Date", "Expiry Type", "Label", "Days Remaining", "Contract Zone"]]
+
+
+    # def fno_expiry_dates(self, symbol="NIFTY", label_filter=None):
+
+    #     from datetime import datetime, time
+
+    #     # Rotate user agent
+    #     self.rotate_user_agent()
+    #     ref_url = 'https://www.nseindia.com/option-chain'
+    #     ref = requests.get(ref_url, headers=self.headers)
+    #     url = f'https://www.nseindia.com/api/option-chain-contract-info?symbol={symbol}'
+
+    #     try:
+    #         response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
+    #         data = response.json()
+    #         expiry_dates = pd.to_datetime(data['expiryDates'], format='%d-%b-%Y')
+    #         expiry_dates = pd.Series(expiry_dates)
+    #     except Exception as e:
+    #         print("Error:", e)
+    #         return None
+
+    #     now = datetime.now()
+    #     if expiry_dates.iloc[0].date() == now.date() and now.time() > time(15, 30):
+    #         expiry_dates = expiry_dates.iloc[1:].reset_index(drop=True)
+
+    #     # Expiry Type
+    #     expiry_info = []
+    #     for i, date in enumerate(expiry_dates):
+    #         if i + 1 < len(expiry_dates):
+    #             next_month = expiry_dates.iloc[i + 1].month
+    #             expiry_type = "Monthly Expiry" if next_month != date.month else "Weekly Expiry"
+    #         else:
+    #             expiry_type = "Monthly Expiry"
+    #         expiry_info.append(expiry_type)
+
+    #     df = pd.DataFrame({
+    #         "Expiry Date": expiry_dates.dt.strftime("%d-%b-%Y"),
+    #         "Expiry Type": expiry_info
+    #     })
+
+    #     # Labels
+    #     df["Label"] = ""
+    #     if len(df) > 0:
+    #         df.loc[0, "Label"] = "Current"
+
+    #     weekly_idx = df[df["Expiry Type"] == "Weekly Expiry"].index
+    #     weekly_after_current = [i for i in weekly_idx if i > 0]
+    #     if weekly_after_current:
+    #         df.loc[weekly_after_current[0], "Label"] = "Next Week"
+
+    #     monthly_idx = df[df["Expiry Type"] == "Monthly Expiry"].index
+    #     monthly_after_current = [i for i in monthly_idx if i > 0]
+    #     if monthly_after_current:
+    #         df.loc[monthly_after_current[0], "Label"] = "Month"
+
+    #     df["Days Remaining"] = (expiry_dates - pd.Timestamp(now.date())).dt.days
+
+    #     # Contract Zone
+    #     def contract_zone(expiry):
+    #         if expiry.month == now.month and expiry.year == now.year:
+    #             return "Current Month"
+    #         elif expiry.month == ((now.month % 12) + 1) and (expiry.year == now.year or expiry.year == now.year + 1):
+    #             return "Next Month"
+    #         elif expiry.month in [3, 6, 9, 12]:
+    #             return "Quarterly"
+    #         else:
+    #             return "Far Month"
+
+    #     df["Contract Zone"] = expiry_dates.apply(contract_zone)
+
+    #     # Reorder
+    #     df = df[["Expiry Date", "Expiry Type", "Label", "Days Remaining", "Contract Zone"]]
+
+    #     # Filter by label if requested
+    #     if label_filter:
+    #         df = df[df["Label"] == label_filter].reset_index(drop=True)
+
+    #     return df
+
+
+    def fno_expiry_dates(self, symbol="NIFTY", label_filter="All"):
+        import requests
+        import pandas as pd
+        from datetime import datetime, time
+
+        # Rotate user agent
+        self.rotate_user_agent()
+
+        # Fetch NSE option-chain page (for cookies)
         ref_url = 'https://www.nseindia.com/option-chain'
         ref = requests.get(ref_url, headers=self.headers)
+
+        # API URL for expiry info
         url = f'https://www.nseindia.com/api/option-chain-contract-info?symbol={symbol}'
+
         try:
             response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
             data = response.json()
-            expiry_dates = pd.to_datetime(data['expiryDates'], format='%d-%b-%Y')
-        except Exception:
+            expiry_dates_raw = data.get('expiryDates') or data.get('records', {}).get('expiryDates')
+            if not expiry_dates_raw:
+                print(f"No expiry dates found for symbol: {symbol}")
+                return None
+
+            expiry_dates = pd.to_datetime(expiry_dates_raw, format='%d-%b-%Y')
+            expiry_dates = pd.Series(expiry_dates)
+
+        except Exception as e:
+            print("Error fetching expiry dates:", e)
             return None
 
-        # Remove today if after 3:30 PM
         now = datetime.now()
-        if expiry_dates[0].date() == now.date() and now.time() > time(15, 30):
-            expiry_dates = expiry_dates[1:]
+        # Remove today if after market close
+        if expiry_dates.iloc[0].date() == now.date() and now.time() > time(15, 30):
+            expiry_dates = expiry_dates.iloc[1:].reset_index(drop=True)
 
-        # Return only the expiry dates
+        # Identify Weekly vs Monthly expiry
+        expiry_info = []
+        for i, date in enumerate(expiry_dates):
+            if i + 1 < len(expiry_dates):
+                next_month = expiry_dates.iloc[i + 1].month
+                expiry_type = "Monthly Expiry" if next_month != date.month else "Weekly Expiry"
+            else:
+                expiry_type = "Monthly Expiry"
+            expiry_info.append(expiry_type)
+
         df = pd.DataFrame({
-            "Expiry Date": expiry_dates.strftime("%d-%b-%Y")
+            "Expiry Date": expiry_dates.dt.strftime("%d-%b-%Y"),
+            "Expiry Type": expiry_info
         })
-        return df
+
+        # Label Current, Next Week, Month
+        df["Label"] = ""
+        if len(df) > 0:
+            df.loc[0, "Label"] = "Current"
+
+        weekly_idx = df[df["Expiry Type"] == "Weekly Expiry"].index
+        weekly_after_current = [i for i in weekly_idx if i > 0]
+        if weekly_after_current:
+            df.loc[weekly_after_current[0], "Label"] = "Next Week"
+
+        monthly_idx = df[df["Expiry Type"] == "Monthly Expiry"].index
+        monthly_after_current = [i for i in monthly_idx if i > 0]
+        if monthly_after_current:
+            df.loc[monthly_after_current[0], "Label"] = "Month"
+
+        # Days remaining (optional)
+        df["Days Remaining"] = (expiry_dates - pd.Timestamp(now.date())).dt.days
+
+        # Contract Zone (optional)
+        def contract_zone(expiry):
+            if expiry.month == now.month and expiry.year == now.year:
+                return "Current Month"
+            elif expiry.month == ((now.month % 12) + 1) and (expiry.year == now.year or expiry.year == now.year + 1):
+                return "Next Month"
+            elif expiry.month in [3, 6, 9, 12]:
+                return "Quarterly"
+            else:
+                return "Far Month"
+
+        df["Contract Zone"] = expiry_dates.apply(contract_zone)
+        df = df[["Expiry Date", "Expiry Type", "Label", "Days Remaining", "Contract Zone"]]
+
+        # Return based on label_filter
+        if label_filter == "All":
+            # Only include labeled expiries: Current / Next Week / Month
+            df_labeled = df[df["Label"].isin(["Current", "Next Week", "Month"])]
+            return df_labeled["Expiry Date"].apply(lambda x: pd.to_datetime(x, format='%d-%b-%Y').strftime("%d-%m-%Y")).tolist()
+        else:
+            df_filtered = df[df["Label"] == label_filter].reset_index(drop=True)
+            if df_filtered.empty:
+                return None
+            return pd.to_datetime(df_filtered.loc[0, "Expiry Date"], format='%d-%b-%Y').strftime("%d-%m-%Y")
+
+
+
+    def fno_live_option_chain_raw(self, symbol: str, expiry_date: str = None):
+        # List of NSE indices
+        index_symbols = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"]
+
+        # Determine if the symbol is an index
+        indices = symbol.upper() in index_symbols
+
+        symbol = symbol.replace(' ', '%20').replace('&', '%26')
+        self.rotate_user_agent()
+        
+        ref_url = f'https://www.nseindia.com/get-quotes/derivatives?symbol={symbol}'
+        ref = requests.get(ref_url, headers=self.headers)
+        
+        url = f"https://www.nseindia.com/api/option-chain-{'indices' if indices else 'equities'}?symbol={symbol}"
+        
+        try:
+            payload = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10).json()
+            
+            # Filter by expiry_date if provided
+            if expiry_date:
+                payload['records']['data'] = [
+                    item for item in payload['records']['data'] if item['expiryDate'] == expiry_date
+                ]
+            
+            return payload
+        
+        except requests.exceptions.RequestException as e:
+            print(f"Request failed: {e}")
+            return None
+        except ValueError as e:
+            print(f"Failed to parse JSON: {e}")
+            return None
 
 
     def fno_live_option_chain(self, symbol: str, expiry_date: str = None, oi_mode: str = "full", indices: bool = False):

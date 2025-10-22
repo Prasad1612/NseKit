@@ -2,10 +2,11 @@
 #                                   NseKit
 #=====================================================================#
 
-import NseKit
+from NseKit import NseKit, Moneycontrol
 from rich.console import Console
 
 # Create NSE instance
+mc = Moneycontrol.MC()
 get = NseKit.Nse()
 rich = Console()
 
@@ -14,7 +15,7 @@ rich = Console()
 # # 🔹 Market Status
 # print(get.nse_market_status("Market Status"))             # "Market Status" "Mcap" "Nifty50" "Gift Nifty"
      
-# rich.print(get.nse_is_market_open("Capital Market"), "\n")       # "Capital Market" "Currency" "Commodity"    "Debt"  "currencyfuture"
+# rich.print(get.nse_is_market_open("Capital Market"), "\n") # "Capital Market" "Currency" "Commodity"    "Debt"  "currencyfuture"
 
 
 # # 🔹 Trading Holidays
@@ -309,15 +310,36 @@ rich = Console()
 # # 🔹 Most Active Options Contracts by Volume
 # print(get.fno_live_most_active_options_contracts_by_volume())  # Most active options by volume
 
+# # 🔹 Most Active Underlying
+# print(get.fno_live_most_active_underlying())                   # Most Active Underlying
 
-# # 🔹 Expiry Date
-# print(get.fno_expiry_dates())                               # Nifty Expiry Date
-# print(get.fno_expiry_dates("TCS"))                          # Expiry Date
+# # 🔹 Change in Open Interest
+# print(get.fno_live_change_in_oi())                             # Change in Open Interest
+
+
+# 🔹 Expiry Date
+# print(get.fno_expiry_dates())                                 # Nifty All Expiry Date
+# print(get.fno_expiry_dates("TCS"))                            # TCS All Expiry Date
+
+# print(get.fno_expiry_dates("NIFTY", "Current"))    # Nifty Current Expiry Date only → "28-10-2025"
+# print(get.fno_expiry_dates("NIFTY", "Next Week"))  # Nifty Next Week Expiry Date only → "04-11-2025"
+# print(get.fno_expiry_dates("NIFTY", "Month"))      # Nifty Month Expiry Date only → "25-11-2025"
+# print(get.fno_expiry_dates("NIFTY", "All"))        # → ["28-10-2025", "04-11-2025", "25-11-2025"]
+
+# print(get.fno_expiry_dates("TCS", "Current"))                 # TCS Current Expiry Date only
+# print(get.fno_expiry_dates("TCS", "Month"))                   # TCS Next Month Expiry Date only
+
+
+# # 🔹 Option Chain
+# print(get.fno_live_option_chain_raw("RELIANCE"))             # Option chain for a stock symbol
+# print(get.fno_live_option_chain_raw("NIFTY 50", indices=True))  # Option chain for an index
+# print(get.fno_live_option_chain_raw("RELIANCE", expiry_date="28-10-2025"))  # Option chain with specific expiry
+
 
 # # 🔹 Option Chain
 # print(get.fno_live_option_chain("RELIANCE"))             # Option chain for a stock symbol
 # print(get.fno_live_option_chain("NIFTY 50", indices=True))  # Option chain for an index
-# print(get.fno_live_option_chain("RELIANCE", expiry_date="30-10-2025"))  # Option chain with specific expiry
+# print(get.fno_live_option_chain("RELIANCE", expiry_date="28-10-2025"))  # Option chain with specific expiry
 # print(get.fno_live_option_chain("RELIANCE", oi_mode="compact"))  # Compact option chain data
 
 # # 🔹 Nifty Active Contracts
@@ -520,3 +542,17 @@ rich = Console()
 # # 🔹 SEBI Data (Paged Circulars)
 # print(get.sebi_data())                                  # Fetch latest SEBI circulars (default: 1 page)
 
+
+
+
+
+
+
+
+
+
+# #---------------------------------------------------------- Money control ----------------------------------------------------------
+
+# # 🔹 Advances/Declines data
+# print(mc.fetch_adv_dec("NIFTY 50"))                                  # Advances/Declines data
+# print(mc.fetch_adv_dec("NIFTY 500"))                                  # Advances/Declines data
