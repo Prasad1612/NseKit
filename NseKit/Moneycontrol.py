@@ -42,45 +42,47 @@ class MC:
     #---------------------------------------------------------------------------------------------------------------------------------------------------------        
 
     def fetch_adv_dec(self, index_name="NIFTY 50"):
-        """Fetch Advances/Declines data from Moneycontrol, human-like headers and sorted by HH:MM."""
-        if index_name == "NIFTY 50":
-            url = (
-                "https://www.moneycontrol.com/markets/indian-indices/chartData?"
-                "deviceType=web&subIndicesId=9&subIndicesName=NIFTY%2050&ex=N"
-                "&current_page=marketTerminal&bridgeId=in;NSX&classic=true"
-            )
-        elif index_name == "NIFTY 500":
-            url = (
-                "https://www.moneycontrol.com/markets/indian-indices/chartData?"
-                "deviceType=web&subIndicesId=7&subIndicesName=NIFTY%20500&ex=N"
-                "&current_page=marketTerminal&bridgeId=in;ncx&classic=true"
-            )
-        else:
-            raise ValueError("Unsupported index. Use 'NIFTY 50' or 'NIFTY 500'.")
+        """Fetch Advances/Declines data from Moneycontrol, sorted by HH:MM.
+        Returns a DataFrame or None if an error occurs.
+        """
+        try:
+            # ---------------------------
+            # URL Selection
+            # ---------------------------
+            if index_name == "NIFTY 50":
+                url = (
+                    "https://www.moneycontrol.com/markets/indian-indices/chartData?"
+                    "deviceType=web&subIndicesId=9&subIndicesName=NIFTY%2050&ex=N"
+                    "&current_page=marketTerminal&bridgeId=in;NSX&classic=true"
+                )
+            elif index_name == "NIFTY 500":
+                url = (
+                    "https://www.moneycontrol.com/markets/indian-indices/chartData?"
+                    "deviceType=web&subIndicesId=7&subIndicesName=NIFTY%20500&ex=N"
+                    "&current_page=marketTerminal&bridgeId=in;ncx&classic=true"
+                )
+            else:
+                return None
 
-        # Rotate UA before request
-        self.rotate_user_agent()
+            # ---------------------------
+            # Fetch & Parse
+            # ---------------------------
+            self.rotate_user_agent()
+            response = self.session.get(url, headers=self.headers, timeout=10)
+            response.raise_for_status()
 
-        response = self.session.get(url, headers=self.headers, timeout=10)
-        response.raise_for_status()
-        html_text = response.text
+            match = re.search(r"createAdcDecGraph\([^,]+,\s*'(\[.*?\])'\)", response.text, re.DOTALL)
+            if not match:
+                return None
 
-        # Extract JSON data from JS
-        pattern = r"createAdcDecGraph\([^,]+,\s*'(\[.*?\])'\)"
-        match = re.search(pattern, html_text, re.DOTALL)
-        if not match:
-            raise ValueError(f"Advances/Declines data not found for {index_name}.")
+            df = pd.DataFrame(json.loads(match.group(1)))
+            df['time'] = pd.to_datetime(df['time'], format='%H:%M', errors='coerce')
+            df = df.dropna(subset=['time']).sort_values('time').reset_index(drop=True)
+            df['time'] = df['time'].dt.strftime('%H:%M')
+            df = df[['time', 'advances', 'declines', 'unchanged']]
 
-        df = pd.DataFrame(json.loads(match.group(1)))
+            return df
 
-        # Convert to datetime for sorting
-        df['time'] = pd.to_datetime(df['time'], format='%H:%M')
-        df = df.sort_values('time').reset_index(drop=True)
-
-        # Keep only HH:MM format
-        df['time'] = df['time'].dt.strftime('%H:%M')
-
-        # Ensure column order
-        df = df[['time', 'advances', 'declines', 'unchanged']]
-
-        return df
+        except (requests.RequestException, ValueError, json.JSONDecodeError) as e:
+            print(f"Error fetching advances/declines for {index_name}: {e}")
+            return None

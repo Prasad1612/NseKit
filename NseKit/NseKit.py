@@ -2297,37 +2297,124 @@ class Nse:
             print(f"❌ Error fetching corporate announcements: {e}")
             return None
 
-    def cm_live_hist_corporate_action(self, from_date_str: str = None, to_date_str: str = None, filter: str = None):
+    def cm_live_hist_corporate_action(self, *args, from_date=None, to_date=None, period=None, symbol=None, filter=None):
+        """
+        Fetch corporate_action disclosures from NSE India.
+
+        Flexible calling patterns:
+        - cm_live_hist_corporate_action("RELIANCE")            -> symbol-only API (no dates)
+        - cm_live_hist_corporate_action()                      -> base API (no params)
+        - cm_live_hist_corporate_action(period="1M")           -> date-based (computed from period)
+        - cm_live_hist_corporate_action("01-10-2025","31-10-2025")
+        - cm_live_hist_corporate_action("RELIANCE","01-10-2025","31-10-2025")
+        - filter parameter applies a case-insensitive substring match on PURPOSE
+        """
+
+        import re
+        import time
+        import requests
+        import pandas as pd
+        from datetime import datetime, timedelta
+
+        date_pattern = re.compile(r"^\d{2}-\d{2}-\d{4}$")
+        today = datetime.now()
+        today_str = today.strftime("%d-%m-%Y")
+
+        # --- Auto-detect arguments --- #
+        for arg in args:
+            if isinstance(arg, str):
+                if date_pattern.match(arg):
+                    if not from_date:
+                        from_date = arg
+                    elif not to_date:
+                        to_date = arg
+                elif arg.upper() in ["1D", "1W", "1M", "3M", "6M", "1Y"]:
+                    period = arg.upper()
+                else:
+                    symbol = arg.upper()
+
+        # --- Rotate user-agent for reliability --- #
         self.rotate_user_agent()
-        
-        # Default date range (next 90 days)
-        if from_date_str is None:
-            from_date = datetime.now()
-            from_date_str = from_date.strftime("%d-%m-%Y")
-        if to_date_str is None:
-            to_date = datetime.now() + timedelta(days=90)
-            to_date_str = to_date.strftime("%d-%m-%Y")
 
-        # Reference URL for cookies
-        ref_url = 'https://www.nseindia.com/companies-listing/corporate-filings-actions'
-        ref = requests.get(ref_url, headers=self.headers)
+        # --- Reference URL for cookies/session setup --- #
+        ref_url = "https://www.nseindia.com/companies-listing/corporate-filings-actions"
 
+        # --- Decide which API to call ---
+        # 1) SYMBOL ONLY — no date/period provided
+        if symbol and not any([from_date, to_date, period]):
+            api_url = f"https://www.nseindia.com/api/corporates-corporateActions?index=equities&symbol={symbol}"
+
+        # 3) Otherwise, compute dates (from period or defaults) and include them
+        else:
+            # Compute from period if provided
+            if period:
+                delta_map = {
+                    "1D": timedelta(days=1),
+                    "1W": timedelta(weeks=1),
+                    "1M": timedelta(days=30),
+                    "3M": timedelta(days=90),
+                    "6M": timedelta(days=180),
+                    "1Y": timedelta(days=365),
+                }
+                delta = delta_map.get(period, timedelta(days=365))
+                from_date = (today - delta).strftime("%d-%m-%Y")
+                if not to_date:
+                    to_date = today_str
+
+            # Default date window if still missing
+            if not from_date:
+                from_date = (today - timedelta(days=1)).strftime("%d-%m-%Y")
+            if not to_date:
+                to_date = (today + timedelta(days=90)).strftime("%d-%m-%Y")
+
+            if symbol:
+                api_url = (
+                    f"https://www.nseindia.com/api/corporates-corporateActions?"
+                    f"index=equities&from_date={from_date}&to_date={to_date}&symbol={symbol}"
+                )
+            elif from_date and to_date:
+                api_url = (
+                    f"https://www.nseindia.com/api/corporates-corporateActions?"
+                    f"index=equities&from_date={from_date}&to_date={to_date}"
+                )
+            else:
+                api_url = "https://www.nseindia.com/api/corporates-corporateActions?index=equities"
+
+        # --- Fetch and process data --- #
         try:
-            url = f"https://www.nseindia.com/api/corporates-corporateActions?index=equities&from_date={from_date_str}&to_date={to_date_str}"
-            data_obj = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
-            
-            # Check if the response is valid
-            data_obj.raise_for_status()
-            json_data = data_obj.json()
-            
-            # Convert response to DataFrame
-            corp_action = pd.DataFrame(json_data)
+            # Step 1: get cookies/session
+            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
+            ref_response.raise_for_status()
 
-            # Apply filtering if needed
-            if filter is not None:
-                corp_action = corp_action[corp_action['subject'].str.contains(filter, case=False, na=False)]
-            
-            # Rename columns
+            # Step 2: request with simple retry logic
+            for attempt in range(3):
+                try:
+                    response = self.session.get(
+                        api_url,
+                        headers=self.headers,
+                        cookies=ref_response.cookies.get_dict(),
+                        timeout=15,
+                    )
+                    response.raise_for_status()
+                    break
+                except requests.RequestException as e:
+                    if attempt < 2:
+                        print(f"⚠️ Retry {attempt+1}/3 corporate action request... ({e})")
+                        time.sleep(2)
+                    else:
+                        raise
+
+            # Step 3: parse JSON (API sometimes returns dict with 'data' key)
+            data = response.json()
+            records = data.get("data") if isinstance(data, dict) else data
+
+            if not records or not isinstance(records, list):
+                print(f"ℹ️ No corporate actions found for {symbol or 'ALL'} with URL: {api_url}")
+                return None
+
+            df = pd.DataFrame(records)
+
+            # --- Clean and rename columns --- #
             column_mapping = {
                 "symbol": "SYMBOL",
                 "comp": "COMPANY NAME",
@@ -2337,25 +2424,36 @@ class Nse:
                 "exDate": "EX-DATE",
                 "recDate": "RECORD DATE",
                 "bcStartDate": "BOOK CLOSURE START DATE",
-                "bcEndDate": "BOOK CLOSURE END DATE"
+                "bcEndDate": "BOOK CLOSURE END DATE",
             }
-            corp_action = corp_action.rename(columns=column_mapping)
+            df.rename(columns=column_mapping, inplace=True)
 
-            # Reorder columns
-            column_order = [
-                "SYMBOL", "COMPANY NAME", "SERIES", "PURPOSE", "FACE VALUE",
-                "EX-DATE", "RECORD DATE", "BOOK CLOSURE START DATE", "BOOK CLOSURE END DATE"
+            # --- Optional filter on PURPOSE ---
+            if filter:
+                df = df[df["PURPOSE"].str.contains(filter, case=False, na=False)]
+
+            # --- Reorder and clean columns ---
+            col_order = [
+                "SYMBOL",
+                "COMPANY NAME",
+                "SERIES",
+                "PURPOSE",
+                "FACE VALUE",
+                "EX-DATE",
+                "RECORD DATE",
+                "BOOK CLOSURE START DATE",
+                "BOOK CLOSURE END DATE",
             ]
-            corp_action = corp_action[column_order]
+            df = df[[c for c in col_order if c in df.columns]]
+            df = df.fillna("").replace({float("inf"): "", float("-inf"): ""})
 
-            # Debug: Print the final number of records
-            # print(f"Final number of records in DataFrame: {len(corp_action)}")
+            # print(f"✅ Corporate Actions fetched: {len(df)} records for {symbol or 'ALL'}")
+            return df
 
-            return corp_action
-
-        except (requests.RequestException, ValueError) as e:
-            print(f"Error occurred: {str(e)}")
+        except (requests.RequestException, ValueError, KeyError) as e:
+            print(f"❌ Error fetching corporate actions: {e}")
             return None
+
 
     def cm_live_today_event_calendar(self, from_date=None, to_date=None):
         # --- Default date handling ---
@@ -3332,19 +3430,55 @@ class Nse:
     #---------------------------------------------------------- FnO_Live_Data ----------------------------------------------------------------
  
     #---------------------------------------------------------- futures ---------------------------------------------------------------------
-    def fno_live_futures_data(self, symbol, indices=False):
+    
+    def fno_live_futures_data(self, symbol):
+
+        # Index list to auto-detect index futures
+        index_list = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"]
+        indices = symbol.upper() in index_list
+
+        # Sanitize symbol
         symbol = symbol.replace(' ', '%20').replace('&', '%26')
         self.rotate_user_agent()
+
+        # Step 1️⃣: Fetch cookies from NSE ref page
         ref_url = f'https://www.nseindia.com/get-quotes/derivatives?symbol={symbol}'
         ref = requests.get(ref_url, headers=self.headers)
+
+        # Step 2️⃣: Get futures data
         try:
             url = f'https://www.nseindia.com/api/quote-derivative?symbol={symbol}'
-            data = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10).json()
-            lst = [i["metadata"] for i in data["stocks"] if i["metadata"]["instrumentType"] == ("Index Futures" if indices else "Stock Futures")]
+            response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
+            data = response.json()
+
+            # Step 3️⃣: Filter relevant futures and merge key trade info
+            lst = [
+                i["metadata"] | {
+                    "totalBuyQuantity": i["marketDeptOrderBook"]["totalBuyQuantity"],
+                    "totalSellQuantity": i["marketDeptOrderBook"]["totalSellQuantity"],
+                    "vmap": i["marketDeptOrderBook"]["tradeInfo"]["vmap"],
+                    "openInterest": i["marketDeptOrderBook"]["tradeInfo"]["openInterest"],
+                    "changeinOpenInterest": i["marketDeptOrderBook"]["tradeInfo"]["changeinOpenInterest"],
+                    "pchangeinOpenInterest": i["marketDeptOrderBook"]["tradeInfo"]["pchangeinOpenInterest"],
+                    "marketLot": i["marketDeptOrderBook"]["tradeInfo"]["marketLot"]
+                }
+                for i in data.get("stocks", [])
+                if i.get("metadata", {}).get("instrumentType") == (
+                    "Index Futures" if indices else "Stock Futures"
+                )
+            ]
+
+            # Step 4️⃣: Convert to DataFrame
+            if not lst:
+                print(f"No futures data found for {symbol}")
+                return None
+
             df = pd.DataFrame(lst)
-            df = df.set_index("identifier", drop=True)
+            df.set_index("identifier", inplace=True)
             return df
-        except (requests.RequestException, ValueError):
+
+        except (requests.RequestException, ValueError, KeyError) as e:
+            print(f"Error fetching futures data for {symbol}: {e}")
             return None
 
     def fno_live_most_active_futures_contracts(self, mode="Volume"):
@@ -3672,176 +3806,7 @@ class Nse:
             print("⚠️ Error fetching most active underlyings:", e)
             return None
 
-    # def fno_expiry_dates(self, symbol="NIFTY"):
-    #     import requests
-    #     import pandas as pd
-    #     from datetime import datetime, time
-
-    #     # Rotate user agent
-    #     self.rotate_user_agent()
-    #     ref_url = 'https://www.nseindia.com/option-chain'
-    #     ref = requests.get(ref_url, headers=self.headers)
-    #     url = f'https://www.nseindia.com/api/option-chain-contract-info?symbol={symbol}'
-
-    #     try:
-    #         response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
-    #         data = response.json()
-    #         expiry_dates = pd.to_datetime(data['expiryDates'], format='%d-%b-%Y')
-    #         expiry_dates = pd.Series(expiry_dates)  # ensure Series for .iloc
-    #     except Exception as e:
-    #         print("Error:", e)
-    #         return None
-
-    #     # -------------------------------------------------
-    #     # Remove today's expiry if after 3:30 PM
-    #     # -------------------------------------------------
-    #     now = datetime.now()
-    #     if expiry_dates.iloc[0].date() == now.date() and now.time() > time(15, 30):
-    #         expiry_dates = expiry_dates.iloc[1:].reset_index(drop=True)
-
-    #     # -------------------------------------------------
-    #     # Identify Expiry Type: Weekly vs Monthly
-    #     # -------------------------------------------------
-    #     expiry_info = []
-    #     for i, date in enumerate(expiry_dates):
-    #         if i + 1 < len(expiry_dates):
-    #             next_month = expiry_dates.iloc[i + 1].month
-    #             expiry_type = "Monthly Expiry" if next_month != date.month else "Weekly Expiry"
-    #         else:
-    #             expiry_type = "Monthly Expiry"
-    #         expiry_info.append(expiry_type)
-
-    #     # -------------------------------------------------
-    #     # Build DataFrame
-    #     # -------------------------------------------------
-    #     df = pd.DataFrame({
-    #         "Expiry Date": expiry_dates.dt.strftime("%d-%b-%Y"),
-    #         "Expiry Type": expiry_info
-    #     })
-
-    #     # -------------------------------------------------
-    #     # Label Current, Next Weekly, Next Monthly
-    #     # -------------------------------------------------
-    #     df["Label"] = ""  # initialize
-
-    #     if len(df) > 0:
-    #         df.loc[0, "Label"] = "Current"
-
-    #     # Weekly expiry after current
-    #     weekly_idx = df[df["Expiry Type"] == "Weekly Expiry"].index
-    #     weekly_after_current = [i for i in weekly_idx if i > 0]  # first weekly after current
-    #     if weekly_after_current:
-    #         df.loc[weekly_after_current[0], "Label"] = "Next Week"
-
-    #     # Monthly expiry after current
-    #     monthly_idx = df[df["Expiry Type"] == "Monthly Expiry"].index
-    #     monthly_after_current = [i for i in monthly_idx if i > 0]  # first monthly after current
-    #     if monthly_after_current:
-    #         df.loc[monthly_after_current[0], "Label"] = "Month"
-
-    #     # -------------------------------------------------
-    #     # Add Days Remaining
-    #     # -------------------------------------------------
-    #     df["Days Remaining"] = (expiry_dates - pd.Timestamp(now.date())).dt.days
-
-    #     # -------------------------------------------------
-    #     # Add Contract Zone (Current Month / Next Month / Quarterly / Far Month)
-    #     # -------------------------------------------------
-    #     def contract_zone(expiry):
-    #         if expiry.month == now.month and expiry.year == now.year:
-    #             return "Current Month"
-    #         elif expiry.month == ((now.month % 12) + 1) and (expiry.year == now.year or expiry.year == now.year + 1):
-    #             return "Next Month"
-    #         elif expiry.month in [3, 6, 9, 12]:
-    #             return "Quarterly"
-    #         else:
-    #             return "Far Month"
-
-    #     df["Contract Zone"] = expiry_dates.apply(contract_zone)
-
-    #     # Reorder columns
-    #     return df[["Expiry Date", "Expiry Type", "Label", "Days Remaining", "Contract Zone"]]
-
-
-    # def fno_expiry_dates(self, symbol="NIFTY", label_filter=None):
-
-    #     from datetime import datetime, time
-
-    #     # Rotate user agent
-    #     self.rotate_user_agent()
-    #     ref_url = 'https://www.nseindia.com/option-chain'
-    #     ref = requests.get(ref_url, headers=self.headers)
-    #     url = f'https://www.nseindia.com/api/option-chain-contract-info?symbol={symbol}'
-
-    #     try:
-    #         response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
-    #         data = response.json()
-    #         expiry_dates = pd.to_datetime(data['expiryDates'], format='%d-%b-%Y')
-    #         expiry_dates = pd.Series(expiry_dates)
-    #     except Exception as e:
-    #         print("Error:", e)
-    #         return None
-
-    #     now = datetime.now()
-    #     if expiry_dates.iloc[0].date() == now.date() and now.time() > time(15, 30):
-    #         expiry_dates = expiry_dates.iloc[1:].reset_index(drop=True)
-
-    #     # Expiry Type
-    #     expiry_info = []
-    #     for i, date in enumerate(expiry_dates):
-    #         if i + 1 < len(expiry_dates):
-    #             next_month = expiry_dates.iloc[i + 1].month
-    #             expiry_type = "Monthly Expiry" if next_month != date.month else "Weekly Expiry"
-    #         else:
-    #             expiry_type = "Monthly Expiry"
-    #         expiry_info.append(expiry_type)
-
-    #     df = pd.DataFrame({
-    #         "Expiry Date": expiry_dates.dt.strftime("%d-%b-%Y"),
-    #         "Expiry Type": expiry_info
-    #     })
-
-    #     # Labels
-    #     df["Label"] = ""
-    #     if len(df) > 0:
-    #         df.loc[0, "Label"] = "Current"
-
-    #     weekly_idx = df[df["Expiry Type"] == "Weekly Expiry"].index
-    #     weekly_after_current = [i for i in weekly_idx if i > 0]
-    #     if weekly_after_current:
-    #         df.loc[weekly_after_current[0], "Label"] = "Next Week"
-
-    #     monthly_idx = df[df["Expiry Type"] == "Monthly Expiry"].index
-    #     monthly_after_current = [i for i in monthly_idx if i > 0]
-    #     if monthly_after_current:
-    #         df.loc[monthly_after_current[0], "Label"] = "Month"
-
-    #     df["Days Remaining"] = (expiry_dates - pd.Timestamp(now.date())).dt.days
-
-    #     # Contract Zone
-    #     def contract_zone(expiry):
-    #         if expiry.month == now.month and expiry.year == now.year:
-    #             return "Current Month"
-    #         elif expiry.month == ((now.month % 12) + 1) and (expiry.year == now.year or expiry.year == now.year + 1):
-    #             return "Next Month"
-    #         elif expiry.month in [3, 6, 9, 12]:
-    #             return "Quarterly"
-    #         else:
-    #             return "Far Month"
-
-    #     df["Contract Zone"] = expiry_dates.apply(contract_zone)
-
-    #     # Reorder
-    #     df = df[["Expiry Date", "Expiry Type", "Label", "Days Remaining", "Contract Zone"]]
-
-    #     # Filter by label if requested
-    #     if label_filter:
-    #         df = df[df["Label"] == label_filter].reset_index(drop=True)
-
-    #     return df
-
-
-    def fno_expiry_dates(self, symbol="NIFTY", label_filter="All"):
+    def fno_expiry_dates(self, symbol="NIFTY", label_filter=None):
         import requests
         import pandas as pd
         from datetime import datetime, time
@@ -3906,10 +3871,10 @@ class Nse:
         if monthly_after_current:
             df.loc[monthly_after_current[0], "Label"] = "Month"
 
-        # Days remaining (optional)
+        # Days remaining
         df["Days Remaining"] = (expiry_dates - pd.Timestamp(now.date())).dt.days
 
-        # Contract Zone (optional)
+        # Contract Zone
         def contract_zone(expiry):
             if expiry.month == now.month and expiry.year == now.year:
                 return "Current Month"
@@ -3923,9 +3888,11 @@ class Nse:
         df["Contract Zone"] = expiry_dates.apply(contract_zone)
         df = df[["Expiry Date", "Expiry Type", "Label", "Days Remaining", "Contract Zone"]]
 
-        # Return based on label_filter
-        if label_filter == "All":
-            # Only include labeled expiries: Current / Next Week / Month
+        # ✅ Return based on label_filter
+        if label_filter is None:
+            # Return full expiry list (default case)
+            return df.reset_index(drop=True)
+        elif label_filter == "All":
             df_labeled = df[df["Label"].isin(["Current", "Next Week", "Month"])]
             return df_labeled["Expiry Date"].apply(lambda x: pd.to_datetime(x, format='%d-%b-%Y').strftime("%d-%m-%Y")).tolist()
         else:
@@ -3933,8 +3900,6 @@ class Nse:
             if df_filtered.empty:
                 return None
             return pd.to_datetime(df_filtered.loc[0, "Expiry Date"], format='%d-%b-%Y').strftime("%d-%m-%Y")
-
-
 
     def fno_live_option_chain_raw(self, symbol: str, expiry_date: str = None):
         # List of NSE indices
