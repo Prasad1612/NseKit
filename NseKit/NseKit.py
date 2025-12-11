@@ -1473,11 +1473,11 @@ class Nse:
         df.drop_duplicates(subset=["Date"], keep="last", inplace=True)
         df["Date"] = df["Date"].dt.strftime("%d-%b-%Y")
 
-        # --- Final Summary ---
-        if fail_chunks:
-            print(f"⚠️ {index}: {len(fail_chunks)} failed chunks → {fail_chunks}")
-        else:
-            print(f"✅ {index} data fetched successfully: {from_date} → {to_date}")
+        # # --- Final Summary ---
+        # if fail_chunks:
+        #     print(f"⚠️ {index}: {len(fail_chunks)} failed chunks → {fail_chunks}")
+        # else:
+        #     print(f"✅ {index} data fetched successfully: {from_date} → {to_date}")
 
         return df.reset_index(drop=True)
 
@@ -1652,11 +1652,11 @@ class Nse:
         df.drop_duplicates(subset=["Date"], keep="last", inplace=True)
         df["Date"] = df["Date"].dt.strftime("%d-%b-%Y")
 
-        # --- Print final summary ---
-        if fail_chunks:
-            print(f"⚠️ {symbol}: {len(fail_chunks)} failed chunks → {fail_chunks}")
-        else:
-            print(f"✅ {symbol} data fetched successfully: {from_date} → {to_date}")
+        # # --- Print final summary ---
+        # if fail_chunks:
+        #     print(f"⚠️ {symbol}: {len(fail_chunks)} failed chunks → {fail_chunks}")
+        # else:
+        #     print(f"✅ {symbol} data fetched successfully: {from_date} → {to_date}")
 
         return df.reset_index(drop=True)
 
