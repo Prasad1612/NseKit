@@ -120,8 +120,11 @@ rich = Console()
 # # 🔹 Nifty 50 Returns Summary
 # print(get.index_live_nifty_50_returns())                 # 1W–5Y Nifty Return %
 
-# # 🔹 Nifty 50 Contribution Data
-# print(get.index_live_nifty_50_contribution())            # Stock-wise Index Contribution
+# # 🔹 Index Contribution Data
+# print(get.index_live_contribution())                      # Nifty 50 Stock-wise Index Contribution
+# print(get.index_live_contribution("Full"))                # Nifty 50 Full Stock-wise Index Contribution
+# print(get.index_live_contribution("NIFTY IT"))            # Index Stock-wise Contribution
+# print(get.index_live_contribution("NIFTY IT","Full"))     # Index Full Stock-wise Index Contribution
 
 
 
@@ -370,7 +373,7 @@ rich = Console()
 # print(get.cm_eod_fii_dii_activity("Nse"))                # Latest FII/DII trading activity in NSE
 
 # # 🔹 Market Activity Report
-# print(get.cm_eod_market_activity_report("17-10-2025"))   # Market activity for specific date
+# print(get.cm_eod_market_activity_report("17-10-25"))   # Market activity for specific date
 
 # # 🔹 Bhavcopy with Delivery
 # print(get.cm_eod_bhavcopy_with_delivery("17-10-2025"))   # Full bhavcopy with delivery data

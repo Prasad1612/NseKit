@@ -689,6 +689,33 @@ class Nse:
             return data_df
         except (requests.RequestException, ValueError):
             return None
+        
+
+    def state_wise_registered_investors(self):
+        self.rotate_user_agent()  # Rotating User-Agent
+
+        ref_url = 'https://www.nseindia.com/registered-investors/'
+        api_url = "https://www.nseindia.com/api/registered-investors"
+
+        # --- Fetch & process ---
+
+        try:
+            # Get reference cookies from the main page
+            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
+            ref_response.raise_for_status()  # Ensure request was successful
+
+            # Make API call using cookies from the previous request
+            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
+            response.raise_for_status()  # Ensure request was successful
+
+            # Convert response to JSON
+            data = response.json()
+
+            return data
+
+        except (requests.RequestException, ValueError, KeyError) as e:
+            print(f"Error fetching data: {e}")
+            return None  
 
     #---------------------------------------------------------- IPO ----------------------------------------------------------------
 
@@ -1121,11 +1148,61 @@ class Nse:
             print(f"Error fetching all indices data: {e}")
             return None
 
-    def index_live_nifty_50_contribution(self):
-        self.rotate_user_agent()  # Rotating User-Agent
+    def index_live_contribution(self, *args, Index: str = "NIFTY 50", Mode: str = "First Five"):
+        """
+        Fetch index contribution data from NSE
 
-        ref_url = 'https://www.nseindia.com'
-        api_url = 'https://www.nseindia.com/api/NextApi/apiClient/indexTrackerApi?functionName=getContributionData&&index=NIFTY%2050'
+        Valid Calls:
+        -----------
+        index_live_contribution()
+        index_live_contribution("Full")
+        index_live_contribution("NIFTY BANK")
+        index_live_contribution("NIFTY BANK", "Full")
+        index_live_contribution(Index="NIFTY IT", Mode="Full")
+        """
+
+        # ----------------------------------
+        # Smart *args Resolver
+        # ----------------------------------
+        if len(args) == 1:
+            if args[0] in ("First Five", "Full"):
+                Mode = args[0]
+            else:
+                Index = args[0]
+
+        elif len(args) == 2:
+            Index, Mode = args
+
+        elif len(args) > 2:
+            raise ValueError("Max 2 positional arguments allowed")
+
+        # ----------------------------------
+        # Validation & Normalization
+        # ----------------------------------
+        Index = str(Index).upper()
+        Mode  = str(Mode)
+
+        if Mode not in ("First Five", "Full"):
+            raise ValueError("Mode must be 'First Five' or 'Full'")
+
+        index_encoded = Index.replace("&", "%26").replace(" ", "%20")
+
+        self.rotate_user_agent()
+        ref_url = "https://www.nseindia.com"
+
+        # ----------------------------------
+        # API URL Selection
+        # ----------------------------------
+        if Mode == "First Five":
+            api_url = (
+                "https://www.nseindia.com/api/NextApi/apiClient/indexTrackerApi"
+                f"?functionName=getContributionData&index={index_encoded}&flag=0"
+            )
+        else:
+            api_url = (
+                "https://www.nseindia.com/api/NextApi/apiClient/indexTrackerApi"
+                f"?functionName=getContributionData&index={index_encoded}&noofrecords=0&flag=1"
+            )
 
         try:
             # Get reference cookies from the main page
@@ -1157,6 +1234,7 @@ class Nse:
         except (requests.RequestException, ValueError, KeyError) as e:
             print(f"Error fetching all indices data: {e}")
             return None
+
         
     #---------------------------------------------------------- Index_Eod_Data ----------------------------------------------------------------
 
@@ -1275,43 +1353,53 @@ class Nse:
         return nse_df
     
     # sub function of def index_historical_data()
-    def get_index_data(self, index: str, from_date: str, to_date: str): 
-        index_data_columns = ['Date', 'INDEX_NAME', 'Open', 'High', 'Close', 'Low', 'Shares Traded', 'Turnover (₹ Cr)']
+    def get_index_data(self, index: str, from_date: str, to_date: str):
+        index_data_columns = ['Date', 'INDEX_NAME', 'Open', 'High', 'Low', 'Close', 'Shares Traded', 'Turnover (₹ Cr)']
+
         index = index.replace(' ', '%20').upper()
         ref_url = 'https://www.nseindia.com/reports-indices-historical-index-data'
         ref = requests.get(ref_url, headers=self.headers)
-        url = f"https://www.nseindia.com/api/historical/indicesHistory?indexType={index}&from={from_date}&to={to_date}"
-        
+        url = f"https://www.nseindia.com/api/historicalOR/indicesHistory?indexType={index}&from={from_date}&to={to_date}"
+
         try:
-            data_json = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict()).json()
-            data_close_df = pd.DataFrame(data_json['data']['indexCloseOnlineRecords']).drop(columns=['_id', 'EOD_TIMESTAMP'])
-            data_turnover_df = pd.DataFrame(data_json['data']['indexTurnoverRecords']).drop(columns=['_id', 'HIT_INDEX_NAME_UPPER'])
-            data_df = pd.merge(data_close_df, data_turnover_df, on='TIMESTAMP', how='inner')
+            data_json = self.session.get(
+                url,
+                headers=self.headers,
+                cookies=ref.cookies.get_dict()
+            ).json()
+
+            records = data_json.get("data", [])
+
+            if not isinstance(records, list) or len(records) == 0:
+                raise ValueError("Empty or invalid NSE index response")
+
+            df = pd.DataFrame(records)
+
         except Exception as e:
-            raise ValueError(f"Failed to fetch data from NSE API: {str(e)}")
-        
-        data_df.drop(columns='TIMESTAMP', inplace=True)
-        unwanted_str_list = ['FH_', 'EOD_', 'HIT_']
-        new_col = data_df.columns
-        for unwanted in unwanted_str_list:
-            new_col = [name.replace(unwanted, '') for name in new_col]
-        data_df.columns = new_col
-        
-        # Rename columns to match requested names
+            raise ValueError(f"Failed to fetch data from NSE API: {e}")
+
+        # Rename columns (new NSE format → standard format)
         column_mapping = {
-            'TIMESTAMP': 'Date',
-            'INDEX_NAME': 'INDEX_NAME',
-            'OPEN_INDEX_VAL': 'Open',
-            'HIGH_INDEX_VAL': 'High',
-            'LOW_INDEX_VAL': 'Low',
-            'CLOSE_INDEX_VAL': 'Close',
-            'TRADED_QTY': 'Shares Traded',
-            'TURN_OVER': 'Turnover (₹ Cr)'
+            'EOD_TIMESTAMP': 'Date',
+            'EOD_INDEX_NAME': 'INDEX_NAME',
+            'EOD_OPEN_INDEX_VAL': 'Open',
+            'EOD_HIGH_INDEX_VAL': 'High',
+            'EOD_LOW_INDEX_VAL': 'Low',
+            'EOD_CLOSE_INDEX_VAL': 'Close',
+            'HIT_TRADED_QTY': 'Shares Traded',
+            'HIT_TURN_OVER': 'Turnover (₹ Cr)'
         }
-        data_df = data_df.rename(columns=column_mapping)
-        # data_df['Date'] = pd.to_datetime(data_df['Date'], format='%d-%b-%Y')
-        
-        return data_df[index_data_columns]
+
+        df = df.rename(columns=column_mapping)
+
+        # # Convert Date
+        # df['Date'] = pd.to_datetime(df['Date'], format='%d-%b-%Y', errors='coerce')
+
+        # # Sort for time-series integrity
+        # df = df.sort_values('Date').reset_index(drop=True)
+
+        return df[index_data_columns]
+
 
     def index_pe_pb_div_historical_data(self, index: str, *args, from_date=None, to_date=None, period=None):
         """
@@ -5561,7 +5649,7 @@ class Nse:
                                 for rec in js["data"]:
                                     rec["FinancialYear"] = fin_year
                                 all_data.extend(js["data"])
-                                print(f"✅ {fin_year} data fetched ({len(js['data'])} records).")
+                                # print(f"✅ {fin_year} data fetched ({len(js['data'])} records).")
                             else:
                                 print(f"⚠️ No data in API for {fin_year}.")
                             break
@@ -6706,12 +6794,12 @@ class Nse:
                                 for rec in js:
                                     rec["FinancialYear"] = fin_year
                                 all_data.extend(js)
-                                print(f"✅ {fin_year} data fetched ({len(js)} records).")
+                                # print(f"✅ {fin_year} data fetched ({len(js)} records).")
                             elif "data" in js and isinstance(js["data"], list) and js["data"]:
                                 for rec in js["data"]:
                                     rec["FinancialYear"] = fin_year
                                 all_data.extend(js["data"])
-                                print(f"✅ {fin_year} data fetched ({len(js['data'])} records).")
+                                # print(f"✅ {fin_year} data fetched ({len(js['data'])} records).")
                             else:
                                 empty_fys.append(fin_year)
                                 print(f"⚠️ No data for {fin_year}.")
@@ -6754,7 +6842,7 @@ class Nse:
             df["Month"] = df["Month_dt"].dt.strftime('%b-%Y')  # keep display format
             df.drop(columns=["Month_dt"], inplace=True)
 
-            print(f"ℹ️ Data fetching complete from FY {from_year} to FY {to_year-1}.")
+            # print(f"ℹ️ Data fetching complete from FY {from_year} to FY {to_year-1}.")
             if empty_fys:
                 print(f"⚠️ No data found for FYs: {', '.join(empty_fys)}")
 
@@ -6931,3 +7019,54 @@ class Nse:
 
         return df
     
+    def quarterly_financial_results(self,symbol: str):
+        self.rotate_user_agent()  # Rotating User-Agent
+
+        ref_url = 'https://www.nseindia.com/'
+        api_url = f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi?functionName=getIntegratedFilingData&symbol={symbol}"
+
+        # --- Fetch & process ---
+
+        try:
+            # Get reference cookies from the main page
+            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
+            ref_response.raise_for_status()  # Ensure request was successful
+
+            # Make API call using cookies from the previous request
+            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
+            response.raise_for_status()  # Ensure request was successful
+
+            # Convert response to JSON
+            data = response.json()
+
+            return data
+
+        except (requests.RequestException, ValueError, KeyError) as e:
+            print(f"Error fetching data: {e}")
+            return None   
+        
+    def list_of_indices(self):
+        self.rotate_user_agent()  # Rotating User-Agent
+
+        ref_url = 'https://www.nseindia.com/'
+        api_url = f"https://www.nseindia.com/api/equity-master"
+
+        # --- Fetch & process ---
+
+        try:
+            # Get reference cookies from the main page
+            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
+            ref_response.raise_for_status()  # Ensure request was successful
+
+            # Make API call using cookies from the previous request
+            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
+            response.raise_for_status()  # Ensure request was successful
+
+            # Convert response to JSON
+            data = response.json()
+
+            return data
+
+        except (requests.RequestException, ValueError, KeyError) as e:
+            print(f"Error fetching data: {e}")
+            return None 
