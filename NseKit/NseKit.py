@@ -955,6 +955,40 @@ class Nse:
         except (requests.RequestException, ValueError, KeyError) as e:
             print(f"Error fetching Nifty Advance-Decline data: {e}")
             return None
+        
+    def pre_market_all_nse_adv_dec_info(self, category='All'):
+        pre_market_xref = {"NIFTY 50": "NIFTY", "Nifty Bank": "BANKNIFTY", "Emerge": "SME", "Securities in F&O": "FO", "Others": "OTHERS", "All": "ALL"}
+        
+        self.rotate_user_agent()
+        ref_url = 'https://www.nseindia.com/market-data/pre-open-market-cm-and-emerge-market'
+        
+        try:
+            ref = self.session.get(ref_url, headers=self.headers, timeout=10)
+            ref.raise_for_status()
+            
+            url = f"https://www.nseindia.com/api/market-data-pre-open?key={pre_market_xref.get(category, 'ALL')}"
+            response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            # Extract Advances, Declines, Unchanged & Timestamp
+            advances = data.get("advances", 0)
+            declines = data.get("declines", 0)
+            unchanged = data.get("unchanged", 0)
+            timestamp = data.get("timestamp", "Unknown")
+
+            # Create a single-row DataFrame
+            df = pd.DataFrame([{
+                "advances": advances,
+                "declines": declines,
+                "unchanged": unchanged,
+                "timestamp": timestamp
+            }])
+            return df
+        except (requests.RequestException, ValueError, KeyError) as e:
+            print(f"Error fetching All NSE Advance-Decline data: {e}")
+            return None
 
     def pre_market_info(self, category='All'):
         pre_market_xref = {"NIFTY 50": "NIFTY", "Nifty Bank": "BANKNIFTY", "Emerge": "SME", "Securities in F&O": "FO", "Others": "OTHERS", "All": "ALL"}
@@ -990,40 +1024,40 @@ class Nse:
             return df
         except (requests.RequestException, ValueError):
             return None
+        
+    def pre_market_derivatives_info(self, category='Index Futures'):
+        pre_market_xref = {"Index Futures": "FUTIDX", "Stock Futures": "FUTSTK"} 
 
-    def pre_market_all_nse_adv_dec_info(self, category='All'):
-        pre_market_xref = {"NIFTY 50": "NIFTY", "Nifty Bank": "BANKNIFTY", "Emerge": "SME", "Securities in F&O": "FO", "Others": "OTHERS", "All": "ALL"}
-        
         self.rotate_user_agent()
-        ref_url = 'https://www.nseindia.com/market-data/pre-open-market-cm-and-emerge-market'
-        
+        ref_url = 'https://www.nseindia.com/market-data/pre-open-market-fno'
+        ref = requests.get(ref_url, headers=self.headers)
+        url = f"https://www.nseindia.com/api/market-data-pre-open-fno?key={pre_market_xref[category]}"
         try:
-            ref = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref.raise_for_status()
-            
-            url = f"https://www.nseindia.com/api/market-data-pre-open?key={pre_market_xref.get(category, 'ALL')}"
             response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
             response.raise_for_status()
-            
-            data = response.json()
-            
-            # Extract Advances, Declines, Unchanged & Timestamp
-            advances = data.get("advances", 0)
-            declines = data.get("declines", 0)
-            unchanged = data.get("unchanged", 0)
-            timestamp = data.get("timestamp", "Unknown")
-
-            # Create a single-row DataFrame
-            df = pd.DataFrame([{
-                "advances": advances,
-                "declines": declines,
-                "unchanged": unchanged,
-                "timestamp": timestamp
-            }])
+            data = response.json()["data"]
+            processed_data = [{
+                "symbol": i["metadata"]["symbol"],
+                "expiryDate": i["metadata"]["expiryDate"],
+                "previousClose": i["metadata"]["previousClose"],
+                "iep": i["metadata"]["iep"],
+                "change": i["metadata"]["change"],
+                "pChange": i["metadata"]["pChange"],
+                "lastPrice": i["metadata"]["lastPrice"],
+                "finalQuantity": i["metadata"]["finalQuantity"],
+                "totalTurnover": i["metadata"]["totalTurnover"],
+                "totalBuyQuantity": i["detail"]["preOpenMarket"]["totalBuyQuantity"],
+                "totalSellQuantity": i["detail"]["preOpenMarket"]["totalSellQuantity"],
+                "atoBuyQty": i["detail"]["preOpenMarket"]["atoBuyQty"],
+                "atoSellQty": i["detail"]["preOpenMarket"]["atoSellQty"],
+                "lastUpdateTime": i["detail"]["preOpenMarket"]["lastUpdateTime"]
+            } for i in data]
+            df = pd.DataFrame(processed_data)
+            df = df.set_index("symbol", drop=False)
             return df
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching All NSE Advance-Decline data: {e}")
+        except (requests.RequestException, ValueError):
             return None
+
 
     #---------------------------------------------------------- Index_Live_Data ----------------------------------------------------------------
     
@@ -3841,6 +3875,93 @@ class Nse:
         except Exception as e:
             print(f"Error fetching futures data for {symbol}: {e}")
             return None
+        
+    def fno_live_top_20_derivatives_contracts(self, category='Stock Options'):
+        """
+        Fetch NSE live most active stock derivative contracts
+
+        category:
+        - 'Stock Options'
+        - 'Stock Futures'
+        """
+        contracts_xref = {"Stock Futures": "stock_fut", "Stock Options": "stock_opt"}
+        if category not in contracts_xref:
+            raise ValueError("Invalid category")
+             
+        self.rotate_user_agent()
+
+        ref_url = 'https://www.nseindia.com/market-data/equity-derivatives-watch'
+        ref = requests.get(ref_url, headers=self.headers)
+
+        url = f"https://www.nseindia.com/api/liveEquity-derivatives?index={contracts_xref[category]}"
+        try:
+            response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
+            response.raise_for_status()
+            data = response.json()
+
+            df = pd.DataFrame(data['data'])
+            if df.empty:
+                return None
+
+            # --- Rename columns to readable short names ---
+            df.rename(columns={
+            'underlying': 'Symbol',
+            'identifier': 'Contract ID',
+            'instrumentType': 'Instr Type',
+            'instrument': 'Segment',
+            'contract': 'Contract',
+            'expiryDate': 'Expiry',
+            'optionType': 'Option',
+            'strikePrice': 'Strike',
+            'lastPrice': 'LTP',
+            'change': 'Chg',
+            'pChange': 'Chg %',
+            'openPrice': 'Open',
+            'highPrice': 'High',
+            'lowPrice': 'Low',
+            'closePrice': 'Prev Close',
+            'volume': 'Volume (Cntr)',
+            'totalTurnover': 'Turnover (₹)',
+            'premiumTurnOver': 'Premium Turnover (₹)',
+            'underlyingValue': 'Underlying LTP',
+            'openInterest': 'OI (Cntr)',
+            'noOfTrades': 'Trades'
+            }, inplace=True)
+
+            # -----------------------------
+            # Convert ₹ to Crores
+            # -----------------------------
+            for col in ['Turnover (₹)', 'Premium Turnover (₹)']:
+                if col in df.columns:
+                    df[col] = (df[col] / 1e7).round(2)   # 1 Crore = 10,000,000
+
+            df.rename(columns={
+                'Turnover (₹)': 'Turnover (₹ Cr)',
+                'Premium Turnover (₹)': 'Premium Turnover (₹ Cr)'
+            }, inplace=True)
+
+            # -----------------------------
+            # Order columns logically
+            # -----------------------------
+            ordered_cols = [
+                'Segment','Symbol', 'Expiry',
+                'Option', 'Strike', 'Prev Close',
+                'LTP', 'Chg', 'Chg %',
+                'Open', 'High', 'Low',
+                'Volume (Cntr)', 'Trades', 'OI (Cntr)',
+                'Premium Turnover (₹ Cr)', 'Turnover (₹ Cr)',
+                'Contract', 'Contract ID', 'Underlying LTP'
+            ]
+
+            df = df[[c for c in ordered_cols if c in df.columns]]
+
+            return df
+
+        except (requests.RequestException, ValueError, KeyError) as e:
+            print("⚠️ Error fetching most active underlyings:", e)
+            return None
+
+
 
     def fno_live_most_active_futures_contracts(self, mode="Volume"):
         """
@@ -4080,6 +4201,84 @@ class Nse:
 
         except (requests.RequestException, ValueError, KeyError) as e:
             print("⚠️ Error fetching most active underlyings:", e)
+            return None
+
+
+    def fno_live_oi_vs_price(self):
+        self.rotate_user_agent()
+
+        ref_url = 'https://www.nseindia.com/market-data/oi-spurts'
+        ref = requests.get(ref_url, headers=self.headers)
+
+        url = 'https://www.nseindia.com/api/live-analysis-oi-spurts-contracts'
+
+        try:
+            response = self.session.get(
+                url,
+                headers=self.headers,
+                cookies=ref.cookies.get_dict(),
+                timeout=10
+            )
+            response.raise_for_status()
+            json_data = response.json()
+
+            rows = []
+
+            # -------------------------------
+            # FLATTEN NEW JSON STRUCTURE
+            # -------------------------------
+            for block in json_data.get("data", []):
+                for category, contracts in block.items():
+                    for c in contracts:
+                        c["OI_Price_Signal"] = category
+                        rows.append(c)
+
+            if not rows:
+                return None
+
+            df = pd.DataFrame(rows)
+
+            # -------------------------------
+            # RENAME COLUMNS
+            # -------------------------------
+            df.rename(columns={
+                'symbol'           : 'Symbol',
+                'instrument'       : 'Instrument',
+                'expiryDate'       : 'Expiry',
+                'optionType'       : 'Type',
+                'strikePrice'      : 'Strike',
+                'ltp'              : 'LTP',
+                'prevClose'        : 'Prev Close',
+                'pChange'          : '% Price Chg',
+                'latestOI'         : 'Latest OI',
+                'prevOI'           : 'Prev OI',
+                'changeInOI'       : 'Chg in OI',
+                'pChangeInOI'      : '% OI Chg',
+                'volume'           : 'Volume',
+                'turnover'         : 'Turnover ₹L',
+                'premTurnover'     : 'Premium ₹L',
+                'underlyingValue'  : 'Underlying Price'
+            }, inplace=True)
+
+            # -------------------------------
+            # ORDER COLUMNS (TRADING LOGIC)
+            # -------------------------------
+            ordered_cols = [
+                'OI_Price_Signal',
+                'Symbol', 'Instrument', 'Expiry', 'Type', 'Strike',
+                'LTP', '% Price Chg',
+                'Latest OI', 'Prev OI', 'Chg in OI', '% OI Chg',
+                'Volume',
+                'Turnover ₹L', 'Premium ₹L',
+                'Underlying Price'
+            ]
+
+            df = df[[c for c in ordered_cols if c in df.columns]]
+
+            return df
+
+        except Exception as e:
+            print("⚠️ OI Spurts Fetch Error:", e)
             return None
 
     def fno_expiry_dates(self, symbol="NIFTY", label_filter=None):
