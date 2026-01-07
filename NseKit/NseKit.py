@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import re
 import random
-import feedparser
 import warnings
 import csv
 import json
@@ -1117,9 +1116,11 @@ class Nse:
             df = df.set_index("symbol", drop=False)
 
             # If only the symbol list is required
+            # if list_only:
+            #     symbol_list = sorted(df.index.tolist())
+            #     return symbol_list
             if list_only:
-                symbol_list = sorted(df.index.tolist())
-                return symbol_list
+                return df["symbol"].tolist()            
 
             # Reorder columns as per your requirement
             column_order = [
@@ -1919,7 +1920,9 @@ class Nse:
                 "derivatives": data['securityInfo']['derivatives'],
                 "surveillance": data['securityInfo']['surveillance']['surv'],
                 "surveillanceDesc": data['securityInfo']['surveillance']['desc'],
-                "Facevalue": data['securityInfo']['faceValue']
+                "Facevalue": data['securityInfo']['faceValue'],
+                "TotalSharesIssued": data['securityInfo']['issuedSize']
+
             }
         except (requests.RequestException, ValueError):
             return None
@@ -1986,6 +1989,126 @@ class Nse:
             }
         except (requests.RequestException, ValueError):
             return None
+    
+
+    def cm_live_equity_full_info(self, symbol):
+        symbol = symbol.replace(" ", "%20").replace("&", "%26")
+        self.rotate_user_agent()
+
+        ref_url = f'https://www.nseindia.com/get-quotes/equity?symbol={symbol}'
+        api_url = (
+            "https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
+            f"?functionName=getSymbolData&marketType=N&series=EQ&symbol={symbol}"
+        )
+
+        try:
+            # Warm-up request
+            ref = self.session.get(ref_url, headers=self.headers, timeout=10)
+
+            response = self.session.get(
+                api_url,
+                headers=self.headers,
+                cookies=ref.cookies.get_dict(),
+                timeout=10
+            ).json()
+
+            equity = response.get("equityResponse", [])
+            if not equity:
+                return None
+
+            eq = equity[0]
+
+            meta   = eq.get("metaData", {})
+            trade  = eq.get("tradeInfo", {})
+            price  = eq.get("priceInfo", {})
+            sec    = eq.get("secInfo", {})
+            order  = eq.get("orderBook", {})
+
+            return {
+                # ================= BASIC =================
+                "Symbol": meta.get("symbol"),
+                "CompanyName": meta.get("companyName"),
+                "Index": sec.get("index"),
+                "ISIN": meta.get("isinCode"),
+                "Series": meta.get("series"),
+                "MarketType": meta.get("marketType"),
+                "BoardStatus": sec.get("boardStatus"),
+                "TradingSegment": sec.get("tradingSegment"),
+                "SecurityStatus": sec.get("secStatus"),
+
+                # ================= PRICE =================
+                "Open": meta.get("open"),
+                "DayHigh": meta.get("dayHigh"),
+                "DayLow": meta.get("dayLow"),
+                "PreviousClose": meta.get("previousClose"),
+                "LastTradedPrice": order.get("lastPrice"),
+                "closePrice": meta.get("closePrice"),
+                "Change": meta.get("change"),
+                "PercentChange": meta.get("pChange"),
+                "VWAP": meta.get("averagePrice"),
+
+                # ================= VOLUME =================
+                "TotalTradedVolume": trade.get("totalTradedVolume"),
+                "TotalTradedValue": trade.get("totalTradedValue"),
+                "Quantity raded": trade.get("quantitytraded"),
+                "DeliveryQty": trade.get("deliveryquantity"),
+                "DeliveryPercent": trade.get("deliveryToTradedQuantity"),
+                "ImpactCost": trade.get("impactCost"),                
+
+                # ================= CIRCUIT =================
+                "PriceBandRange": price.get("priceBand"),
+                "PriceBand": price.get("ppriceBand"),
+                "TickSize": price.get("tickSize"),
+                
+                # ================= ORDER BOOK =================
+                "Bid Price 1": order.get("buyPrice1"), "Bid Quantity 1": order.get("buyQuantity1"),
+                "Bid Price 2": order.get("buyPrice2"), "Bid Quantity 2": order.get("buyQuantity2"),
+                "Bid Price 3": order.get("buyPrice3"), "Bid Quantity 3": order.get("buyQuantity3"),
+                "Bid Price 4": order.get("buyPrice4"), "Bid Quantity 4": order.get("buyQuantity4"),
+                "Bid Price 5": order.get("buyPrice5"), "Bid Quantity 5": order.get("buyQuantity5"),
+
+                "Ask Price 1": order.get("sellPrice1"), "Ask Quantity 1": order.get("sellQuantity1"),
+                "Ask Price 2": order.get("sellPrice2"), "Ask Quantity 2": order.get("sellQuantity2"),
+                "Ask Price 3": order.get("sellPrice3"), "Ask Quantity 3": order.get("sellQuantity3"),
+                "Ask Price 4": order.get("sellPrice4"), "Ask Quantity 4": order.get("sellQuantity4"),
+                "Ask Price 5": order.get("sellPrice5"), "Ask Quantity 5": order.get("sellQuantity5"),
+
+                "TotalBuyQuantity": order.get("totalBuyQuantity"),
+                "TotalSellQuantity": order.get("totalSellQuantity"),
+                # "BuyQuantity%": order.get("perBuyQty"),
+                # "SellQuantity%": order.get("perSellQty"),
+                # "BuyQuantity%": f"{order.get('perBuyQty', 0):.2f} %",
+                # "SellQuantity%": f"{order.get('perSellQty', 0):.2f} %",
+                "BuyQuantity%": f"{order.get('perBuyQty', 0):.2f}",
+                "SellQuantity%": f"{order.get('perSellQty', 0):.2f}",  
+                              
+                # ================= FUNDAMENTAL =================
+                "52WeekHigh": price.get("yearHigh"),
+                "52WeekLow": price.get("yearLow"),
+                "52WeekHighDate": price.get("yearHightDt"),
+                "52WeekLowDate": price.get("yearLowDt"),
+                "DailyVolatility": price.get("cmDailyVolatility"),
+                "AnnualisedVolatility": price.get("cmAnnualVolatility"),               
+                "SymbolPE": sec.get("pdSymbolPe"),                
+                "FaceValue": trade.get("faceValue"),
+                "TotalIssuedShares": trade.get("issuedSize"),
+                "MarketCap": trade.get("totalMarketCap"),
+                "FreeFloatMcap": trade.get("ffmc"),
+                "DateOfListing": sec.get("listingDate"),                
+
+                # ================= SECTOR =================
+                "Macro": sec.get("macro"),
+                "Sector": sec.get("sector"),
+                "Industry": sec.get("industryInfo"),
+                "BasicIndustry": sec.get("basicIndustry"),
+
+                # ================= META =================
+                "LastUpdated": eq.get("lastUpdateTime")
+            }
+
+        except (requests.RequestException, ValueError, KeyError):
+            return None
+
 
     def cm_live_most_active_equity_by_value(self):
         self.rotate_user_agent()
@@ -4280,6 +4403,32 @@ class Nse:
         except Exception as e:
             print("⚠️ OI Spurts Fetch Error:", e)
             return None
+        
+    def fno_expiry_dates_raw(self,symbol: str="NIFTY"):
+        self.rotate_user_agent()  # Rotating User-Agent
+
+        ref_url = 'https://www.nseindia.com/option-chain'
+        api_url = f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi?functionName=getOptionChainDropdown&symbol={symbol}"
+
+        # --- Fetch & process ---
+
+        try:
+            # Get reference cookies from the main page
+            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
+            ref_response.raise_for_status()  # Ensure request was successful
+
+            # Make API call using cookies from the previous request
+            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
+            response.raise_for_status()  # Ensure request was successful
+
+            # Convert response to JSON
+            data = response.json()
+
+            return data
+
+        except (requests.RequestException, ValueError, KeyError) as e:
+            print(f"Error fetching data: {e}")
+            return None   
 
     def fno_expiry_dates(self, symbol="NIFTY", label_filter=None):
         from datetime import datetime, time
@@ -4381,38 +4530,33 @@ class Nse:
                 return None
             return pd.to_datetime(df_filtered.loc[0, "Expiry Date"], format='%d-%b-%Y').strftime("%d-%m-%Y")
 
-    # def fno_live_option_chain_raw(self, symbol: str, expiry_date: str = None):
-    #     # List of NSE indices
-    #     index_symbols = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"]
+    def fno_live_option_chain_raw(self, symbol: str, expiry_date: str = None,):
+        symbol = symbol.upper().replace(' ', '%20').replace('&', '%26')
+        self.rotate_user_agent()  # Rotating User-Agent
 
-    #     # Determine if the symbol is an index
-    #     indices = symbol.upper() in index_symbols
+        ref_url = 'https://www.nseindia.com/option-chain'
+        api_url = f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi?functionName=getOptionChainData&symbol={symbol}&params=expiryDate={expiry_date}"
 
-    #     symbol = symbol.replace(' ', '%20').replace('&', '%26')
-    #     self.rotate_user_agent()
-        
-    #     ref_url = f'https://www.nseindia.com/get-quotes/derivatives?symbol={symbol}'
-    #     ref = requests.get(ref_url, headers=self.headers)
-        
-    #     url = f"https://www.nseindia.com/api/option-chain-{'indices' if indices else 'equities'}?symbol={symbol}"
-        
-    #     try:
-    #         payload = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10).json()
-            
-    #         # Filter by expiry_date if provided
-    #         if expiry_date:
-    #             payload['records']['data'] = [
-    #                 item for item in payload['records']['data'] if item['expiryDate'] == expiry_date
-    #             ]
-            
-    #         return payload
-        
-    #     except requests.exceptions.RequestException as e:
-    #         print(f"Request failed: {e}")
-    #         return None
-    #     except ValueError as e:
-    #         print(f"Failed to parse JSON: {e}")
-    #         return None
+        # --- Fetch & process ---
+
+        try:
+            # Get reference cookies from the main page
+            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
+            ref_response.raise_for_status()  # Ensure request was successful
+
+            # Make API call using cookies from the previous request
+            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
+            response.raise_for_status()  # Ensure request was successful
+
+            # Convert response to JSON
+            data = response.json()
+
+            return data
+
+        except (requests.RequestException, ValueError, KeyError) as e:
+            print(f"Error fetching data: {e}")
+            return None  
+
 
     def fno_live_option_chain(self, symbol: str, expiry_date: str = None, oi_mode: str = "full"):
         # symbol = symbol.upper().replace(' ', '%20').replace('&', '%26')
@@ -4582,7 +4726,7 @@ class Nse:
 
             # Convert expiry date to NSE format
             if expiry_date:
-                exp = pd.to_datetime(expiry_date, format="%d-%m-%Y")
+                exp = pd.to_datetime(expiry_date, format="%d-%b-%Y")
                 expiry_date = exp.strftime("%d-%b-%Y")
 
             # Filter by expiry date if provided
@@ -6204,7 +6348,7 @@ class Nse:
         try:
             # Convert date (expects dd-mm-YYYY)
             trade_date = datetime.strptime(trade_date, "%d-%m-%Y")
-            url = f"https://nsearchives.nseindia.com/archives/fo/mkt/fo{trade_date.strftime('%d%m%Y').upper()}.zip"
+            url = f"https://nsearchives.nseindia.com/archives/fo/mkt/fo{trade_date.strftime('%d%m%Y')}.zip"
 
             # Fetch ZIP
             request_bhav = requests.get(url, headers=self.headers, timeout=10)
@@ -6224,6 +6368,7 @@ class Nse:
         except Exception as e:
             print(f"❌ Error fetching Top 20 Option for {raw_trade_date}: {e}")
             return None
+
 
     def fno_eod_sec_ban(self, trade_date: str):
         self.rotate_user_agent()

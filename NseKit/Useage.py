@@ -75,7 +75,11 @@ rich = Console()
 # print(get.nse_eod_equity_full_list())                                                     # Full equity list
 # print(get.nse_eod_equity_full_list(list_only=True))                                       # List of equity symbols
 
-# print(get.state_wise_registered_investors())                                              # state wise registered investors
+# # 🔹 Indices Name List
+# print(get.list_of_indices())                                                              # Indices Name List                         {JSON}
+
+
+# print(get.state_wise_registered_investors())                                              # state wise registered investors           {JSON}
 
 
 # #---------------------------------------------------------- IPO Data ----------------------------------------------------------#
@@ -165,11 +169,16 @@ rich = Console()
 
 # #---------------------------------------------------------- Capital Market Live Data ----------------------------------------------------------
 
-# # 🔹 Equity Information
+# # 🔹 Equity Information           (Old)
 # print(get.cm_live_equity_info("RELIANCE"))                                                # Equity details for a symbol
 
-# # 🔹 Equity Price Information
+# # 🔹 Equity Price Information     (Old)
 # print(get.cm_live_equity_price_info("RELIANCE"))                                          # Detailed price data with bid/ask levels
+
+
+# # 🔹 Equity Information           (New)
+# print(get.cm_live_equity_full_info("RELIANCE"))                                           # Equity details for a symbol
+
 
 # # 🔹 Most Active Equities by Value
 # print(get.cm_live_most_active_equity_by_value())                                          # Most active equities by traded value
@@ -282,9 +291,13 @@ rich = Console()
 # print(get.cm_live_hist_annual_reports("RELIANCE", "01-01-2025", "15-10-2025"))            # Symbol + date range
 
 
+# # 🔹 Quarterly Results - {JSON}
+# print(get.quarterly_financial_results('TCS'))                                             # Last 3 Quarterly Results Consolidated/Standalone (Income, PBT, Net Profit, EPS)
+
+
 # #---------------------------------------------------------- Live Chart Data ----------------------------------------------------------
 
-# print(get.nifty_chart("1D"))
+# print(get.nifty_chart("1D"))                                                              # "1D" "1M" "3M" "6M" "1Y"
 # print(get.stock_chart("RELIANCE", "1D"))
 # print(get.fno_chart("TCS", "FUTSTK","30-12-2025"))
 # print(get.fno_chart("NIFTY", "OPTIDX","09-12-2025","CE25900"))
@@ -340,6 +353,10 @@ rich = Console()
 # # 🔹 Price Vs OI
 # print(get.fno_live_oi_vs_price())                                                         # Price Vs OI   (Rise in OI and Rise in Price, Rise in OI and Slide in Price, etc)
 
+# 🔹 Expiry Date - Raw   
+# print(get.fno_expiry_dates_raw())                                                         # Nifty All Expiry Date                     {JSON}   
+# print(get.fno_expiry_dates_raw("TCS"))                                                    # TCS All Expiry Date                       {JSON}
+
 # 🔹 Expiry Date
 # print(get.fno_expiry_dates())                                                             # Nifty All Expiry Date
 # print(get.fno_expiry_dates("TCS"))                                                        # TCS All Expiry Date
@@ -359,12 +376,14 @@ rich = Console()
 # print(get.fno_live_option_chain("RELIANCE", expiry_date="27-Jan-2026"))                   # Option chain with specific expiry
 # print(get.fno_live_option_chain("RELIANCE", oi_mode="compact"))                           # Compact option chain data
 
+# print(get.fno_live_option_chain_raw("RELIANCE", expiry_date="27-Jan-2026"))               # Raw Option chain with specific expiry     {JSON}
+
 # # 🔹 Active Contracts
 # print(get.fno_live_active_contracts("NIFTY"))                                             # Active index option contracts
-# print(get.fno_live_active_contracts("NIFTY", expiry_date="09-12-2025"))                   # Active index contracts with expiry
+# print(get.fno_live_active_contracts("NIFTY", expiry_date="27-Jan-2026"))                   # Active index contracts with expiry
 
 # print(get.fno_live_active_contracts("RELIANCE"))                                          # Active stock option contracts
-# print(get.fno_live_active_contracts("RELIANCE", expiry_date="30-10-2025"))                # Active stock contracts with expiry
+# print(get.fno_live_active_contracts("RELIANCE", expiry_date="27-Jan-2026"))                # Active stock contracts with expiry
 
 
 # #---------------------------------------------------------- CM EOD Data ----------------------------------------------------------
@@ -500,7 +519,7 @@ rich = Console()
 # print(get.fno_eod_top10_fut("17-10-2025"))                                                # Top 10 futures contracts (DD-MM-YYYY)
 
 # # 🔹 Top 20 Options
-# print(get.fno_eod_top20_opt("17-10-2025"))                                                # Top 20 options contracts (DD-MM-YYYY)
+# print(get.fno_eod_top20_opt("31-12-2025"))                                                # Top 20 options contracts (DD-MM-YYYY)
 
 # # 🔹 Security Ban
 # print(get.fno_eod_sec_ban("17-10-2025"))                                                  # Securities in ban period (DD-MM-YYYY)
