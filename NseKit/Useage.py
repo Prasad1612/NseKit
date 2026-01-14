@@ -297,10 +297,12 @@ rich = Console()
 
 # #---------------------------------------------------------- Live Chart Data ----------------------------------------------------------
 
-# print(get.nifty_chart("1D"))                                                              # "1D" "1M" "3M" "6M" "1Y"
+# print(get.index_chart("NIFTY 50","1D"))                                                    # "1D" "1M" "3M" "6M" "1Y"
 # print(get.stock_chart("RELIANCE", "1D"))
 # print(get.fno_chart("TCS", "FUTSTK","30-12-2025"))
-# print(get.fno_chart("NIFTY", "OPTIDX","09-12-2025","CE25900"))
+# print(get.fno_chart("NIFTY", "OPTIDX","20-01-2026","PE25700"))
+
+# print(get.india_vix_chart())
 
 # #---------------------------------------------------------- FnO Live Data ----------------------------------------------------------
 
@@ -376,7 +378,7 @@ rich = Console()
 # print(get.fno_live_option_chain("RELIANCE", expiry_date="27-Jan-2026"))                   # Option chain with specific expiry
 # print(get.fno_live_option_chain("RELIANCE", oi_mode="compact"))                           # Compact option chain data
 
-# print(get.fno_live_option_chain_raw("RELIANCE", expiry_date="27-Jan-2026"))               # Raw Option chain with specific expiry     {JSON}
+# print(get.fno_live_option_chain_raw("M&M", expiry_date="27-Jan-2026"))                    # Raw Option chain with specific expiry     {JSON}
 
 # # 🔹 Active Contracts
 # print(get.fno_live_active_contracts("NIFTY"))                                             # Active index option contracts

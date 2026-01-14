@@ -3633,20 +3633,16 @@ class Nse:
     
     #---------------------------------------------------------- Live Chart Data ----------------------------------------------------------------
  
-    def nifty_chart(self, timeframe: str = "1D"):
+    def index_chart(self, index: str, timeframe: str = "1D"):
         """
-        Fetches chart data for NIFTY 50.
-        timeframe: "1D", "5D", "1M", etc.
-        Returns pandas DataFrame with: timestamp_ms, datetime_utc, datetime_ist, price, flag
+        Fetches chart data for index.
+        timeframe: "1D" "1M" "3M" "6M" "1Y" etc.
         """
+        index = index.upper().replace(' ', '%20').replace('&', '%26')
         self.rotate_user_agent()
 
-        home_url = "https://www.nseindia.com/"
-        api_url = (
-            "https://www.nseindia.com/api/NextApi/apiClient"
-            "?functionName=getGraphChart"
-            f"&type=NIFTY%2050&flag={timeframe}"
-        )
+        home_url = "https://www.nseindia.com/"  
+        api_url = (f"https://www.nseindia.com/api/NextApi/apiClient/indexTrackerApi?functionName=getIndexChart&&index={index}&flag={timeframe}")
 
         try:
             # Step 1: Get cookies
@@ -3688,8 +3684,9 @@ class Nse:
             return df
 
         except (requests.HTTPError, ValueError, KeyError) as e:
-            print("Error fetching NIFTY chart:", e)
+            print("Error fetching index chart:", e)
             return None
+        
         
     def stock_chart(self, symbol: str, timeframe: str = "1D"):
         """
@@ -3816,6 +3813,53 @@ class Nse:
         except Exception as e:
             print("FnO chart error:", e)
             return None
+
+
+    def india_vix_chart(self):
+        """
+        Fetches intraday chart data for India VIX.
+        """
+        self.rotate_user_agent()
+
+        home_url = "https://www.nseindia.com/market-data/live-market-indices"
+        api_url = "https://www.nseindia.com/api/chart-databyindex-dynamic?index=INDIA%20VIX&type=index"
+
+        try:
+            # Step 1: Get cookies
+            resp0 = self.session.get(home_url, headers=self.headers, timeout=10)
+            resp0.raise_for_status()
+            cookies = resp0.cookies.get_dict()
+
+            time.sleep(0.5)
+
+            # Step 2: Fetch chart data
+            resp = self.session.get(api_url, headers=self.headers, cookies=cookies, timeout=10)
+            resp.raise_for_status()
+            obj = resp.json()
+
+             # 🔥 Access grapthData directly
+            if "grapthData" not in obj:
+                raise ValueError("No 'grapthData' in response JSON")
+
+            rows = []
+            for ts, price, flag in obj["grapthData"]:
+                dt_utc = pd.to_datetime(ts, unit="ms", utc=True)
+
+                rows.append({
+                    # "timestamp_ms": ts,
+                    "datetime_utc": dt_utc.strftime("%Y-%m-%d %H:%M:%S"),
+                    "price": price,
+                    "flag": flag
+                })
+
+            df = pd.DataFrame(rows)
+            return df
+
+        except (requests.HTTPError, ValueError, KeyError) as e:
+            print("Error fetching India VIX chart:", e)
+            return None
+
+
 
     #---------------------------------------------------------- FnO_Live_Data ----------------------------------------------------------------
 
