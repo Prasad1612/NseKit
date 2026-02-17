@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import re
 import random
+import feedparser
 import warnings
 import csv
 import json
@@ -3559,11 +3560,8 @@ class Nse:
             print(f"Error fetching Shareholding Patterns data: {e}")
             return None
 
-    def cm_live_hist_annual_reports(self, *args, from_date=None, to_date=None, symbol=None):
-        """
-        annual reports serach symbol only so we use "BUSINESS RESPONSIBILITY AND SUSTAINABILITY REPORTS" to find annual reports.
-    
-        """
+    def cm_live_hist_br_sr(self, *args, from_date=None, to_date=None, symbol=None):
+        
         # --- Detect date pattern ---
         date_pattern = re.compile(r"^\d{2}-\d{2}-\d{4}$")
         today_str = datetime.now().strftime("%d-%m-%Y")
@@ -3635,13 +3633,13 @@ class Nse:
  
     def index_chart(self, index: str, timeframe: str = "1D"):
         """
-        Fetches chart data for index.
-        timeframe: "1D" "1M" "3M" "6M" "1Y" etc.
+        Fetches chart data for NSE index.
+        timeframe: "1D", "1M", "3M", "6M", "1Y"
         """
         index = index.upper().replace(' ', '%20').replace('&', '%26')
         self.rotate_user_agent()
 
-        home_url = "https://www.nseindia.com/"  
+        home_url = "https://www.nseindia.com/"
         api_url = (f"https://www.nseindia.com/api/NextApi/apiClient/indexTrackerApi?functionName=getIndexChart&&index={index}&flag={timeframe}")
 
         try:
@@ -3663,36 +3661,36 @@ class Nse:
                 raise ValueError("No 'grapthData' in response JSON")
 
             rows = []
-            for ts, price, flag in data["grapthData"]:
+            for row in data["grapthData"]:
+                ts, price, flag, chng, pct = row
+
                 dt_utc = pd.to_datetime(ts, unit="ms", utc=True)
-                # dt_ist = dt_utc.tz_convert("Asia/Kolkata")
 
                 rows.append({
-                    # "timestamp_ms": ts,
                     "datetime_utc": dt_utc,
-                    # "datetime_ist": dt_ist,
                     "price": price,
+                    "change": chng,
+                    "pct_change": pct,
                     "flag": flag
                 })
 
             df = pd.DataFrame(rows)
 
-            # 🔥 IMPORTANT FIX: convert datetime to string for Excel / JSON writers
+            # Excel / JSON safe
             df["datetime_utc"] = df["datetime_utc"].dt.strftime("%Y-%m-%d %H:%M:%S")
-            # df["datetime_ist"] = df["datetime_ist"].dt.strftime("%Y-%m-%d %H:%M:%S")
 
             return df
 
         except (requests.HTTPError, ValueError, KeyError) as e:
             print("Error fetching index chart:", e)
             return None
-        
-        
+
     def stock_chart(self, symbol: str, timeframe: str = "1D"):
         """
-        Fetches chart data for stocks.
+        Fetches chart data for NSE stocks.
         timeframe: "1D", "5D", "1M", etc.
-        Returns pandas DataFrame with: timestamp_ms, datetime_utc, price, flag
+        Returns DataFrame:
+        datetime_utc | price | change | pct_change | flag
         """
         self.rotate_user_agent()
 
@@ -3700,31 +3698,30 @@ class Nse:
         api_url = (f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi?functionName=getSymbolChartData&symbol={symbol}EQN&days={timeframe}")
 
         try:
-            # Step 1: Get cookies
+            # Step 1: cookies
             resp0 = self.session.get(home_url, headers=self.headers, timeout=10)
             resp0.raise_for_status()
             cookies = resp0.cookies.get_dict()
-
             time.sleep(0.5)
 
-            # Step 2: Fetch chart data
-            resp = self.session.get(api_url, headers=self.headers,
-                                    cookies=cookies, timeout=10)
+            # Step 2: data
+            resp = self.session.get(api_url, headers=self.headers, cookies=cookies, timeout=10)
             resp.raise_for_status()
             obj = resp.json()
 
-             # 🔥 Access grapthData directly
             if "grapthData" not in obj:
                 raise ValueError("No 'grapthData' in response JSON")
 
             rows = []
-            for ts, price, flag in obj["grapthData"]:
+            for row in obj["grapthData"]:
+                ts, price, flag, chng, pct = row
                 dt_utc = pd.to_datetime(ts, unit="ms", utc=True)
 
                 rows.append({
-                    # "timestamp_ms": ts,
                     "datetime_utc": dt_utc.strftime("%Y-%m-%d %H:%M:%S"),
                     "price": price,
+                    "change": chng,
+                    "pct_change": pct,
                     "flag": flag
                 })
 
@@ -3734,7 +3731,6 @@ class Nse:
         except (requests.HTTPError, ValueError, KeyError) as e:
             print("Error fetching stock chart:", e)
             return None
-
 
     def fno_chart(self, symbol: str, inst_type: str, expiry: str, strike: str = ""):
         """
@@ -3792,19 +3788,29 @@ class Nse:
             # -----------------------------
             rows = []
             for row in data["grapthData"]:
-                # NSE sometimes returns [ts, price] — no flag
-                if len(row) == 2:
-                    ts, price = row
-                    flag = ""
-                else:
-                    ts, price, flag = row
+
+                # -------- Universal parser --------
+                ts = row[0]
+                price = row[1]
+
+                chng = row[2] if len(row) >= 3 else None
+                pct   = row[3] if len(row) >= 4 else None
+
+                # Old legacy flag support
+                flag = ""
+                if len(row) == 3 and isinstance(row[2], str):
+                    flag = row[2]
 
                 dt_utc = pd.to_datetime(ts, unit="ms", utc=True)
                 dt_ist = dt_utc.tz_convert("Asia/Kolkata")
 
                 rows.append({
-                    "datetime_utc": dt_utc.strftime("%Y-%m-%d %H:%M:%S"),
-                    "price": price,
+                    "datetime_utc": dt_utc,
+                    # "datetime_ist": dt_ist,
+                    "price": float(price),
+                    "chng": None if chng is None else float(chng),
+                    "pct": None if pct is None else float(pct),
+                    "flag": flag
                 })
 
             df = pd.DataFrame(rows)
@@ -3858,7 +3864,6 @@ class Nse:
         except (requests.HTTPError, ValueError, KeyError) as e:
             print("Error fetching India VIX chart:", e)
             return None
-
 
 
     #---------------------------------------------------------- FnO_Live_Data ----------------------------------------------------------------
@@ -4086,7 +4091,7 @@ class Nse:
             'openPrice': 'Open',
             'highPrice': 'High',
             'lowPrice': 'Low',
-            'closePrice': 'Prev Close',
+            'closePrice': 'Close',
             'volume': 'Volume (Cntr)',
             'totalTurnover': 'Turnover (₹)',
             'premiumTurnOver': 'Premium Turnover (₹)',
@@ -4112,7 +4117,7 @@ class Nse:
             # -----------------------------
             ordered_cols = [
                 'Segment','Symbol', 'Expiry',
-                'Option', 'Strike', 'Prev Close',
+                'Option', 'Strike', 'Close',
                 'LTP', 'Chg', 'Chg %',
                 'Open', 'High', 'Low',
                 'Volume (Cntr)', 'Trades', 'OI (Cntr)',
@@ -7458,3 +7463,58 @@ class Nse:
         except (requests.RequestException, ValueError, KeyError) as e:
             print(f"Error fetching data: {e}")
             return None 
+
+    def recent_annual_reports(self):
+        rss_url = "https://nsearchives.nseindia.com/content/RSS/Annual_Reports.xml"
+
+        try:
+            response = self.session.get(rss_url, headers=self.headers, timeout=10)
+            response.raise_for_status()
+
+            feed = feedparser.parse(response.text)
+            records = []
+
+            for item in feed.entries:
+                title = item.get("title", "")
+                link = item.get("link", "")
+                desc = item.get("description", "")
+
+                filename = link.split("/")[-1]
+
+                # SME detection
+                SME = "SME" if filename.startswith("SME_AR_") else ""
+
+                # Unified regex
+                pattern = r"(?:SME_)?AR_\d+_(?P<symbol>[A-Z0-9]+)_(?P<fyFrom>\d{4})_(?P<fyTo>\d{4})_"
+                m = re.search(pattern, filename)
+
+                if not m:
+                    continue
+
+                symbol = m.group("symbol")
+                fyFrom = int(m.group("fyFrom"))
+                fyTo   = int(m.group("fyTo"))
+
+                # Submission date
+                date_match = re.search(r"(\d{2}-[A-Z]{3}-\d{2})", desc)
+                submissionDate = None
+                if date_match:
+                    submissionDate = datetime.strptime(
+                        date_match.group(1), "%d-%b-%y"
+                    ).strftime("%d-%b-%Y")
+
+                records.append({
+                    "symbol": symbol,
+                    "companyName": title,
+                    "fyFrom": fyFrom,
+                    "fyTo": fyTo,
+                    "link": link,
+                    "submissionDate": submissionDate,
+                    "SME": SME
+                })
+
+            return pd.DataFrame(records)
+
+        except Exception as e:
+            print(f"Error fetching annual reports: {e}")
+            return pd.DataFrame()

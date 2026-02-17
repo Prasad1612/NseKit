@@ -2,7 +2,8 @@
 #                                   NseKit
 #=====================================================================#
 
-from NseKit import NseKit, Moneycontrol
+import NseKit
+import Moneycontrol
 from rich.console import Console
 
 # Create NSE instance
@@ -285,10 +286,13 @@ rich = Console()
 # print(get.cm_live_qtly_shareholding_patterns())                                           # Quarterly shareholding patterns
 
 # # 🔹 Annual Reports
-# print(get.cm_live_hist_annual_reports())                                                  # All Annual reports
-# print(get.cm_live_hist_annual_reports("RELIANCE"))                                        # Annual reports for a symbol
-# print(get.cm_live_hist_annual_reports("01-01-2025", "15-10-2025"))                        # Date range
-# print(get.cm_live_hist_annual_reports("RELIANCE", "01-01-2025", "15-10-2025"))            # Symbol + date range
+# print(get.recent_annual_reports())                                                        # Recent 20 Annual reports
+
+# # 🔹 Business Responsibility and Sustainability Reports
+# print(get.cm_live_hist_br_sr())                                                           # All Business Responsibility and Sustainability Reports
+# print(get.cm_live_hist_br_sr("RELIANCE"))                                                 # Business Responsibility and Sustainability Reports for a symbol
+# print(get.cm_live_hist_br_sr("01-01-2025", "15-10-2025"))                                 # Date range
+# print(get.cm_live_hist_br_sr("RELIANCE", "01-01-2025", "15-10-2025"))                     # Symbol + date range
 
 
 # # 🔹 Quarterly Results - {JSON}
@@ -299,8 +303,8 @@ rich = Console()
 
 # print(get.index_chart("NIFTY 50","1D"))                                                    # "1D" "1M" "3M" "6M" "1Y"
 # print(get.stock_chart("RELIANCE", "1D"))
-# print(get.fno_chart("TCS", "FUTSTK","30-12-2025"))
-# print(get.fno_chart("NIFTY", "OPTIDX","20-01-2026","PE25700"))
+# print(get.fno_chart("TCS", "FUTSTK","24-02-2026"))
+# print(get.fno_chart("NIFTY", "OPTIDX","24-02-2026","PE25700"))
 
 # print(get.india_vix_chart())
 
@@ -546,7 +550,7 @@ rich = Console()
 
 # # 🔹  Historical Options
 # print(get.option_price_volume_data("NIFTY", "Index", "01-10-2025", "17-10-2025", expiry= "20-10-2025"))
-# print(get.option_price_volume_data("ITC", "Stock Options","CE", "01-10-2025", "17-10-2025", expiry= "28-10-2025"))
+# print(get.option_price_volume_data("TCS", "Stock Options","3000","CE", "01-02-2026", "06-02-2026", expiry= "24-02-2026"))
 # print(get.option_price_volume_data("BANKNIFTY", "Index Options","47000", "01-10-2025", "17-10-2025", expiry= "28-10-2025"))
 # print(get.option_price_volume_data("ITC", "Stock Options", "04-10-2025", expiry= "28-10-2025"))
 # print(get.option_price_volume_data("BANKNIFTY", "Index Options", "3M"))
