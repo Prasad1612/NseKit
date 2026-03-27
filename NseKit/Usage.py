@@ -2,22 +2,40 @@
 #                                   NseKit
 #=====================================================================#
 
-import NseKit
-import Moneycontrol
+# from NseKit import NseKit, Moneycontrol
+import NseKit, Moneycontrol
 from rich.console import Console
 
-# Create NSE instance
-mc = Moneycontrol.MC()
-get = NseKit.Nse()
+# #------------------------------------------ Configuration Section ----------------------------------------------------------
+
+# You can control settings globally or per-instance.
+
+# # 1. GLOBAL SETTINGS (Affects all new Nse instances by default)
+# NseKit.NseConfig.max_rps      = 2.0    # Default: 3.0
+# NseKit.NseConfig.retries      = 3      # Default: 2
+# NseKit.NseConfig.retry_delay  = 2.0    # Default: 2.0
+# NseKit.NseConfig.cookie_cache = True   # Default: True  False
+
+# 2. PER-INSTANCE SETTINGS (Overwrites global settings for this instance only)
+# get_custom = NseKit.Nse(max_rps = 1.0, retries = 2, retry_delay  = 3.0, cookie_cache = True)
+
+# 3. DEFAULT INSTANCE (Uses whatever is currently in NseConfig)
+get  = NseKit.Nse()
+# #-----------------
+mc   = Moneycontrol
 rich = Console()
+
+# #---------------------------------------------------------- Cookie ----------------------------------------------------------
+
+# # 🔹 Cookie
+# get.clear_cookie_cache()                                                                    #  Delete the cookie cache
 
 # #---------------------------------------------------------- NSE Data ----------------------------------------------------------
 
 # # 🔹 Market Status
-# print(get.nse_market_status("Nifty50"))                                                   # "Market Status" | "Mcap" | "Nifty50" | "Gift Nifty"
+# print(get.nse_market_status("Market Status"))                                             # "Market Status" | "Mcap" | "Nifty50" | "Gift Nifty"
      
 # rich.print(get.nse_is_market_open("Capital Market"), "\n")                                # "Capital Market" | "Currency" | "Commodity" | "Debt" | "currencyfuture"
-
 
 # # 🔹 Trading Holidays
 # print(get.nse_trading_holidays())                                                         # Trading holidays DataFrame
@@ -29,11 +47,11 @@ rich = Console()
 
 # # 🔹 Check Trading Holiday
 # print(get.is_nse_trading_holiday())                                                       # Check if today is a trading holiday
-# print(get.is_nse_trading_holiday("21-Oct-2025"))                                          # Check if specific date is a trading holiday
+# print(get.is_nse_trading_holiday("25-Dec-2026"))                                          # Check if specific date is a trading holiday
 
 # # 🔹 Check Clearing Holiday
 # print(get.is_nse_clearing_holiday())                                                      # Check if today is a clearing holiday
-# print(get.is_nse_clearing_holiday("22-Oct-2025"))                                         # Check if specific date is a clearing holiday
+# print(get.is_nse_clearing_holiday("25-Dec-2026"))                                         # Check if specific date is a clearing holiday
 
 # # 🔹 Live Market Turnover
 # print(get.nse_live_market_turnover())                                                     # Live market turnover summary
@@ -41,7 +59,7 @@ rich = Console()
 # # 🔹 Historical Circulars
 # print(get.nse_live_hist_circulars())                                                      # Default: yesterday to today
 # print(get.nse_live_hist_circulars("18-07-2025", "18-10-2025"))                            # Specific date range
-# print(get.nse_live_hist_circulars("NSE Listing"))                                         # Filter by department
+# print(get.nse_live_hist_circulars(filter="Listing"))                                      # Filter by department
 
 
 # # 🔹 Historical Press Releases
@@ -103,7 +121,7 @@ rich = Console()
 # # 🔹 Pre-Open Index Info
 # print(get.pre_market_nifty_info("NIFTY 50"))                                              # Index A/D Summary, "Nifty Bank" | "Emerge" | "Securities in F&O" | "Others" | "All"
 
-# # 🔹 All NSE Pre-Open Advances/Declines Summary
+# # 🔹 All NSE Pre-Open Advances/Declines Summary                                          ❌ unwanted function use print(get.pre_market_nifty_info("All")) 
 # print(get.pre_market_all_nse_adv_dec_info())                                              # NSE-wide Advance/Decline Data
 
 # # 🔹 Pre-Open Market Stocks (All Categories)
@@ -209,7 +227,7 @@ rich = Console()
 
 # # 🔹 Corporate Announcements
 # print(get.cm_live_hist_corporate_announcement())                                          # Corporate announcements 
-# print(get.cm_live_hist_corporate_announcement("12-10-2025", "15-10-2025"))                # Date range 
+# print(get.cm_live_hist_corporate_announcement("14-10-2025", "15-10-2025"))                # Date range 
 # print(get.cm_live_hist_corporate_announcement("RELIANCE"))                                # Announcements for a symbol
 # print(get.cm_live_hist_corporate_announcement("RELIANCE", "01-01-2025", "15-10-2025"))    # Symbol + date range
 
@@ -298,13 +316,16 @@ rich = Console()
 # # 🔹 Quarterly Results - {JSON}
 # print(get.quarterly_financial_results('TCS'))                                             # Last 3 Quarterly Results Consolidated/Standalone (Income, PBT, Net Profit, EPS)
 
+# url = "https://nsearchives.nseindia.com/corporate/ixbrl/INTEGRATED_FILING_INDAS_139754_02022026201126_iXBRL_WEB.html"
+# print(get.html_tables(url, show_tables=False, output="json"))
+
 
 # #---------------------------------------------------------- Live Chart Data ----------------------------------------------------------
 
 # print(get.index_chart("NIFTY 50","1D"))                                                    # "1D" "1M" "3M" "6M" "1Y"
 # print(get.stock_chart("RELIANCE", "1D"))
-# print(get.fno_chart("TCS", "FUTSTK","24-02-2026"))
-# print(get.fno_chart("NIFTY", "OPTIDX","24-02-2026","PE25700"))
+# print(get.fno_chart("TCS", "FUTSTK","30-03-2026"))
+# print(get.fno_chart("NIFTY", "OPTIDX","30-03-2026","PE25700"))
 
 # print(get.india_vix_chart())
 
@@ -359,11 +380,11 @@ rich = Console()
 # # 🔹 Price Vs OI
 # print(get.fno_live_oi_vs_price())                                                         # Price Vs OI   (Rise in OI and Rise in Price, Rise in OI and Slide in Price, etc)
 
-# 🔹 Expiry Date - Raw   
+# # 🔹 Expiry Date - Raw   
 # print(get.fno_expiry_dates_raw())                                                         # Nifty All Expiry Date                     {JSON}   
 # print(get.fno_expiry_dates_raw("TCS"))                                                    # TCS All Expiry Date                       {JSON}
 
-# 🔹 Expiry Date
+# # 🔹 Expiry Date
 # print(get.fno_expiry_dates())                                                             # Nifty All Expiry Date
 # print(get.fno_expiry_dates("TCS"))                                                        # TCS All Expiry Date
 
@@ -455,7 +476,7 @@ rich = Console()
 
 # # 🔹 Historical Security Data
 # print(get.cm_hist_security_wise_data("RELIANCE"))                                         # 1Y data for symbol
-# print(get.cm_hist_security_wise_data("RELIANCE", "1Y"))                                   # 1Y for symbol    1D, 1W, 1M, 3M, 6M, 1Y
+# print(get.cm_hist_security_wise_data("RELIANCE", "2Y"))                                   # 1Y for symbol    1D, 1W, 1M, 3M, 6M, 1Y
 # print(get.cm_hist_security_wise_data("RELIANCE", "01-10-2025", "17-10-2025"))             # Date range for symbol
 
 # # 🔹 Historical Bulk Deals
@@ -516,7 +537,7 @@ rich = Console()
 # #---------------------------------------------------------- FnO EOD Data ----------------------------------------------------------
 
 # # 🔹 F&O Bhavcopy
-# print(get.fno_eod_bhav_copy("17-10-2025"))                                                # F&O bhavcopy for a specific trade date (DD-MM-YYYY)
+# print(get.fno_eod_bhav_copy("16-02-2026"))                                                # F&O bhavcopy for a specific trade date (DD-MM-YYYY)
 
 # # 🔹 FII Stats
 # print(get.fno_eod_fii_stats("17-10-2025"))                                                # FII statistics for a specific trade date (DD-MM-YYYY)
@@ -525,7 +546,7 @@ rich = Console()
 # print(get.fno_eod_top10_fut("17-10-2025"))                                                # Top 10 futures contracts (DD-MM-YYYY)
 
 # # 🔹 Top 20 Options
-# print(get.fno_eod_top20_opt("31-12-2025"))                                                # Top 20 options contracts (DD-MM-YYYY)
+# print(get.fno_eod_top20_opt("17-10-2025"))                                                # Top 20 options contracts (DD-MM-YYYY)
 
 # # 🔹 Security Ban
 # print(get.fno_eod_sec_ban("17-10-2025"))                                                  # Securities in ban period (DD-MM-YYYY)
@@ -592,3 +613,26 @@ rich = Console()
 # # 🔹 Advances/Declines data
 # print(mc.fetch_adv_dec("NIFTY 50"))                                                       # Advances/Declines data
 # print(mc.fetch_adv_dec("NIFTY 500"))                                                      # Advances/Declines data
+
+
+
+
+
+# #---------------------------------------------------------- CSV save ----------------------------------------------------------
+
+# import NseKit
+
+# get = NseKit.Nse()
+
+# # # 🔹 Fetch Historical Index Data (OHLC + Turnover)
+# # print(get.index_historical_data("NIFTY50 USD", "01-01-2025", "17-10-2025"))
+# # print(get.index_historical_data("NIFTY50 USD", "01-12-2025"))                                 # Auto today date as "To date" 
+# # print(get.index_historical_data("NIFTY50 USD", "2Y"))                                         # Last 1 Week      '1D','1W','1M','3M','6M','1Y','2Y','5Y','10Y','YTD','MAX'
+
+# data = get.index_historical_data("NIFTY50 USD", "1W")
+# print(data.tail())
+
+# # Save to CSV
+# data.to_csv("Data.csv", index=True)
+
+# print("CSV file saved successfully.")

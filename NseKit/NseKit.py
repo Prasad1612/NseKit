@@ -1,2065 +1,3527 @@
-import requests
-import pandas as pd
-import numpy as np
-import re
-import random
-import feedparser
-import warnings
+"""
+NseKit — NSE India Data Client
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A clean, production-grade Python client for the National Stock Exchange (NSE)
+of India.  Provides live quotes, EOD archives, F&O data, corporate filings,
+SEBI circulars, and much more — all via a single ``Nse`` class.
+
+Usage::
+
+    from NseKit import Nse
+    nse = Nse()
+    nse.cm_live_equity_price_info("RELIANCE")
+"""
+
 import csv
 import json
-import zipfile
+import logging
+import os
 import random
+import re
+import shelve
+import threading
 import time
+import warnings
+import zipfile
 from datetime import datetime, timedelta
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from io import StringIO, BytesIO
+from io import BytesIO, StringIO
+
+import feedparser
+import numpy as np
+import pandas as pd
+import requests
 from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
-from rich.text import Text
+
+logger = logging.getLogger(__name__)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# I. Infrastructure & Utilities
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Constants ──────────────────────────────────────────────────────────────────
+
+_USER_AGENTS: list[str] = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 Chrome/90.0.4430.212 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 Chrome/91.0.4472.114 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) "
+    "AppleWebKit/537.36 Chrome/92.0.4515.107 Safari/537.36",
+]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NseConfig — central control panel (read by ALL Nse instances)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Three behaviours are controlled here.  Change any field at any point
+# before or after creating an Nse() instance — the next request will pick
+# up the new value automatically.
+#
+# Usage (decorator-style, all at the module level):
+#
+#   from NseKit_antigravity import NseConfig
+#
+#   NseConfig.max_rps        = 2.0    # ≤ 2 requests per second
+#   NseConfig.retries        = 4      # up to 5 total attempts per call
+#   NseConfig.retry_delay    = 3.0    # 3 s base delay, doubles each retry
+#   NseConfig.cookie_cache   = False  # always warm-up, never touch disk
+#
+# All fields have safe defaults so zero-config usage still works:
+#   nse = Nse()   # same behaviour as before
+
+class NseConfig:
+    """
+    Central configuration panel for all ``Nse`` instances.
+
+    Every field is a **class attribute** — there are no instances.
+    Changes take effect immediately for all subsequent HTTP calls in the
+    same process.
+
+    Attributes
+    ----------
+    max_rps : float
+        Maximum requests per second (shared across all ``Nse`` instances
+        and threads via an internal lock).  Default ``3.0``.
+    retries : int
+        Number of *extra* retry attempts after the first failure.
+        Total attempts = ``retries + 1``.  Default ``2`` (3 total tries).
+    retry_delay : float
+        Base sleep in seconds between retries.  Doubles on each subsequent
+        attempt (exponential back-off).  Default ``2.0``.
+    cookie_cache : bool
+        ``True`` (default) — load cookies from ``~/.nsekit_session_cache``
+        if fresh; save after every warm-up.
+        ``False`` — always perform a full warm-up; never read or write
+        the on-disk cache.
+
+    Examples
+    --------
+    >>> NseConfig.max_rps      = 1.5
+    >>> NseConfig.retries      = 3
+    >>> NseConfig.retry_delay  = 1.0
+    >>> NseConfig.cookie_cache = False
+    >>> nse = Nse()
+    """
+
+    max_rps:     float = 3.0
+    retries:     int   = 2
+    retry_delay: float = 2.0
+    cookie_cache: bool = True
+
+    # ── Internal rate-limit state (not for direct use) ────────────────────
+    _lock:         threading.Lock = threading.Lock()
+    _last_request: float          = 0.0    # monotonic timestamp
+
+    def __init_subclass__(cls, **kw):
+        raise TypeError("NseConfig is not meant to be subclassed")
+
+    def __new__(cls):
+        raise TypeError("NseConfig is a namespace — do not instantiate it")
+
+# Interval in seconds between requests (used by legacy tests)
+_RATE_MIN_INTERVAL: float = 1.0 / NseConfig.max_rps
+
+_PERIOD_DELTA: dict[str, timedelta] = {
+    "1D":  timedelta(days=1),
+    "1W":  timedelta(weeks=1),
+    "1M":  timedelta(days=30),
+    "3M":  timedelta(days=90),
+    "6M":  timedelta(days=180),
+    "1Y":  timedelta(days=365),
+    "2Y":  timedelta(days=730),
+    "5Y":  timedelta(days=1825),
+    "10Y": timedelta(days=3650),
+}
+
+_SHORT_PERIODS: list[str] = ["1D", "1W", "1M", "3M", "6M", "1Y"]
+_ALL_PERIODS:   list[str] = _SHORT_PERIODS + ["2Y", "5Y", "10Y", "YTD", "MAX"]
+_DATE_PATTERN:  re.Pattern = re.compile(r"^\d{2}-\d{2}-\d{4}$")
+
+_MONTH_NUM: dict[str, int] = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
+
+_NUM_MONTH: dict[int, str] = {v: k for k, v in _MONTH_NUM.items()}
+
+# ── Business-growth column rename maps (used by _biz_growth_fetch) ────────────
+#    Defined at module level so they are not re-created on every call.
+_FO_YEARLY_RENAME: dict[str, str] = {
+    "date": "FY",
+    "Index_Futures_QTY": "Index_Futures_Qty",   "Index_Futures_VAL": "Index_Futures_Val",
+    "Stock_Futures_QTY": "Stock_Futures_Qty",   "Stock_Futures_VAL": "Stock_Futures_Val",
+    "Index_Options_QTY": "Index_Options_Qty",   "Index_Options_VAL": "Index_Options_Val",
+    "Index_Options_PREM_VAL": "Index_Options_Prem_Val",
+    "Stock_Options_QTY": "Stock_Options_Qty",   "Stock_Options_VAL": "Stock_Options_Val",
+    "Stock_Options_PREM_VAL": "Stock_Options_Prem_Val",
+    "F&O_Total_QTY": "FO_Total_Qty",            "F&O_Total_VAL": "FO_Total_Val",
+    "TOTAL_TRADED_PREM_VAL": "Total_Traded_Prem_Val",
+    "F&O_AVG_DAILYTURNOVER": "FO_Avg_Daily_Turnover",
+}
+
+_BIZ_GROWTH_RENAME_MAPS: dict = {
+    "cm": {
+        "yearly": {
+            "GLY_MONTH_YEAR": "FY",
+            "GLY_NO_OF_CO_LISTED": "No_of_Cos_Listed",
+            "GLY_NO_OF_CO_PERMITTED": "No_of_Cos_Permitted",
+            "GLY_NO_OF_CO_AVAILABLE": "No_of_Cos_Available",
+            "GTY_NO_OF_TRADING_DAYS": "Trading_Days",
+            "GTY_NO_OF_SECURITIES_TRADED": "Securities_Traded",
+            "GTY_NO_OF_TRADES": "No_of_Trades",
+            "GTY_TRADED_QTY": "Traded_Qty",
+            "GTY_TURNOVER": "Turnover",
+            "GTY_AVG_DLY_TURNOVER": "Avg_Daily_Turnover",
+            "GTY_AVG_TRD_SIZE": "Avg_Trade_Size",
+            "GTY_DEMAT_SECURITIES_TRADED": "Demat_Securities_Traded",
+            "GTY_DEMAT_TURNOVER": "Demat_Turnover",
+            "GTY_MKT_CAP": "Market_Cap",
+        },
+        "monthly": {
+            "GLM_MONTH_YEAR": "Month",
+            "GLM_NO_OF_CO_LISTED": "No_of_Cos_Listed",
+            "GLM_NO_OF_CO_PERMITTED": "No_of_Cos_Permitted",
+            "GLM_NO_OF_CO_AVAILABLE": "No_of_Cos_Available",
+            "GTM_NO_OF_TRADING_DAYS": "Trading_Days",
+            "GTM_NO_OF_SECURITIES_TRADED": "Securities_Traded",
+            "GTM_NO_OF_TRADES": "No_of_Trades",
+            "GTM_TRADED_QTY": "Traded_Qty",
+            "GTM_TURNOVER": "Turnover",
+            "GTM_AVG_DLY_TURNOVER": "Avg_Daily_Turnover",
+            "GTM_AVG_TRD_SIZE": "Avg_Trade_Size",
+            "GTM_DEMAT_SECURITIES_TRADED": "Demat_Securities_Traded",
+            "GTM_DEMAT_TURNOVER": "Demat_Turnover",
+            "GTM_MKT_CAP": "Market_Cap",
+        },
+        "daily": {
+            "F_TIMESTAMP": "Date",
+            "CDT_NOS_OF_SECURITY_TRADES": "No_of_Security_Trades",
+            "CDT_NOS_OF_TRADES": "No_of_Trades",
+            "CDT_TRADES_QTY": "Traded_Qty",
+            "CDT_TRADES_VALUES": "Turnover",
+        },
+    },
+    "fo": {
+        "yearly":  _FO_YEARLY_RENAME,
+        "monthly": _FO_YEARLY_RENAME,    # F&O monthly uses the same mapping as yearly
+        "daily": {
+            "date": "Date",
+            "Index_Futures_QTY": "Index_Futures_Qty",   "Index_Futures_VAL": "Index_Futures_Val",
+            "Stock_Futures_QTY": "Stock_Futures_Qty",   "Stock_Futures_VAL": "Stock_Futures_Val",
+            "Index_Options_QTY": "Index_Options_Qty",   "Index_Options_VAL": "Index_Options_Val",
+            "Index_Options_PREM_VAL": "Index_Options_Prem_Val",
+            "Index_Options_PUT_CALL_RATIO": "Index_Options_PCR",
+            "Stock_Options_QTY": "Stock_Options_Qty",   "Stock_Options_VAL": "Stock_Options_Val",
+            "Stock_Options_PREM_VAL": "Stock_Options_Prem_Val",
+            "Stock_Options_PUT_CALL_RATIO": "Stock_Options_PCR",
+            "F&O_Total_QTY": "FO_Total_Qty",            "F&O_Total_VAL": "FO_Total_Val",
+            "TOTAL_TRADED_PREM_VAL": "Total_Traded_Prem_Val",
+            "F&O_Total_PUT_CALL_RATIO": "FO_Total_PCR",
+        },
+    },
+}
+
+
+# ── Module-level helpers ───────────────────────────────────────────────────────
+
+def _parse_args(args: tuple, short: bool = False) -> dict:
+    """
+    Auto-detect ``from_date``, ``to_date``, ``period``, and ``symbol`` from
+    a positional *args* tuple.
+
+    Parameters
+    ----------
+    args : tuple
+        Raw positional arguments forwarded by a public method.
+    short : bool, optional
+        If ``True``, only the short period set (1D–1Y) is accepted.
+        Default is ``False``.
+
+    Returns
+    -------
+    dict
+        Dictionary with keys ``from_date``, ``to_date``, ``period``,
+        ``symbol``; any un-detected key is ``None``.
+    """
+    valid_periods = _SHORT_PERIODS if short else _ALL_PERIODS
+    # result keys must match the expected return signature
+    result = {"from_date": None, "to_date": None, "period": None, "symbol": None}
+    # (The above is typed as dict[str, Optional[str]] by modern checkers)
+
+    for arg in args:
+        if not isinstance(arg, str):
+            continue
+        if _DATE_PATTERN.match(arg):
+            if not result["from_date"]:
+                result["from_date"] = arg
+            elif not result["to_date"]:
+                result["to_date"] = arg
+        elif arg.upper() in valid_periods:
+            result["period"] = arg.upper()
+        else:
+            result["symbol"] = arg.upper()
+
+    return result
+
+
+def _resolve_dates(
+    from_date: str | None = None,
+    to_date:   str | None = None,
+    period:    str | None = None,
+    days:      int        = 365,
+) -> tuple[str, str]:
+    """
+    Resolve a ``(from_date, to_date)`` pair from an optional *period* string
+    or explicit date strings, falling back to *days* ago → today.
+
+    Parameters
+    ----------
+    from_date : str, optional
+        Explicit start date in ``DD-MM-YYYY`` format.
+    to_date : str, optional
+        Explicit end date in ``DD-MM-YYYY`` format.
+    period : str, optional
+        Shorthand period code e.g. ``"1Y"``, ``"YTD"``, ``"MAX"``.
+    days : int, optional
+        Fallback lookback in days when no other input is provided.
+        Default is ``365``.
+
+    Returns
+    -------
+    tuple[str, str]
+        ``(from_str, to_str)`` both in ``DD-MM-YYYY`` format.
+    """
+    today    = datetime.now()
+    today_s  = today.strftime("%d-%m-%Y")
+
+    if period:
+        p = period.upper()
+        if p == "YTD":
+            return datetime(today.year, 1, 1).strftime("%d-%m-%Y"), today_s
+        if p == "MAX":
+            return "01-01-2008", today_s
+        delta = _PERIOD_DELTA.get(p, timedelta(days=days))
+        return (today - delta).strftime("%d-%m-%Y"), today_s
+
+    from_s = from_date or (today - timedelta(days=days)).strftime("%d-%m-%Y")
+    to_s   = to_date   or today_s
+    return from_s, to_s
+
+
+def _clean(df: pd.DataFrame) -> pd.DataFrame:
+    """Replace all *NA*, *NaN*, and infinite values with ``None``."""
+    return df.replace([pd.NA, np.nan, float("inf"), float("-inf")], None)
+
+
+def _csv_from_bytes(raw: bytes) -> pd.DataFrame:
+    """
+    Parse a CSV from raw bytes into a clean ``DataFrame``.
+
+    Strips the UTF-8 BOM if present, trims whitespace and quotes from
+    column names, and coerces comma-separated numeric strings.
+
+    Parameters
+    ----------
+    raw : bytes
+        Raw CSV bytes, optionally BOM-prefixed.
+
+    Returns
+    -------
+    pd.DataFrame
+        Parsed data with numeric columns already cast to ``float``/``int``.
+    """
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        content = raw.decode("latin-1", errors="ignore")
+
+    df = pd.read_csv(StringIO(content))
+    df.columns = [c.strip().replace('"', "") for c in df.columns]
+
+    for col in df.columns:
+        if df[col].dtype == object:
+            series = df[col].astype(str).str.replace(",", "", regex=False).str.strip()
+            try:
+                df[col] = pd.to_numeric(series)
+            except (ValueError, TypeError):
+                df[col] = series
+
+    return df
+
+
+def _parse_year_month_args(
+    args: tuple,
+    month: int | None,
+    year:  int | None,
+    mode:  str,
+    mode_values: tuple[str, ...],
+) -> tuple[str, int | None, int | None]:
+    """
+    Shared positional-arg parser for methods that accept a mode string,
+    an optional year, and an optional month.
+
+    Handles:
+    * A bare 4-digit year string (``"2025"``) → *year*
+    * A month name prefix (``"OCT"``, ``"OCTOBER"``) → *month*
+    * A ``"MON-YYYY"`` combined string → *month* and *year*
+    * An integer year (1900–2100) → *year*
+    * An integer month (1–12) → *month*
+    * Any string in *mode_values* → *mode*
+
+    Parameters
+    ----------
+    args : tuple
+    month, year : int or None
+        Seed values; overridden when found in *args*.
+    mode : str
+        Seed mode value.
+    mode_values : tuple of str
+        Upper-case strings that are recognised as mode choices
+        (e.g. ``("MONTH_WISE", "DAY_WISE")``).
+
+    Returns
+    -------
+    tuple
+        ``(mode, month, year)``
+    """
+    for arg in args:
+        if isinstance(arg, str):
+            upper = arg.strip().upper()
+            if upper in mode_values:
+                mode = upper
+            elif upper.isdigit() and len(upper) == 4:
+                year = int(upper)
+            elif upper[:3] in _MONTH_NUM:
+                month = _MONTH_NUM[upper[:3]]
+            elif "-" in upper:
+                pts = upper.split("-")
+                if len(pts) == 2:
+                    if pts[0][:3] in _MONTH_NUM:
+                        month = _MONTH_NUM[pts[0][:3]]
+                    elif pts[0].isdigit():
+                        month = int(pts[0])
+                    if pts[1].isdigit():
+                        year = int(pts[1])
+        elif isinstance(arg, int):
+            if 1900 <= arg <= 2100:
+                year = arg
+            elif 1 <= arg <= 12:
+                month = arg
+    return mode, month, year
+
+
+def _parse_biz_growth_args(args: tuple, month: int | None, year: int | None, mode: str) -> tuple:
+    """
+    Shared argument parser for ``cm_dmy_biz_growth`` and ``fno_dmy_biz_growth``.
+
+    Delegates to :func:`_parse_year_month_args` with the biz-growth mode set
+    (``"YEARLY"``, ``"MONTHLY"``, ``"DAILY"``), then applies lowercase
+    normalisation and safety defaults for month/year.
+
+    Parameters
+    ----------
+    args : tuple
+        Positional arguments forwarded from the caller.
+    month : int or None
+        Seed value for month (1–12); overridden if found in *args*.
+    year : int or None
+        Seed value for year (4-digit); overridden if found in *args*.
+    mode : str
+        Seed value for mode; overridden if found in *args*.
+
+    Returns
+    -------
+    tuple
+        ``(mode, month, year)`` with any overrides from *args* applied.
+    """
+    mode, month, year = _parse_year_month_args(
+        args, month, year, mode, ("YEARLY", "MONTHLY", "DAILY")
+    )
+    # _parse_year_month_args returns mode upper-cased when matched; biz-growth
+    # callers expect lowercase.
+    if mode.upper() in ("YEARLY", "MONTHLY", "DAILY"):
+        mode = mode.lower()
+    # Safety defaults
+    if month is None:
+        month = datetime.now().month
+    if year is None:
+        year = datetime.now().year
+    return mode, month, year
+
+
+def _parse_settlement_args(args: tuple, from_year: int | None, to_year: int | None, period: str | None) -> tuple:
+    """
+    Shared argument parser for monthly settlement report methods.
+
+    Accepts 4-digit year strings (``"2024"``) and shorthand period strings
+    like ``"2Y"`` from *args*.
+
+    Parameters
+    ----------
+    args : tuple
+        Positional arguments forwarded from the caller.
+    from_year : int or None
+        Seed start financial year; overridden if found in *args*.
+    to_year : int or None
+        Seed end financial year; overridden if found in *args*.
+    period : str or None
+        Shorthand period like ``"1Y"``, ``"2Y"``; overridden if found.
+
+    Returns
+    -------
+    tuple
+        ``(from_year, to_year, period)``.
+    """
+    year_re = re.compile(r"^\d{4}$")
+    for arg in args:
+        if isinstance(arg, str):
+            if year_re.match(arg):
+                if not from_year:
+                    from_year = int(arg)
+                elif not to_year:
+                    to_year = int(arg)
+            elif arg.upper() in ("1Y", "2Y", "3Y", "5Y"):
+                period = arg.upper()
+    return from_year, to_year, period
+
+
+def _unpack_args(
+    args:      tuple,
+    from_date: str | None = None,
+    to_date:   str | None = None,
+    period:    str | None = None,
+    symbol:    str | None = None,
+    short:     bool       = False,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """
+    Merge keyword values with auto-detected positional *args*.
+
+    Calls :func:`_parse_args` and merges the result with any already-supplied
+    keyword values (keywords win over positional detection).
+
+    Parameters
+    ----------
+    args : tuple
+        Raw positional arguments forwarded by a public method.
+    from_date, to_date, period, symbol : str or None
+        Already-supplied keyword values; take priority over *args*.
+    short : bool, optional
+        Passed through to :func:`_parse_args`.
+
+    Returns
+    -------
+    tuple
+        ``(from_date, to_date, period, symbol)`` with merged values.
+    """
+    p = _parse_args(args, short=short)
+    return (
+        from_date or p["from_date"],
+        to_date   or p["to_date"],
+        period    or p["period"],
+        symbol    or p["symbol"],
+    )
+
+
+def _clean_str(df: pd.DataFrame) -> pd.DataFrame:
+    """Replace ``inf`` values with ``""`` and fill ``NaN`` with ``""``."""
+    return df.fillna("").replace({float("inf"): "", float("-inf"): ""})
+
+
+def _sort_dedup_dates(
+    df:        pd.DataFrame,
+    col:       str   = "Date",
+    fmt:       str   = "%d-%b-%Y",
+    ascending: bool  = False,
+) -> pd.DataFrame:
+    """
+    Parse *col* to datetime, sort, drop duplicates, and reformat to *fmt*.
+
+    Centralises the repeated pattern that appeared in ``_get_csv_session``,
+    ``_hist_index_df``, and ``cm_hist_security_wise_data``.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame containing the date column.
+    col : str, optional
+        Name of the date column. Default is ``"Date"``.
+    fmt : str, optional
+        ``strptime`` / ``strftime`` format string. Default is ``"%d-%b-%Y"``.
+    ascending : bool, optional
+        Sort order. Default is ``False`` (newest first).
+
+    Returns
+    -------
+    pd.DataFrame
+        Sorted, deduped copy with the date column formatted as strings.
+    """
+    if col not in df.columns:
+        return df
+    df = df.copy()
+    df[col] = pd.to_datetime(df[col], format=fmt, errors="coerce")
+    df.sort_values(col, ascending=ascending, inplace=True)
+    df.drop_duplicates(subset=[col], keep="last" if not ascending else "first", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    df[col] = df[col].dt.strftime(fmt)
+    return df
+
+
+def _keep_cols(df: pd.DataFrame, cols: list) -> pd.DataFrame:
+    """Return *df* with only the columns in *cols* that actually exist."""
+    existing = [c for c in cols if c in df.columns]
+    return df[existing]
+
+
+def _fmt_trade_date(trade_date: str, fmt: str = "%d%m%Y") -> str:
+    """
+    Parse a ``DD-MM-YYYY`` trade-date string and reformat it.
+
+    Parameters
+    ----------
+    trade_date : str
+        Date in ``DD-MM-YYYY`` format.
+    fmt : str, optional
+        Output ``strftime`` format. Default is ``"%d%m%Y"`` (used in most
+        NSE archive URLs).
+
+    Returns
+    -------
+    str
+        Reformatted date string.
+    """
+    for in_fmt in ("%d-%m-%Y", "%d-%m-%y"):
+        try:
+            return datetime.strptime(trade_date, in_fmt).strftime(fmt)
+        except ValueError:
+            continue
+    raise ValueError(f"Invalid date format: {trade_date}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# II. Core Nse Client
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Main Class ────────────────────────────────────────────────────────────────
 
 class Nse:
+    """
+    NSE India data client.
 
-    def __init__(self):
+    All public methods return a ``pd.DataFrame`` (or ``dict`` / ``list`` for
+    raw JSON endpoints) and ``None`` on failure.  Failed HTTP calls are
+    retried automatically up to 2 extra times by the underlying transport
+    helpers before giving up.
+
+    Quick start
+    -----------
+    ::
+
+        from NseKit import Nse
+        nse = Nse()
+        df  = nse.cm_live_equity_price_info("RELIANCE")
+        print(df)
+    """
+
+    _SEBI_URL = "https://www.sebi.gov.in/sebiweb/ajax/home/getnewslistinfo.jsp"
+    _SEBI_REFERER = (
+        "https://www.sebi.gov.in/sebiweb/home/"
+        "HomeAction.do?doListing=yes&sid=1&ssid=7&smid=0"
+    )
+
+    _COOKIE_CACHE = os.path.join(os.path.expanduser("~"), ".nsekit_session_cache")
+    _COOKIE_TTL   = 3600  # 1 hour
+
+    # ── Construction ────────────────────────────────────────────────────────
+
+    def __init__(
+        self,
+        max_rps:      float | None = None,
+        retries:      int   | None = None,
+        retry_delay:  float | None = None,
+        cookie_cache: bool  | None = None,
+    ):
+        """
+        Initialise the HTTP session and warm up NSE cookies.
+
+        Parameters
+        ----------
+        max_rps : float, optional
+            Limit requests per second for this instance. Defaults to
+            ``NseConfig.max_rps``.
+        retries : int, optional
+            Number of retries for this instance. Defaults to
+            ``NseConfig.retries``.
+        retry_delay : float, optional
+            Base delay between retries for this instance. Defaults to
+            ``NseConfig.retry_delay``.
+        cookie_cache : bool, optional
+            Enable/Disable on-disk cookie caching for this instance.
+            Defaults to ``NseConfig.cookie_cache``.
+        """
+        if max_rps is not None and max_rps <= 0:
+            raise ValueError("max_rps must be positive")
+        if retries is not None and retries < 0:
+            raise ValueError("retries must be non-negative")
+        if retry_delay is not None and retry_delay < 0:
+            raise ValueError("retry_delay must be non-negative")
+
+        self.max_rps      = max_rps      if max_rps      is not None else NseConfig.max_rps
+        self.retries      = retries      if retries      is not None else NseConfig.retries
+        self.retry_delay  = retry_delay  if retry_delay  is not None else NseConfig.retry_delay
+        self.cookie_cache = cookie_cache if cookie_cache is not None else NseConfig.cookie_cache
+
         self.session = requests.Session()
-        self._initialize_session()
+        self._init_session()
 
-    def _initialize_session(self):
-        """Initialize session with proper cookies and headers"""
+    def rotate_user_agent(self) -> None:
+        """Randomly rotate the ``User-Agent`` header to reduce rate-limiting."""
+        self.headers["User-Agent"] = random.choice(_USER_AGENTS)
+
+    def clear_cookie_cache(self) -> None:
+        """
+        Delete the on-disk cookie cache so the next ``Nse()`` instantiation
+        performs a full warm-up.  Useful when NSE changes its session scheme.
+        """
+        for ext in ("", ".db", ".dir", ".bak", ".dat"):
+            path = self._COOKIE_CACHE + ext
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+
+    # ── Rate Limiting ───────────────────────────────────────────────────────
+
+    def _throttle(self) -> None:
+        """
+        Block the calling thread just long enough to stay within
+        this instance's ``max_rps``.
+
+        Uses ``NseConfig._lock`` so that multiple ``Nse`` instances in
+        the same process share a single rate budget timeline, even if
+        they have different individual limits.
+        """
+        min_interval = 1.0 / self.max_rps
+        with NseConfig._lock:
+            now     = time.monotonic()
+            elapsed = now - NseConfig._last_request
+            wait    = min_interval - elapsed
+            if wait > 0:
+                time.sleep(wait)
+            NseConfig._last_request = time.monotonic()
+
+    # ── Session Bootstrap & Cookie Management ───────────────────────────────
+
+    def _init_session(self) -> None:
+        """
+        Build request headers and warm up NSE session cookies.
+
+        Reads ``NseConfig.cookie_cache`` at call time — changing the flag
+        between two ``Nse()`` instantiations takes effect immediately.
+        When ``True``, a fresh on-disk cache skips the warm-up GETs.
+        """
         self.headers = {
-            'User-Agent': self._get_random_user_agent(),
-            'Accept': 'application/json, text/javascript, */*; q=0.01',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': 'https://www.nseindia.com/',
-            'X-Requested-With': 'XMLHttpRequest',
-            'Connection': 'keep-alive',
-            'Origin': 'https://www.nseindia.com'
+            "User-Agent":       random.choice(_USER_AGENTS),
+            "Accept":           "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language":  "en-US,en;q=0.9",
+            "Referer":          "https://www.nseindia.com/",
+            "X-Requested-With": "XMLHttpRequest",
+            "Connection":       "keep-alive",
+            "Origin":           "https://www.nseindia.com",
         }
-        try:
-            self.session.get("https://www.nseindia.com", headers=self.headers, timeout=10)
-            self.session.get("https://www.nseindia.com/market-data/live-equity-market", 
-                           headers=self.headers, timeout=10)
-            time.sleep(1)
-        except requests.RequestException:
-            pass
+        if self.cookie_cache and self._load_cookies():
+            return   # fresh cached cookies loaded — skip warm-up
+        self._warm_up()
 
-    def _get_random_user_agent(self):
-        user_agents = [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36',
-            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36'
-        ]
-        return random.choice(user_agents)
-
-    def rotate_user_agent(self):
-        self.headers['User-Agent'] = self._get_random_user_agent()
-
-
-    #---------------------------------------------------------- NSE ----------------------------------------------------------------
-
-    def nse_market_status(self, mode: str = "Market Status"):
+    def _load_cookies(self) -> bool:
         """
-        Fetch NSE Market Status data.
+        Try to restore session cookies from the on-disk shelve cache.
 
-        Modes:
+        Returns ``True`` when a fresh, non-expired cookie set was found and
+        loaded into ``self.session``.  Returns ``False`` on any cache miss,
+        expiry, or read error — the caller should then call :meth:`_warm_up`.
+
+        The previous implementation tested ``os.path.exists`` for ``.db``
+        and bare paths, which silently missed the cache on Windows
+        (``dumbdbm`` uses ``.bak/.dat/.dir``).  Letting ``shelve.open``
+        itself decide whether the file exists is both simpler and portable.
+        """
+        try:
+            with shelve.open(self._COOKIE_CACHE, flag="r") as db:
+                ts = db.get("ts", 0.0)
+                if time.time() - ts < self._COOKIE_TTL and "cookies" in db:
+                    for k, v in db["cookies"].items():
+                        self.session.cookies.set(k, v)
+                    logger.debug("NseKit: session cookies loaded from cache")
+                    return True
+        except Exception:
+            pass   # missing, corrupt, or locked — fall through to warm-up
+        return False
+
+    def _save_cookies(self) -> None:
+        """
+        Persist the current session cookies to the on-disk shelve cache.
+
+        Does nothing when ``NseConfig.cookie_cache`` is ``False``.
+        Called unconditionally after :meth:`_warm_up` so that even a
+        partial warm-up saves whatever cookies were obtained.
+        Failures are logged at DEBUG level and never propagate.
+        """
+        if not self.cookie_cache:
+            logger.debug("NseKit: cookie cache disabled — skipping save")
+            return
+        cookies = dict(self.session.cookies)
+        if not cookies:
+            logger.debug("NseKit: no cookies to save — skipping cache write")
+            return
+        try:
+            with shelve.open(self._COOKIE_CACHE) as db:
+                db["cookies"] = cookies
+                db["ts"]      = time.time()
+            logger.debug("NseKit: %d cookie(s) saved to cache", len(cookies))
+        except Exception as exc:
+            logger.debug("NseKit: cookie cache write failed: %s", exc)
+
+    def _warm_up(self) -> None:
+        """
+        Perform the two NSE warm-up GETs that establish a valid session.
+
+        Each request runs in its own ``try/except`` so that a timeout on the
+        second URL does not prevent the first URL's cookies from being saved.
+        After both attempts (successful or not) :meth:`_save_cookies` is
+        called unconditionally.
+        """
+        for url in (
+            "https://www.nseindia.com",
+            "https://www.nseindia.com/market-data/live-equity-market",
+        ):
+            try:
+                self._throttle()
+                self.session.get(url, headers=self.headers, timeout=10)
+            except Exception as exc:
+                logger.debug("NseKit: warm-up GET failed (%s): %s", url, exc)
+        time.sleep(0.5)
+        self._save_cookies()   # always attempt — save whatever cookies we got
+
+    # ── Logging & Retry ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _log_error(tag: str, exc: Exception) -> None:
+        """
+        Print a standardised one-line error message and forward to the
+        ``NseKit`` logger at WARNING level.
+
+        Parameters
+        ----------
+        tag : str
+            Short label identifying the calling method (e.g. ``"_get_json"``).
+        exc : Exception
+            The caught exception.
+        """
+        msg = f"[NseKit.{tag}] {type(exc).__name__}: {exc}"
+        print(msg)
+        logger.warning(msg)
+
+    def _retry(self, fn, retries: int | None = None, delay: float | None = None):
+        """
+        Call *fn()* up to ``1 + retries`` times with exponential back-off.
+
+        When *retries* or *delay* are ``None`` (the default) the values are
+        read from ``NseConfig.retries`` and ``NseConfig.retry_delay``
+        respectively — so changing those fields at the module level affects
+        every subsequent HTTP call without touching any method signature.
+
+        Parameters
+        ----------
+        fn : callable
+            A zero-argument callable that may raise an exception.
+        retries : int or None, optional
+            Override ``NseConfig.retries`` for this call only.
+        delay : float or None, optional
+            Override ``NseConfig.retry_delay`` for this call only.
+
+        Returns
         -------
-        - "Market Status" : Returns overall marketState DataFrame
-        - "Mcap"          : Returns marketcap DataFrame
-        - "Nifty50"       : Returns indicative Nifty 50 DataFrame
-        - "Gift Nifty"    : Returns GIFT Nifty DataFrame
-        - "All"           : Returns dictionary with all 4 DataFrames
+        object
+            Return value of ``fn()`` on the first successful call.
 
-        Returns:
-        --------
-        pd.DataFrame or dict[str, pd.DataFrame] or None
+        Raises
+        ------
+        Exception
+            Re-raises the last exception if all attempts are exhausted.
         """
+        n   = self.retries     if retries is None else retries
+        d   = self.retry_delay if delay   is None else delay
+        last_exc: Exception | None = None
+        for attempt in range(n + 1):
+            try:
+                return fn()
+            except Exception as exc:
+                last_exc = exc
+                if attempt < n:
+                    time.sleep(d * (2 ** attempt))
+        raise last_exc
 
-        self.rotate_user_agent()
+    # ── Core HTTP Transport ─────────────────────────────────────────────────
 
-        ref_url = 'https://www.nseindia.com/market-data/live-equity-market'
-        api_url = 'https://www.nseindia.com/api/marketStatus'
-
-        try:
-            # Step 1: Reference cookies
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()
-
-            # Step 2: API request
-            response = self.session.get(
-                api_url,
-                headers=self.headers,
-                cookies=ref_response.cookies.get_dict(),
-                timeout=10
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            # Step 3: Initialize DFs
-            market_state_df = market_cap_df = nifty50_df = gift_nifty_df = None
-
-            # ===== MARKET STATE =====
-            if 'marketState' in data and isinstance(data['marketState'], list):
-                market_state_df = pd.DataFrame(data['marketState'])
-                keep_cols = ['market', 'marketStatus', 'tradeDate', 'index', 'last',
-                             'variation', 'percentChange', 'marketStatusMessage']
-                market_state_df = market_state_df[[c for c in keep_cols if c in market_state_df.columns]]
-
-            # ===== MARKET CAP =====
-            if 'marketcap' in data and isinstance(data['marketcap'], dict):
-                market_cap_df = pd.DataFrame([data['marketcap']])
-                market_cap_df.rename(columns={
-                    'timeStamp': 'Date',
-                    'marketCapinTRDollars': 'MarketCap_USD_Trillion',
-                    'marketCapinLACCRRupees': 'MarketCap_INR_LakhCr',
-                    'marketCapinCRRupees': 'MarketCap_INR_Cr',
-                }, inplace=True)
-
-            # ===== NIFTY50 =====
-            if 'indicativenifty50' in data and isinstance(data['indicativenifty50'], dict):
-                nifty50_df = pd.DataFrame([data['indicativenifty50']])
-                nifty50_df.rename(columns={
-                    'dateTime': 'DateTime',
-                    'indexName': 'Index',
-                    'closingValue': 'ClosingValue',
-                    'finalClosingValue': 'FinalClose',
-                    'change': 'Change',
-                    'perChange': 'PercentChange',
-                }, inplace=True)
-
-            # ===== GIFT NIFTY =====
-            if 'giftnifty' in data and isinstance(data['giftnifty'], dict):
-                gift_nifty_df = pd.DataFrame([data['giftnifty']])
-                gift_nifty_df.rename(columns={
-                    'SYMBOL': 'Symbol',
-                    'EXPIRYDATE': 'ExpiryDate',
-                    'LASTPRICE': 'LastPrice',
-                    'DAYCHANGE': 'DayChange',
-                    'PERCHANGE': 'PercentChange',
-                    'CONTRACTSTRADED': 'ContractsTraded',
-                    'TIMESTMP': 'Timestamp',
-                }, inplace=True)
-
-            # ===== RETURN BASED ON MODE =====
-            mode = mode.strip().lower()
-
-            if mode == "market status":
-                return market_state_df
-            elif mode == "mcap":
-                return market_cap_df
-            elif mode == "nifty50":
-                return nifty50_df
-            elif mode == "gift nifty":
-                return gift_nifty_df
-            elif mode == "all":
-                return {
-                    "Market Status": market_state_df,
-                    "Mcap": market_cap_df,
-                    "Nifty50": nifty50_df,
-                    "Gift Nifty": gift_nifty_df
-                }
-            else:
-                print(f"Invalid mode '{mode}'. Valid modes: 'Market Status', 'Mcap', 'Nifty50', 'Gift Nifty', 'All'.")
-                return None
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching NSE Market Status: {e}")
-            return None
-
-    def nse_is_market_open(self, market: str = "Capital Market") -> Text:
+    def _warm_and_fetch(
+        self,
+        ref_url:     str,
+        api_url:     str,
+        params:      dict | None = None,
+        timeout:     int = 10,
+        api_timeout: int | None = None,
+    ) -> requests.Response:
         """
-        Fetch NSE Market Status and return a Rich Text object with segmented color formatting.
-        
-        Example output:
-        [Capital Market] → Normal Market has Closed (red) | Status: Open (green)
+        Single warm-up GET → session API GET, returning the ``Response``.
+
+        Centralises the four-line pattern that was duplicated verbatim in
+        ``_get_json``, ``_chart_fetch``, ``_live_ref_fetch``, and
+        ``_further_issue``:
+
+        1. Throttle + warm-up GET on *ref_url* (establishes cookies).
+        2. Throttle + data GET on *api_url* using those cookies.
+
+        The caller is responsible for error handling / retry wrapping.
+        Raises ``requests.HTTPError`` on non-2xx responses.
+
+        Parameters
+        ----------
+        ref_url : str
+            Page used to establish session cookies.
+        api_url : str
+            Actual data endpoint.
+        timeout : int, optional
+            Timeout for the warm-up GET. Default is ``10``.
+        api_timeout : int or None, optional
+            Timeout for the data GET; falls back to *timeout* when ``None``.
+
+        Returns
+        -------
+        requests.Response
+            The response from *api_url*.
         """
+        if api_timeout is None:
+            api_timeout = timeout
+        self._throttle()
+        ref = self.session.get(ref_url, headers=self.headers, timeout=timeout)
+        ref.raise_for_status()
+        self._throttle()
+        resp = self.session.get(
+            api_url, params=params, headers=self.headers,
+            cookies=ref.cookies.get_dict(), timeout=api_timeout,
+        )
+        resp.raise_for_status()
+        return resp
 
+    def _get_json(self, ref_url: str, api_url: str, timeout: int = 10) -> dict | None:
+        """
+        Warm-up cookies from *ref_url*, then fetch *api_url* as JSON.
+
+        Parameters
+        ----------
+        ref_url : str
+            Page used to obtain session cookies (warm-up GET).
+        api_url : str
+            Actual JSON API endpoint to query.
+        timeout : int, optional
+            Per-request timeout in seconds. Default is ``10``.
+
+        Returns
+        -------
+        dict or None
+            Parsed JSON payload, or ``None`` on persistent failure after
+            2 retries.
+        """
         self.rotate_user_agent()
-
-        ref_url = "https://www.nseindia.com/market-data/live-equity-market"
-        api_url = "https://www.nseindia.com/api/marketStatus"
-
         try:
-            # Get session cookies
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()
-
-            # Get market status
-            response = self.session.get(api_url, headers=self.headers,
-                                        cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()
-            data = response.json()
-
-            markets = data.get("marketState", [])
-            selected = next((m for m in markets if m.get("market") == market), None)
-
-            if not selected:
-                return Text(f"[{market}] → Market data not found.", style="bold yellow")
-
-            status = selected.get('marketStatus', '').strip()
-            message = selected.get('marketStatusMessage', '').strip()
-
-            # Create a styled Text object
-            text = Text(f"[{market}] → ", style="bold white")
-
-            # Add message (red if contains 'Closed' or 'Halted')
-            if any(word in message.lower() for word in ["closed", "halted", "suspended"]):
-                text.append(message, style="bold red")
-            else:
-                text.append(message, style="bold green")
-
-            # text.append(" | Today's Market: ", style="bold white")
-
-            # # Add status (green if open, red otherwise)
-            # if "open" in status.lower():
-            #     text.append(status, style="bold green")
-            # else:
-            #     text.append(status, style="bold red")
-
-            return text
-
-        except Exception as e:
-            return Text(f"Error fetching NSE Market Status: {e}", style="bold red")
-
-
-    def nse_trading_holidays(self, list_only=False):
-        self.rotate_user_agent()
-        holiday_type = "trading"
-        try:
-            response = self.session.get(
-                f"https://www.nseindia.com/api/holiday-master?type={holiday_type}",
-                headers=self.headers, timeout=10
+            return self._retry(
+                lambda: self._warm_and_fetch(ref_url, api_url, timeout=timeout).json()
             )
-            response.raise_for_status()
-            data = response.json()
-            
-            # Extract only "CM" (Capital Market) holiday data
-            if "CM" in data:
-                df = pd.DataFrame(data["CM"], columns=["Sr_no", "tradingDate", "weekDay", "description", "morning_session", "evening_session"])
-                
-                if list_only:
-                    return df["tradingDate"].tolist()
-                return df
-            else:
-                return None
-        except (requests.RequestException, ValueError) as e:
-            print(f"Error fetching trading holidays: {e}")
+        except Exception as exc:
+            self._log_error("_get_json", exc)
             return None
 
-    def nse_clearing_holidays(self, list_only=False):
+    def _get_archive(self, url: str) -> bytes | None:
+        """
+        Direct GET for a static archive file — no session cookies needed.
+
+        Parameters
+        ----------
+        url : str
+            Fully-qualified URL of the file to download.
+
+        Returns
+        -------
+        bytes or None
+            Raw response bytes, or ``None`` after 2 failed attempts.
+        """
         self.rotate_user_agent()
-        holiday_type = "clearing"
+
+        def _call() -> bytes:
+            self._throttle()
+            resp = self.session.get(url, headers=self.headers, timeout=10)
+            resp.raise_for_status()
+            return resp.content
+
         try:
-            response = self.session.get(
-                f"https://www.nseindia.com/api/holiday-master?type={holiday_type}",
-                headers=self.headers, timeout=10
+            return self._retry(_call)
+        except Exception as exc:
+            self._log_error("_get_archive", exc)
+            return None
+
+    def _get_csv_archive(self, url: str) -> pd.DataFrame | None:
+        """
+        Fetch a static CSV archive and parse it into a ``DataFrame``.
+
+        Parameters
+        ----------
+        url : str
+            Fully-qualified URL of the CSV file.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Parsed data, or ``None`` on download/parse failure.
+        """
+        raw = self._get_archive(url)
+        if raw is None:  # Bug 2 fix: b"" (empty file) is valid; only None signals error
+            return None
+        try:
+            return pd.read_csv(BytesIO(raw))
+        except Exception as exc:
+            self._log_error("_get_csv_archive", exc)
+            return None
+
+    def _get_csv_session(
+        self,
+        ref_url: str,
+        api_url: str,
+        retries: int = 3,
+    ) -> pd.DataFrame | None:
+        """
+        Fetch a session-authenticated CSV with BOM stripping and retry logic.
+
+        Warm-up cookies are obtained from *ref_url*; the actual CSV is
+        requested from *api_url*.  Automatically sorts by the ``Date`` column
+        if present.
+
+        Uses :meth:`_warm_and_fetch` for the HTTP call and :meth:`_retry`
+        for exponential back-off — replacing the previous hand-rolled
+        ``for attempt in range(retries)`` loop.
+
+        Parameters
+        ----------
+        ref_url : str
+            Page used to obtain session cookies.
+        api_url : str
+            CSV endpoint URL.
+        retries : int, optional
+            Maximum download attempts. Default is ``3``.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Sorted and cleaned data, or ``None`` on failure.
+        """
+        self.rotate_user_agent()
+
+        def _call() -> pd.DataFrame:
+            resp = self._warm_and_fetch(ref_url, api_url, timeout=10, api_timeout=15)
+            if "text/html" in resp.headers.get("Content-Type", ""):
+                raise ValueError("Received HTML instead of CSV — session may have expired")
+            df = _csv_from_bytes(resp.content)
+            if df.empty or len(df.columns) < 2:
+                raise ValueError("CSV response was empty or malformed")
+            if "Date" in df.columns:
+                df = _sort_dedup_dates(df, "Date", fmt="%d-%b-%Y", ascending=False)
+            return _clean_str(df)
+
+        try:
+            return self._retry(_call, retries=retries - 1)
+        except Exception as exc:
+            self._log_error("_get_csv_session", exc)
+            return None
+
+    def _get_chunked(
+        self,
+        ref_url:  str,
+        api_tpl:  str,
+        from_date: str,
+        to_date:   str,
+        chunk:    int = 89,
+        retries:  int = 3,
+    ) -> list:
+        """
+        Fetch data in sliding 89-day windows and collect all records.
+
+        *api_tpl* must be a format string accepting two positional
+        ``str.format`` arguments: ``{0}`` (start) and ``{1}`` (end) both
+        as ``DD-MM-YYYY`` strings.
+
+        Uses :meth:`_warm_and_fetch` for the initial session warm-up and
+        for the mid-loop cookie refresh when a chunk fetch fails, removing
+        the duplicated inline warm-up GET blocks.
+
+        Parameters
+        ----------
+        ref_url : str
+            Page for cookie warm-up.
+        api_tpl : str
+            URL template with ``{}`` placeholders for start and end dates.
+        from_date : str
+            Overall range start in ``DD-MM-YYYY``.
+        to_date : str
+            Overall range end in ``DD-MM-YYYY``.
+        chunk : int, optional
+            Window size in days. Default is ``89``.
+        retries : int, optional
+            Attempts per chunk. Default is ``3``.
+
+        Returns
+        -------
+        list
+            Collected raw record dicts; empty list on session failure.
+        """
+        self.rotate_user_agent()
+
+        # ── Initial warm-up: get cookies via _warm_and_fetch ─────────
+        try:
+            ref_resp = self._warm_and_fetch(ref_url, ref_url, timeout=10)
+            cookies  = ref_resp.cookies.get_dict() or dict(self.session.cookies)
+        except Exception as exc:
+            self._log_error("_get_chunked.session", exc)
+            return []
+
+        start    = datetime.strptime(from_date, "%d-%m-%Y")
+        end      = datetime.strptime(to_date,   "%d-%m-%Y")
+        all_data = []
+
+        while start <= end:
+            chunk_end = min(start + timedelta(days=chunk), end)
+            url       = api_tpl.format(
+                start.strftime("%d-%m-%Y"),
+                chunk_end.strftime("%d-%m-%Y"),
             )
-            response.raise_for_status()
-            data = response.json()
-            
-            # Extract only "CD" (Capital Market) holiday data
-            if "CM" in data:
-                df = pd.DataFrame(data["CD"], columns=["Sr_no", "tradingDate", "weekDay", "description", "morning_session", "evening_session"])
-                
-                if list_only:
-                    return df["tradingDate"].tolist()
-                return df
-            else:
-                return None
-        except (requests.RequestException, ValueError) as e:
-            print(f"Error fetching clearing holidays: {e}")
-            return None
-    
-    def is_nse_trading_holiday(self, date_str=None):
-        holidays = self.nse_trading_holidays(list_only=True)
-        if holidays is None:
-            return None
-        date_format = "%d-%b-%Y"
+            fetched = False
+
+            for att in range(1, retries + 1):
+                try:
+                    self._throttle()
+                    resp = self.session.get(
+                        url, headers=self.headers,
+                        cookies=cookies, timeout=15 + att * 5,
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        if "data" in data and isinstance(data["data"], list):
+                            all_data.extend(data["data"])
+                        fetched = True
+                        break
+                    elif resp.status_code == 429:
+                        time.sleep(random.uniform(8, 12))
+                    else:
+                        time.sleep(random.uniform(2, 4))
+                except Exception as exc:
+                    logger.debug("_get_chunked chunk attempt %d: %s", att, exc)
+                    time.sleep(random.uniform(3, 6))
+
+            if not fetched:
+                # ── Cookie refresh: reuse _warm_and_fetch ────────────
+                try:
+                    self.rotate_user_agent()
+                    ref_resp = self._warm_and_fetch(ref_url, ref_url, timeout=10)
+                    cookies  = ref_resp.cookies.get_dict() or dict(self.session.cookies)
+                except Exception as exc:
+                    logger.debug("_get_chunked cookie refresh failed: %s", exc)
+                    time.sleep(random.uniform(5, 10))
+
+            time.sleep(random.uniform(1.5, 3.5))
+            start = chunk_end + timedelta(days=1)
+
+        return all_data
+
+    def _live_ref_fetch(
+        self,
+        ref_url:     str,
+        api_url:     str,
+        timeout:     int = 10,
+        api_timeout: int | None = None,
+    ) -> requests.Response | None:
+        """
+        Warm-up cookies from *ref_url* then fetch *api_url* via the session.
+
+        Returns the ``Response`` on success, or ``None`` on any exception.
+        Used by live-data methods that need a simple one-shot warm-up but
+        do not require the full retry logic of :meth:`_get_json`.
+
+        Delegates the actual HTTP work to :meth:`_warm_and_fetch`.
+
+        Parameters
+        ----------
+        ref_url : str
+            Page used to obtain session cookies.
+        api_url : str
+            Actual data endpoint to query.
+        timeout : int, optional
+            Timeout for the warm-up GET. Default is ``10``.
+        api_timeout : int or None, optional
+            Timeout for the data GET. Defaults to *timeout* when ``None``.
+        """
+        self.rotate_user_agent()
         try:
-            if date_str:
-                date_obj = datetime.strptime(date_str, date_format)
-            else:
-                date_obj = datetime.today()
-            formatted_date = date_obj.strftime(date_format)
-            return formatted_date in holidays
-        except ValueError:
+            return self._warm_and_fetch(ref_url, api_url, timeout=timeout, api_timeout=api_timeout)
+        except Exception as exc:
+            self._log_error("_live_ref_fetch", exc)
             return None
 
-    def is_nse_clearing_holiday(self, date_str=None):
-        holidays = self.nse_clearing_holidays(list_only=True)
-        if holidays is None:
-            return None
-        date_format = "%d-%b-%Y"
+    def _chart_fetch(
+        self,
+        api_url: str,
+        home:    str = "https://www.nseindia.com/option-chain",
+    ) -> dict | None:
+        """
+        Warm-up cookies from *home*, then fetch the chart *api_url* as JSON.
+
+        Retries up to 2 times via :meth:`_retry`.  Delegates HTTP work to
+        :meth:`_warm_and_fetch`, removing the previously duplicated
+        warm-up + session GET block.
+        """
+        self.rotate_user_agent()
         try:
-            if date_str:
-                date_obj = datetime.strptime(date_str, date_format)
-            else:
-                date_obj = datetime.today()
-            formatted_date = date_obj.strftime(date_format)
-            return formatted_date in holidays
-        except ValueError:
+            return self._retry(
+                lambda: self._warm_and_fetch(home, api_url, timeout=10).json()
+            )
+        except Exception as exc:
+            self._log_error("_chart_fetch", exc)
             return None
 
-    def nse_live_market_turnover(self):
+
+# ══════════════════════════════════════════════════════════════════════════════
+# III. Internal Data Shaping & Parsing
+# ══════════════════════════════════════════════════════════════════════════════
+
+    # ── File Format Parsers ─────────────────────────────────────────────────
+
+    def _zip_csv(self, content: bytes) -> pd.DataFrame:
+        """
+        Extract the first ``.csv`` file from a ZIP archive and return it as a
+        ``DataFrame``.  Returns an empty ``DataFrame`` if no CSV is found.
+        """
+        with zipfile.ZipFile(BytesIO(content), "r") as zf:
+            for name in zf.namelist():
+                if name.endswith(".csv"):
+                    return pd.read_csv(zf.open(name))
+        return pd.DataFrame()
+
+    def _zip_rows(self, url: str, prefix: str) -> list | None:
+        """
+        Download a ZIP from *url* and extract raw CSV rows from the file
+        whose name starts with *prefix*.
+
+        Returns a list of string-lists (``csv.reader`` output) or ``None``.
+        """
+        raw = self._get_archive(url)
+        if not raw:
+            return None
+        try:
+            with zipfile.ZipFile(BytesIO(raw), "r") as zf:
+                for name in zf.namelist():
+                    if name.lower().startswith(prefix) and name.endswith(".csv"):
+                        text = zf.open(name).read().decode("utf-8", "ignore")
+                        return list(csv.reader(text.splitlines()))
+        except Exception as exc:
+            self._log_error("_zip_rows", exc)
+            return None
+
+    def _read_excel(self, content: bytes) -> pd.DataFrame | None:
+        """
+        Auto-detect ``xlrd`` vs ``openpyxl`` from the file magic bytes and
+        parse the Excel workbook into a ``DataFrame`` with all-string dtypes.
+
+        Returns ``None`` when the magic bytes are unrecognised.
+        """
+        buf = BytesIO(content)
+        sig = buf.read(8)
+        buf.seek(0)
+        if sig.startswith(b"\xD0\xCF\x11\xE0"):
+            engine = "xlrd"
+        elif sig.startswith(b"\x50\x4B\x03\x04"):
+            engine = "openpyxl"
+        else:
+            return None
+        return pd.read_excel(buf, engine=engine, dtype=str)
+
+    # ── Domain-Agnostic Shared Logic ────────────────────────────────────────
+
+    def _json_data_df(self, ref_url: str, api_url: str) -> pd.DataFrame | None:
+        """
+        Fetch *api_url* as JSON, assert a top-level ``"data"`` key, and
+        return the contents as a ``DataFrame``.
+
+        Returns ``None`` when the request fails or ``"data"`` is absent.
+        Centralises the ``if not data or "data" not in data`` guard that
+        appeared verbatim in 20+ public methods.
+        """
+        data = self._get_json(ref_url, api_url)
+        if not data or "data" not in data:
+            return None
+        return pd.DataFrame(data["data"])
+
+    def _cm_live_simple(
+        self,
+        ref_url: str,
+        api_url: str,
+        cols:    list | None = None,
+    ) -> pd.DataFrame | None:
+        """
+        Generic single-call helper for live CM endpoints that return a
+        top-level ``{"data": [...]}`` JSON payload.
+
+        *cols* optionally selects a subset of columns from the result.
+        """
+        df = self._json_data_df(ref_url, api_url)
+        if df is None:
+            return None
+        if cols:
+            df = _keep_cols(df, cols)
+        return df if not df.empty else None
+
+    def _cm_live_52wk(self, ref_url: str, api_url: str) -> pd.DataFrame | None:
+        """
+        Shared fetch for 52-week high / low live data.
+
+        Returns a ``DataFrame`` with the six standard price columns or
+        ``None`` on failure.
+        """
+        df = self._json_data_df(ref_url, api_url)
+        if df is None:
+            return None
+        if df.empty:
+            return None
+        return df[["symbol", "series", "ltp", "pChange", "new52WHL", "prev52WHL", "prevHLDate"]]
+
+    def _hist_index_df(
+        self,
+        ref_url:  str,
+        api_tpl:  str,
+        from_date: str,
+        to_date:   str,
+        col_map:  dict,
+    ) -> pd.DataFrame:
+        """
+        Shared helper for index / VIX historical data.
+
+        Fetches records via the chunked API, renames columns per *col_map*,
+        sorts by ``Date``, and removes duplicates.
+        """
+        records = self._get_chunked(ref_url, api_tpl, from_date, to_date)
+        if not records:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(records)
+        df = _keep_cols(df, col_map).rename(columns=col_map)
+
+        if "Date" in df.columns:
+            df = _sort_dedup_dates(df, "Date", fmt="%d-%b-%Y", ascending=True)
+
+        return df.reset_index(drop=True)
+
+    def _snapshot_contracts(self, index_param: str) -> pd.DataFrame | None:
+        """
+        Shared helper for most-active-contracts snapshots (OI / volume /
+        options).  Hits the NSE ``snapshot-derivatives-equity`` endpoint
+        with *index_param* as the query value.
+        """
+        resp = self._live_ref_fetch(
+            "https://www.nseindia.com/market-data/most-active-contracts",
+            f"https://www.nseindia.com/api/snapshot-derivatives-equity?index={index_param}",
+        )
+        try:
+            df = pd.DataFrame(resp.json()["volume"]["data"])
+            return df if not df.empty else None
+        except Exception as exc:
+            self._log_error("_snapshot_contracts", exc)
+            return None
+
+    def _hist_deal_csv(
+        self,
+        option_type: str,
+        *args,
+        from_date: str | None = None,
+        to_date:   str | None = None,
+        period:    str | None = None,
+        symbol:    str | None = None,
+    ) -> pd.DataFrame | None:
+        """
+        Shared CSV fetch for bulk deals, block deals, and short-selling.
+
+        *option_type* must be one of ``"bulk_deals"``, ``"block_deals"``,
+        or ``"short_selling"``.
+        """
+        from_date, to_date, period, symbol = _unpack_args(
+            args, from_date, to_date, period, symbol, short=True
+        )
+
+        # Bug 4 fix: _resolve_dates already falls back to today, so the two
+        # redundant "or today" lines were dead code and have been removed.
+        from_date, to_date = _resolve_dates(from_date, to_date, period)
+
+        ref_url = "https://www.nseindia.com/report-detail/display-bulk-and-block-deals"
+        base    = "https://www.nseindia.com/api/historicalOR/bulk-block-short-deals"
+        api_url = (
+            f"{base}?optionType={option_type}&symbol={symbol}"
+            f"&from={from_date}&to={to_date}&csv=true"
+            if symbol
+            else f"{base}?optionType={option_type}&from={from_date}&to={to_date}&csv=true"
+        )
+        return self._get_csv_session(ref_url, api_url)
+
+    def _corp_filing(
+        self,
+        ref_url:   str,
+        base_api:  str,
+        *args,
+        from_date: str | None = None,
+        to_date:   str | None = None,
+        symbol:    str | None = None,
+        period:    str | None = None,
+        extra:     str        = "",
+        keep_cols: list | None = None,
+    ) -> pd.DataFrame | None:
+        """
+        Shared helper for all corporate-filing endpoints (announcements,
+        board meetings, insider trading, BR/SR).
+
+        Builds the correct query string from optional date/symbol parameters,
+        fetches JSON via :meth:`_get_json`, and returns a filtered
+        ``DataFrame``.
+        """
+        from_date, to_date, period, symbol = _unpack_args(
+            args, from_date, to_date, period, symbol, short=True
+        )
+
+        if period:
+            from_date, to_date = _resolve_dates(period=period)
+
+        today = datetime.now().strftime("%d-%m-%Y")
+        if (from_date or to_date or period) and not symbol:
+            from_date = from_date or today
+            to_date   = to_date   or today
+
+        if symbol and from_date and to_date:
+            api = f"{base_api}?index=equities&from_date={from_date}&to_date={to_date}&symbol={symbol}{extra}"
+        elif symbol:
+            api = f"{base_api}?index=equities&symbol={symbol}{extra}"
+        elif from_date and to_date:
+            api = f"{base_api}?index=equities&from_date={from_date}&to_date={to_date}{extra}"
+        else:
+            # Base URL selection: BR/SR endpoint (sustainabilitiy) prefers no 'index=equities'
+            # on the base "recent" call, whereas other filings (announcements, etc.)
+            # are fine with it or expect it for the standard 'NSE Equities' scope.
+            if "sustainabilitiy" in base_api:
+                api = f"{base_api}{extra}"
+            else:
+                api = f"{base_api}?index=equities{extra}"
+
+        data = self._get_json(ref_url, api)
+        if not data:
+            return None
+        records = data.get("data") if isinstance(data, dict) else data
+        if not records or not isinstance(records, list):
+            return None
+
+        df = pd.DataFrame(records)
+        if keep_cols:
+            df = _keep_cols(df, keep_cols)
+        return _clean_str(df)
+
+    def _further_issue(
+        self,
+        base_url:     str,
+        ref_page:     str,
+        index_map:    dict,
+        rename_maps:  dict,
+        *args,
+        from_date: str | None = None,
+        to_date:   str | None = None,
+        period:    str | None = None,
+        symbol:    str | None = None,
+        stage:     str | None = None,
+    ) -> pd.DataFrame | None:
+        """
+        Shared helper for further-issue endpoints: QIP, Preferential Issue,
+        and Rights Issue.
+
+        Accepts stage strings ``"In-Principle"`` or ``"Listing Stage"`` via
+        positional *args* or the *stage* keyword, plus the usual date/symbol
+        parameters.
+
+        Uses :meth:`_warm_and_fetch` (via :meth:`_retry`) instead of the
+        previous inline warm-up GET block.
+        """
+        period_re = re.compile(r"^(1D|1W|1M|3M|6M|1Y)$", re.IGNORECASE)
+        for arg in args:
+            if not isinstance(arg, str):
+                continue
+            arg_t = arg.title()
+            if arg_t in ("In-Principle", "Listing Stage"):
+                stage = arg_t
+            elif _DATE_PATTERN.match(arg):
+                if not from_date:
+                    from_date = arg
+                elif not to_date:
+                    to_date = arg
+            elif period_re.match(arg.upper()):
+                period = arg.upper()
+            else:
+                symbol = arg.upper()
+
+        if period and not (from_date and to_date):
+            from_date, to_date = _resolve_dates(period=period)
+
+        stage  = (stage or "In-Principle").title()
+        params = {"index": index_map[stage]}
+        if symbol:
+            params["symbol"] = symbol
+        elif from_date and to_date:
+            params["from_date"] = from_date
+            params["to_date"]   = to_date
+
+        api = base_url + "?" + "&".join(f"{k}={v}" for k, v in params.items())
         self.rotate_user_agent()
 
-        ref_url = 'https://www.nseindia.com/'
-        api_url = 'https://www.nseindia.com/api/NextApi/apiClient?functionName=getMarketTurnoverSummary'
-
         try:
-            # Step 1: Get cookies
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()
-
-            # Step 2: Fetch API data
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()
-
-            # Step 3: Parse JSON
-            data = response.json().get('data', {})
-
+            data = self._retry(
+                lambda: self._warm_and_fetch(ref_page, api, timeout=10).json().get("data", [])
+            )
             if not data:
-                print("No data returned from API.")
-                return pd.DataFrame()  # Return empty DataFrame instead of None
+                return None
+            rmap = rename_maps[stage]
+            df   = pd.DataFrame(data)
+            df   = _keep_cols(df, rmap).rename(columns=rmap)
+            return _clean_str(df)
+        except Exception as exc:
+            self._log_error("_further_issue", exc)
+            return None
 
+    def _name_change_csv(self, url: str, has_header: bool = True) -> pd.DataFrame | None:
+        """
+        Fetch a name/symbol-change CSV and sort by the fourth column (date).
+
+        Used by :meth:`cm_eod_eq_name_change` and
+        :meth:`cm_eod_eq_symbol_change`.
+        """
+        raw = self._get_archive(url)
+        if not raw:
+            return None
+        df = (
+            pd.read_csv(BytesIO(raw))
+            if has_header
+            else pd.read_csv(BytesIO(raw), header=None)
+        )
+        if df.shape[1] >= 4:
+            df.iloc[:, 3] = (
+                pd.to_datetime(df.iloc[:, 3], format="%d-%b-%Y", errors="coerce")
+                .dt.strftime("%Y-%m-%d")
+            )
+            df = df.sort_values(by=df.columns[3], ascending=False).reset_index(drop=True)
+        return df
+
+    def _biz_growth_fetch(self, market_type: str, mode: str, month: int | str, year: int):
+        """
+        Generic fetch, clean, convert, and rename for CM or F&O business-growth data.
+
+        Parameters
+        ----------
+        market_type : str
+            ``"cm"`` or ``"fo"``.
+        mode : str
+            ``"yearly"``, ``"monthly"``, or ``"daily"``.
+        month : int or str
+            Month as an integer (1–12) or a 3-letter abbreviation (e.g. ``"OCT"``).
+        year : int
+            4-digit calendar year.
+
+        Returns
+        -------
+        list[dict] or None
+            Records as a list of dicts, or ``None`` on failure.
+        """
+        if mode not in ("yearly", "monthly", "daily"):
+            raise ValueError("Invalid mode. Use 'yearly', 'monthly', or 'daily'")
+
+        # Normalise month to int then to NSE title-case string (e.g. "Oct")
+        if isinstance(month, str):
+            month = _MONTH_NUM[month[:3].upper()]
+        month_str = _NUM_MONTH[month].title()
+
+        # Financial-year window required only for monthly mode
+        # Bug 1 fix: always define from_year / to_year before the dict
+        # literal so the f-string ternary does not raise NameError when
+        # mode is 'yearly' or 'daily' (variables would be unbound).
+        from_year = to_year = None
+        if mode == "monthly":
+            from_year, to_year = (year - 1, year) if month in (1, 2, 3) else (year, year + 1)
+
+        base_url = "https://www.nseindia.com/api/historicalOR"
+        api_path_map = {
+            "cm": {
+                "yearly":  "cm/tbg/yearly",
+                "monthly": f"cm/tbg/monthly?from={from_year}&to={to_year}" if mode == "monthly" else None,
+                "daily":   f"cm/tbg/daily?month={month_str}&year={year % 100:02d}",
+            },
+            "fo": {
+                "yearly":  "fo/tbg/yearly",
+                "monthly": f"fo/tbg/monthly?from={from_year}&to={to_year}" if mode == "monthly" else None,
+                "daily":   f"fo/tbg/daily?month={month_str}&year={year}",
+            },
+        }
+        url = f"{base_url}/{api_path_map[market_type][mode]}"
+        self.rotate_user_agent()
+
+        try:
+            raw_data = self._retry(
+                lambda: self._warm_and_fetch(
+                    "https://www.nseindia.com/option-chain", url, timeout=10
+                ).json().get("data", [])
+            )
+            data_list = [item.get("data", item) for item in raw_data if item]
+            if not data_list:
+                return None
+
+            df = pd.DataFrame(data_list)
+
+            # Normalise all columns: strip commas, coerce to numeric where possible.
+            # errors="coerce" converts non-numeric strings to NaN; we then fill
+            # those back from the cleaned string series so non-numeric columns
+            # (e.g. month labels) keep their original string values.
+            for col in df.columns:
+                cleaned = df[col].astype(str).str.replace(",", "", regex=False).str.strip()
+                cleaned = cleaned.replace({"None": "-", "nan": "-", "NaN": "-", "": "-"})
+                numeric = pd.to_numeric(cleaned, errors="coerce")
+                df[col] = numeric.where(numeric.notna(), other=cleaned)
+
+            df = df.rename(columns=_BIZ_GROWTH_RENAME_MAPS[market_type][mode])
+            return df.astype(object).to_dict(orient="records")
+
+        except (requests.RequestException, ValueError, KeyError) as exc:
+            self._log_error("_biz_growth_fetch", exc)
+            return None
+
+    def _monthly_settlement(
+        self,
+        from_year:  int | None,
+        to_year:    int | None,
+        period:     str | None,
+        api_tpl:    str,
+        rename_map: dict,
+    ) -> pd.DataFrame | None:
+        """
+        Shared helper for monthly settlement reports (CM and F&O).
+
+        Loops over each financial year in the requested range, calls the
+        NSE API for each, and returns a consolidated ``DataFrame`` sorted
+        by month.
+        """
+        today = datetime.now()
+        cfy   = today.year if today.month >= 4 else today.year - 1
+
+        if period and not from_year:
+            from_year = cfy - int(period[:-1])
+            to_year   = cfy + 1
+        elif not from_year:
+            from_year = cfy
+            to_year   = cfy + 1
+        elif not to_year:
+            to_year = from_year + 1
+
+        self.rotate_user_agent()
+        ref_url = "https://www.nseindia.com/report-detail/monthly-settlement-statistics"
+
+        try:
             all_data = []
 
-            # Step 4: Iterate through each segment (equities, derivatives, etc.)
-            for segment_name, records in data.items():
-                if isinstance(records, list):
-                    for item in records:
-                        all_data.append({
-                            "Segment": segment_name.upper(),
-                            "Product": item.get("instrument", ""),
-                            "Vol (Shares/Contracts)": item.get("volume", 0),
-                            "Value (₹ Cr)": round(item.get("value", 0) / 1e7, 2),
-                            "OI (Contracts)": item.get("oivalue", 0),
-                            "No. of Orders#": item.get("noOfOrders", 0),
-                            "No. of Trades": item.get("noOfTrades", 0),
-                            "Avg Trade Value (₹)": item.get("averageTrade", 0),
-                            "Updated At": item.get("mktTimeStamp", ""),
-                            "Prev Vol": item.get("prevVolume", 0),
-                            "Prev Value (₹ Cr)": round(item.get("prevValue", 0) / 1e7, 2),
-                            "prev OI (Contracts)": item.get("prevOivalue", 0),
-                            "prev Orders#": item.get("prevNoOfOrders", 0),
-                            "prev Trades": item.get("prevNoOfTrades", 0),
-                            "prev Avg Trade Value (₹)": item.get("prevAverageTrade", 0),       
-                        })
+            for fy in range(from_year, to_year):
+                api = api_tpl.format(fy, fy + 1)
 
-            # Convert all data into a single DataFrame
-            df_turnover = pd.DataFrame(all_data)
+                def _call(api=api):
+                    return self._warm_and_fetch(ref_url, api, timeout=15).json()
 
-            # Clean up NaNs/Infs for Google Sheets
-            df_turnover.replace([pd.NA, np.nan, float('inf'), float('-inf')], None, inplace=True)
-
-            return df_turnover
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching market turnover data: {e}")
-            return pd.DataFrame()  # Return empty DataFrame if error
-
-    def nse_live_hist_circulars(self, from_date_str: str = None, to_date_str: str = None, filter: str = None):
-        self.rotate_user_agent()
-
-        # Default date range (yesterday to today if not provided)
-        if from_date_str is None:
-            from_date = datetime.now() - timedelta(days=1)
-            from_date_str = from_date.strftime("%d-%m-%Y")
-        if to_date_str is None:
-            to_date = datetime.now()
-            to_date_str = to_date.strftime("%d-%m-%Y")
-
-        # Reference URL for cookies
-        ref_url = 'https://www.nseindia.com/resources/exchange-communication-circulars'
-        try:
-            ref = requests.get(ref_url, headers=self.headers)
-        except requests.RequestException as e:
-            print(f"Failed to get reference cookies: {str(e)}")
-            return pd.DataFrame(columns=["Date", "Circulars No", "Category", "Department", "Subject", "Attachment"])
-
-        try:
-            # API URL for circulars
-            url = f"https://www.nseindia.com/api/circulars?&fromDate={from_date_str}&toDate={to_date_str}"
-            response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
-            response.raise_for_status()
-            json_data = response.json().get("data", [])
-
-            # Handle empty or unexpected data
-            if not isinstance(json_data, list) or not json_data:
-                # print("❌ No NSE Circular data available")
-                return pd.DataFrame(columns=["Date", "Circulars No", "Category", "Department", "Subject", "Attachment"])
-
-            circulars = []
-            for item in json_data:
-                circulars.append({
-                    "date": item.get("cirDisplayDate", ''),
-                    "circulars": item.get("circDisplayNo", ''),
-                    "category": item.get("circCategory", ''),
-                    "department": item.get("circDepartment", ''),
-                    "subject": item.get("sub", ''),
-                    "attachment": item.get("circFilelink", ''),
-                })
-
-            # Create DataFrame
-            df = pd.DataFrame(circulars)
-
-            # Apply filtering
-            if filter is not None:
-                df = df[df['department'].str.contains(filter, case=False, na=False)]
-
-            # Rename and reorder columns
-            column_mapping = {
-                "date": "Date",
-                "circulars": "Circulars No",
-                "category": "Category",
-                "department": "Department",
-                "subject": "Subject",
-                "attachment": "Attachment",
-            }
-            df = df.rename(columns=column_mapping)
-            df = df[["Date", "Circulars No", "Category", "Department", "Subject", "Attachment"]]
-
-            # print(f"Final number of records in DataFrame: {len(df)}")
-            return df
-
-        except (requests.RequestException, ValueError, TypeError) as e:
-            # print("No circulars available")
-            return pd.DataFrame(columns=["Date", "Circulars No", "Category", "Department", "Subject", "Attachment"])
-
-    def nse_live_hist_press_releases(self, from_date_str: str = None, to_date_str: str = None, filter: str = None):
-        self.rotate_user_agent()
-
-        # Default date range (yesterday to today if not provided)
-        try:
-            if from_date_str is None:
-                from_date = datetime.now() - timedelta(days=1)
-                from_date_str = from_date.strftime("%d-%m-%Y")
-            else:
-                datetime.strptime(from_date_str, "%d-%m-%Y")  # Validate date format
-
-            if to_date_str is None:
-                to_date = datetime.now()
-                to_date_str = to_date.strftime("%d-%m-%Y")
-            else:
-                datetime.strptime(to_date_str, "%d-%m-%Y")  # Validate date format
-        except ValueError as e:
-            print(f"Invalid date format: {e}")
-            return pd.DataFrame(columns=["DATE", "DEPARTMENT", "SUBJECT", "ATTACHMENT URL", "LAST UPDATED"])
-
-        # Reference URL for cookies
-        ref_url = 'https://www.nseindia.com/resources/exchange-communication-press-releases'
-        try:
-            ref = requests.get(ref_url, headers=self.headers, timeout=10)
-            ref.raise_for_status()
-        except requests.RequestException as e:
-            print(f"Failed to fetch reference URL: {e}")
-            return pd.DataFrame(columns=["DATE", "DEPARTMENT", "SUBJECT", "ATTACHMENT URL", "LAST UPDATED"])
-
-        try:
-            # API URL for press releases
-            url = f"https://www.nseindia.com/api/press-release-cms20?fromDate={from_date_str}&toDate={to_date_str}"
-            response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
-            response.raise_for_status()
-            json_data = response.json()
-
-            # Handle case when response is not a list
-            if not isinstance(json_data, list):
-                print("No press releases found")
-                return pd.DataFrame(columns=["DATE", "DEPARTMENT", "SUBJECT", "ATTACHMENT URL", "LAST UPDATED"])
-
-            press_releases = []
-            for item in json_data:
-                if not isinstance(item, dict) or 'content' not in item:
-                    continue  # Skip invalid items
-
-                content = item['content']
-
-                # Clean HTML from subject
-                subject_raw = content.get('body', '')
-                subject_clean = subject_raw  # Default to raw text as fallback
-                if subject_raw and isinstance(subject_raw, str):
-                    # Check if content resembles HTML (basic heuristic)
-                    if '<' in subject_raw and '>' in subject_raw:
-                        try:
-                            with warnings.catch_warnings():
-                                warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
-                                soup = BeautifulSoup(subject_raw, "html.parser")
-                                subject_clean = soup.get_text(separator=' ').strip()
-                        except Exception as e:
-                            print(f"Failed to parse HTML for subject: {e}")
-                    else:
-                        # Treat as plain text and strip whitespace
-                        subject_clean = subject_raw.strip()
-
-                # Format 'changed' field
-                changed_raw = item.get('changed', '')
                 try:
-                    last_updated_ts = datetime.strptime(changed_raw, "%a, %m/%d/%Y - %H:%M")
-                    last_updated_str = last_updated_ts.strftime("%a %d-%b-%Y %I:%M %p")
-                except ValueError:
-                    last_updated_str = changed_raw  # Fallback to raw string
+                    js   = self._retry(_call)
+                    recs = js if isinstance(js, list) else js.get("data", [])
+                    for rec in recs:
+                        if isinstance(rec, dict):
+                            rec["FinancialYear"] = f"{fy}-{fy + 1}"
+                    all_data.extend(recs)
+                except Exception:
+                    pass
 
-                press_releases.append({
-                    "date": content.get('field_date', ''),
-                    "subject": subject_clean,
-                    "department": content.get('field_type', ''),
-                    "attachment_url": content.get('field_file_attachement', {}).get('url') if content.get('field_file_attachement') else None,
-                    "changed": last_updated_str
-                })
+            if not all_data:
+                return None
 
-            if not press_releases:
-                print("No press releases data available")
-                return pd.DataFrame(columns=["DATE", "DEPARTMENT", "SUBJECT", "ATTACHMENT URL", "LAST UPDATED"])
-
-            # Create DataFrame
-            df = pd.DataFrame(press_releases)
-
-            # Apply filtering
-            if filter is not None:
-                df = df[df['department'].str.contains(filter, case=False, na=False)]
-
-            # Rename and reorder columns
-            column_mapping = {
-                "date": "DATE",
-                "subject": "SUBJECT",
-                "department": "DEPARTMENT",
-                "attachment_url": "ATTACHMENT URL",
-                "changed": "LAST UPDATED"
-            }
-            df = df.rename(columns=column_mapping)
-            df = df[["DATE", "DEPARTMENT", "SUBJECT", "ATTACHMENT URL", "LAST UPDATED"]]
-
-            # print(f"Final number of records in DataFrame: {len(df)}")
+            df = pd.DataFrame(all_data).rename(columns=rename_map)
+            if "Month" in df.columns:
+                df["_sort"] = pd.to_datetime(df["Month"], format="%b-%Y", errors="coerce")
+                df.sort_values(["FinancialYear", "_sort"], inplace=True)
+                df.reset_index(drop=True, inplace=True)
+                df["Month"] = df["_sort"].dt.strftime("%b-%Y")
+                df.drop(columns=["_sort"], inplace=True)
             return df
 
-        except (requests.RequestException, ValueError, TypeError) as e:
-            print(f"Error fetching press releases: {e}")
-            return pd.DataFrame(columns=["DATE", "DEPARTMENT", "SUBJECT", "ATTACHMENT URL", "LAST UPDATED"])
- 
-    def nse_reference_rates(self):
-        self.rotate_user_agent()  # Rotating User-Agent
-
-        ref_url = 'https://www.nseindia.com'
-        api_url = 'https://www.nseindia.com/api/NextApi/apiClient?functionName=getReferenceRates&&type=null&&flag=CUR'
-
-        try:
-            # Get reference cookies
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()
-
-            # Fetch API data
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()
-
-            data = response.json()
-            
-            # Extract currencySpotRates safely
-            currency_data = data.get('data', {}).get('currencySpotRates', [])
-            if currency_data:
-                df = pd.DataFrame(currency_data)
-                columns = ['currency', 'unit', 'value', 'prevDayValue']
-                df = df[columns]
-
-                # Fix NaN / Infinite values
-                df = df.fillna(0)
-                df = df.replace({float('inf'): 0, float('-inf'): 0})
-
-                return df if not df.empty else None
-
-            return None  # No currency data found
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching reference rates: {e}")
+        except Exception as exc:
+            self._log_error("_monthly_settlement", exc)
             return None
 
-    def nse_eod_top10_nifty50(self, trade_date: str):
-        self.rotate_user_agent()
-        trade_date = datetime.strptime(trade_date, "%d-%m-%y")
-        url = f"https://nsearchives.nseindia.com/content/indices/top10nifty50_{str(trade_date.strftime('%d%m%y').upper())}.csv"
-        try:
-            nse_resp = requests.get(url, headers=self.headers, timeout=10)
-            nse_resp.raise_for_status()
-            bhav_df = pd.read_csv(BytesIO(nse_resp.content))
-            return bhav_df
-        except (requests.RequestException, ValueError):
-            return None
-        
-    def nse_6m_nifty_50(self, list_only=False):
-        self.rotate_user_agent()
-        url = "https://nsearchives.nseindia.com/content/indices/ind_nifty50list.csv"
-        try:
-            nse_resp = self.session.get(url, headers=self.headers, timeout=10)
-            nse_resp.raise_for_status()
-            data_df = pd.read_csv(BytesIO(nse_resp.content))
-            data_df.columns = data_df.columns.str.strip()  # Clean column names
-            data_df = data_df[['Company Name', 'Industry', 'Symbol', 'Series', 'ISIN Code']]
-            if list_only:
-                return data_df['Symbol'].tolist()
-            return data_df
-        except (requests.RequestException, ValueError) as e:
-            print("Error fetching Nifty 50 list:", e)
-            return None
-    
-    def nse_eom_fno_full_list(self, mode: str = "stocks", list_only: bool = False):
+    def _pre_open(self, category: str = "All") -> dict | None:
         """
-        Fetch NSE End-of-Month (EoM) F&O Full List — Underlyings or Indices.
+        Shared data fetch for all pre-open market methods.
+
+        *category* accepts ``"NIFTY 50"``, ``"Nifty Bank"``, ``"Emerge"``,
+        ``"Securities in F&O"``, ``"Others"``, or ``"All"``.
+        """
+        xref = {
+            "NIFTY 50": "NIFTY", "Nifty Bank": "BANKNIFTY",
+            "Emerge": "SME", "Securities in F&O": "FO",
+            "Others": "OTHERS", "All": "ALL",
+        }
+        self.rotate_user_agent()
+        ref_url = "https://www.nseindia.com/market-data/pre-open-market-cm-and-emerge-market"
+
+        def _call():
+            api = (
+                f"https://www.nseindia.com/api/market-data-pre-open"
+                f"?key={xref.get(category, 'ALL')}"
+            )
+            return self._warm_and_fetch(ref_url, api, timeout=10).json()
+
+        try:
+            return self._retry(_call)
+        except Exception as exc:
+            self._log_error("_pre_open", exc)
+            return None
+
+    def _fao_participant_csv(self, trade_date: str, suffix: str) -> pd.DataFrame | None:
+        """
+        Shared fetch for participant-wise OI and volume CSVs.
+
+        *suffix* is either ``"oi"`` or ``"vol"``.
+        """
+        ds = _fmt_trade_date(trade_date, "%d%m%Y").upper()
+        return self._get_csv_archive(
+            f"https://nsearchives.nseindia.com/content/nsccl/"
+            f"fao_participant_{suffix}_{ds}.csv"
+        )
+
+    def _holidays(
+        self,
+        htype:     str,
+        seg:       str,
+        list_only: bool,
+    ) -> pd.DataFrame | list | None:
+        """
+        Shared helper for trading and clearing holiday calendars.
+
+        *htype* is ``"trading"`` or ``"clearing"``; *seg* is ``"CM"`` or
+        ``"CD"``.  When *list_only* is ``True``, returns a plain list of date
+        strings instead of a ``DataFrame``.
+        """
+        try:
+            raw = self._get_json(
+                "https://www.nseindia.com/market-data/live-equity-market",
+                f"https://www.nseindia.com/api/holiday-master?type={htype}"
+            )
+        except Exception as exc:
+            self._log_error("_holidays", exc)
+            return None
+
+        if raw is None:
+            return None
+        if seg not in raw:
+            return None
+        df = pd.DataFrame(
+            raw[seg],
+            columns=["Sr_no", "tradingDate", "weekDay", "description",
+                     "morning_session", "evening_session"],
+        )
+        return df["tradingDate"].tolist() if list_only else df
+
+    def _is_holiday(self, fn, date_str: str | None = None) -> bool | None:
+        """
+        Check whether *date_str* (``%d-%b-%Y``) or today is a market holiday.
+
+        *fn* must be either :meth:`nse_trading_holidays` or
+        :meth:`nse_clearing_holidays`.
+        """
+        holidays = fn(list_only=True)
+        if holidays is None:
+            return None
+        try:
+            dt  = datetime.strptime(date_str, "%d-%b-%Y") if date_str else datetime.today()
+            return dt.strftime("%d-%b-%Y") in holidays
+        except Exception as exc:
+            self._log_error("_is_holiday", exc)
+            return None
+
+    def _nse_csv_list(
+        self,
+        url:      str,
+        cols:     list,
+        sym_col:  str,
+        list_only: bool,
+    ) -> pd.DataFrame | list | None:
+        """
+        Download a CSV archive, keep only *cols*, and optionally return just
+        the *sym_col* values as a plain list.
+        """
+        raw = self._get_archive(url)
+        if not raw:
+            return None
+        df = pd.read_csv(BytesIO(raw))
+        df.columns = df.columns.str.strip()
+        df = _keep_cols(df, cols)
+        return df[sym_col].tolist() if list_only else df
+
+    # ── SEBI Helpers ────────────────────────────────────────────────────────
+
+    def _sebi_headers(self) -> dict:
+        """Shared headers for all SEBI POST requests."""
+        return {
+            "User-Agent":       "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Referer":          self._SEBI_REFERER,
+            "Origin":           "https://www.sebi.gov.in",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+
+    def _sebi_post(self, payload: dict) -> list[dict]:
+        """
+        POST to the SEBI circular listing endpoint, parse the HTML table,
+        and return a list of row dicts.
 
         Parameters
         ----------
-        mode : str, default 'stocks'
-            Type of list to fetch.
-            Options:
-                'stocks' -> Underlying (Equity) List
-                'index'  -> Index List
-        list_only : bool, default False
-            If True, return only a list of symbols.
-            If False, return a DataFrame with details.
+        payload : dict
+            Form data to send.  Callers must supply the date/page fields.
 
         Returns
         -------
-        list or pd.DataFrame or None
-            Returns list of symbols if list_only=True.
-            Returns DataFrame with serial number, symbol, and underlying if list_only=False.
-            Returns None on failure.
+        list[dict]
+            Parsed rows; empty list on HTTP error or missing table.
         """
-        self.rotate_user_agent()
-        ref_url = "https://www.nseindia.com/products-services/equity-derivatives-list-underlyings-information"
-        api_url = "https://www.nseindia.com/api/underlying-information"
-
         try:
-            # Step 1: Get reference cookies
-            ref_resp = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_resp.raise_for_status()
+            self._throttle()
+            resp  = requests.post(
+                self._SEBI_URL,
+                headers=self._sebi_headers(),   # was missing () — called as property, not method
+                data=payload,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            soup  = BeautifulSoup(resp.text, "html.parser")
+            table = soup.find("table", {"id": "sample_1"})
+            return self._parse_sebi_table(table)
+        except Exception as exc:
+            self._log_error("_sebi_post", exc)
+            return []
 
-            # Step 2: API call with cookies
-            data_resp = self.session.get(api_url, headers=self.headers, cookies=ref_resp.cookies.get_dict(), timeout=10)
-            data_resp.raise_for_status()
-            data_dict = data_resp.json()
+    @staticmethod
+    def _parse_sebi_table(table) -> list[dict]:
+        """
+        Extract rows from a SEBI HTML ``<table id="sample_1">`` element.
 
-            # Step 3: Determine which list to fetch
-            mode = mode.strip().lower()
-            if mode == "index":
-                data_df = pd.DataFrame(data_dict["data"]["IndexList"])
-            elif mode == "stocks":
-                data_df = pd.DataFrame(data_dict["data"]["UnderlyingList"])
-            else:
-                raise ValueError("Invalid mode. Choose either 'stocks' or 'index'.")
+        Returns a list of ``{"Date": str, "Title": str, "Link": str|None}``
+        dicts.  The Date value is the raw text from the first cell; callers
+        are responsible for converting it to a datetime type.
+        """
+        rows = []
+        if not table:
+            return rows
+        for tr in table.find_all("tr")[1:]:
+            tds = tr.find_all("td")
+            if len(tds) < 2:
+                continue
+            a_tag = tds[1].find("a")
+            title = a_tag.get("title") or a_tag.get_text(strip=True) if a_tag else tds[1].get_text(strip=True)
+            href  = a_tag.get("href") if a_tag else None
+            if href and not href.startswith("http"):
+                href = "https://www.sebi.gov.in" + href
+            rows.append({
+                "Date":  tds[0].get_text(strip=True),
+                "Title": title,
+                "Link":  href,
+            })
+        return rows
 
-            # Step 4: Standardize columns
-            data_df = data_df.rename(columns={
-                "serialNumber": "Serial Number",
-                "symbol": "Symbol",
-                "underlying": "Underlying"
+    @staticmethod
+    def _finalise_sebi_df(df: pd.DataFrame) -> pd.DataFrame:
+        """Sort, dedup, and format the Date column of a SEBI DataFrame."""
+        if df.empty:
+            return df
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df.sort_values("Date", ascending=False, inplace=True)
+        df.drop_duplicates(subset=["Date", "Title"], keep="first", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        df["Date"] = df["Date"].dt.strftime("%d-%b-%Y")
+        return df
+
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ── NSE Market ──────────────────────────────────────────────────────────
+
+    def nse_market_status(self, mode: str = "Market Status") -> pd.DataFrame | dict | None:
+        """
+        Fetch overall NSE market status, market cap, Nifty 50 info, and
+        Gift Nifty snapshot.
+
+        Combines four sub-payloads from the ``/api/marketStatus`` endpoint
+        into individual ``DataFrame`` slices.
+
+        Parameters
+        ----------
+        mode : str, optional
+            One of ``"Market Status"``, ``"Mcap"``, ``"Nifty50"``,
+            ``"Gift Nifty"`` (case-insensitive), or ``"all"`` to return
+            everything packed in a dict. Default is ``"Market Status"``.
+
+        Returns
+        -------
+        pd.DataFrame or dict or None
+            Selected slice of the market-status payload, or ``None`` on
+            failure.
+
+        Examples
+        --------
+        >>> nse.nse_market_status("Nifty50")
+        >>> nse.nse_market_status("Mcap")
+        >>> nse.nse_market_status("Gift Nifty")
+        """
+        data = self._get_json(
+            "https://www.nseindia.com/market-data/live-equity-market",
+            "https://www.nseindia.com/api/marketStatus",
+        )
+        if not data:
+            return None
+
+        ms = mcap = n50 = gift = None
+
+        if isinstance(data.get("marketState"), list):
+            ms = pd.DataFrame(data["marketState"])
+            ms = ms[[c for c in [
+                "market", "marketStatus", "tradeDate", "index",
+                "last", "variation", "percentChange", "marketStatusMessage",
+            ] if c in ms.columns]]
+
+        if isinstance(data.get("marketcap"), dict):
+            mcap = pd.DataFrame([data["marketcap"]]).rename(columns={
+                "timeStamp":              "Date",
+                "marketCapinTRDollars":   "MarketCap_USD_Trillion",
+                "marketCapinLACCRRupees": "MarketCap_INR_LakhCr",
+                "marketCapinCRRupees":    "MarketCap_INR_Cr",
             })
 
-            # Step 5: Return list or DataFrame
-            if list_only:
-                return data_df["Symbol"].tolist()
+        if isinstance(data.get("indicativenifty50"), dict):
+            n50 = pd.DataFrame([data["indicativenifty50"]]).rename(columns={
+                "dateTime":         "DateTime",
+                "indexName":        "Index",
+                "closingValue":     "ClosingValue",
+                "finalClosingValue":"FinalClose",
+                "change":           "Change",
+                "perChange":        "PercentChange",
+            })
 
-            return data_df[["Serial Number", "Symbol", "Underlying"]]
+        if isinstance(data.get("giftnifty"), dict):
+            gift = pd.DataFrame([data["giftnifty"]]).rename(columns={
+                "SYMBOL":           "Symbol",
+                "EXPIRYDATE":       "ExpiryDate",
+                "LASTPRICE":        "LastPrice",
+                "DAYCHANGE":        "DayChange",
+                "PERCHANGE":        "PercentChange",
+                "CONTRACTSTRADED":  "ContractsTraded",
+                "TIMESTMP":         "Timestamp",
+            })
 
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching NSE EoM F&O list: {e}")
-            return None
+        lookup = {
+            "market status": ms, "mcap": mcap,
+            "nifty50": n50, "gift nifty": gift,
+        }
+        m = mode.strip().lower()
+        if m in lookup:
+            return lookup[m]
+        if m == "all":
+            return {"Market Status": ms, "Mcap": mcap, "Nifty50": n50, "Gift Nifty": gift}
 
-    def nse_6m_nifty_500(self, list_only=False):
-        self.rotate_user_agent()
-        url = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
-        try:
-            nse_resp = self.session.get(url, headers=self.headers, timeout=10)
-            nse_resp.raise_for_status()
-            data_df = pd.read_csv(BytesIO(nse_resp.content))
-            data_df.columns = data_df.columns.str.strip()  # Remove leading/trailing spaces
-            data_df = data_df[['Company Name', 'Industry', 'Symbol', 'Series', 'ISIN Code']]
-            if list_only:
-                return data_df['Symbol'].tolist()
-            return data_df
-        except (requests.RequestException, ValueError) as e:
-            print("Error fetching Nifty 500 list:", e)
-            return None
-    
-    def nse_eod_equity_full_list(self, list_only=False):
-        self.rotate_user_agent()
-        url = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
-        try:
-            nse_resp = self.session.get(url, headers=self.headers, timeout=10)
-            nse_resp.raise_for_status()
-            data_df = pd.read_csv(BytesIO(nse_resp.content))
-            data_df = data_df[['SYMBOL', 'NAME OF COMPANY', ' SERIES', ' DATE OF LISTING', ' FACE VALUE']]
-            if list_only:
-                return data_df['SYMBOL'].tolist()
-            return data_df
-        except (requests.RequestException, ValueError):
-            return None
-        
+        print(f"Invalid mode '{mode}'")
+        return None
 
-    def state_wise_registered_investors(self):
-        self.rotate_user_agent()  # Rotating User-Agent
-
-        ref_url = 'https://www.nseindia.com/registered-investors/'
-        api_url = "https://www.nseindia.com/api/registered-investors"
-
-        # --- Fetch & process ---
-
-        try:
-            # Get reference cookies from the main page
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()  # Ensure request was successful
-
-            # Make API call using cookies from the previous request
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()  # Ensure request was successful
-
-            # Convert response to JSON
-            data = response.json()
-
-            return data
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching data: {e}")
-            return None  
-
-    #---------------------------------------------------------- IPO ----------------------------------------------------------------
-
-    def ipo_current(self):
-        self.rotate_user_agent()  # Rotating User-Agent
-
-        ref_url = 'https://www.nseindia.com/market-data/all-upcoming-issues-ipo'
-        api_url = 'https://www.nseindia.com/api/ipo-current-issue'
-
-        try:
-            # Get reference cookies from the main page
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()  # Ensure request was successful
-
-            # Make API call using cookies from the previous request
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()  # Ensure request was successful
-
-            # Convert response to JSON
-            data = response.json()
-
-            if isinstance(data, list):
-                # Create DataFrame from the JSON data
-                df = pd.DataFrame(data)
-
-                # Define columns to match the JSON structure
-                columns = ['symbol', 'companyName', 'series', 'issueStartDate', 'issueEndDate', 'status', 
-                           'issueSize', 'issuePrice', 'noOfSharesOffered', 'noOfsharesBid', 'noOfTime']
-                
-                # Ensure DataFrame has the correct columns
-                df = df[columns]
-
-                # Fix NaN values to avoid issues
-                df = df.fillna(0)  # Replace NaN with 0
-                df = df.replace({float('inf'): 0, float('-inf'): 0})  # Replace infinite values with 0
-
-                return df if not df.empty else None  # Return DataFrame if not empty
-            return None  # Return None if no data is found
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching IPO data: {e}")
-            return None
-        
-    def ipo_preopen(self):
-        self.rotate_user_agent()  # Rotating User-Agent
-
-        ref_url = 'https://www.nseindia.com/market-data/new-stock-exchange-listings-today'
-        api_url = 'https://www.nseindia.com/api/special-preopen-listing'
-
-        try:
-            # Get reference cookies from the main page
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()  # Ensure request was successful
-
-            # Make API call using cookies from the previous request
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()  # Ensure request was successful
-
-            # Convert response to JSON
-            data = response.json()
-
-            if 'data' in data and isinstance(data['data'], list):
-                # Create a list to store flattened data
-                flattened_data = []
-                
-                for item in data['data']:
-                    # Extract preopenBook fields
-                    preopen_book = item.get('preopenBook', {})
-                    preopen = preopen_book.get('preopen', [{}])[0] if preopen_book.get('preopen') else {}
-                    ato = preopen_book.get('ato', {})
-
-                    # Flatten the data into a single dictionary
-                    flattened_item = {
-                        'symbol': item.get('symbol', ''),
-                        'series': item.get('series', ''),
-                        'prevClose': item.get('prevClose', ''),
-                        'iep': item.get('iep', ''),
-                        'change': item.get('change', ''),
-                        'perChange': item.get('perChange', ''),
-                        'ieq': item.get('ieq', ''),
-                        'ieVal': item.get('ieVal', ''),
-                        'buyOrderCancCnt': item.get('buyOrderCancCnt', ''),
-                        'buyOrderCancVol': item.get('buyOrderCancVol', ''),
-                        'sellOrderCancCnt': item.get('sellOrderCancCnt', ''),
-                        'sellOrderCancVol': item.get('sellOrderCancVol', ''),
-                        'isin': item.get('isin', ''),
-                        'status': item.get('status', ''),
-                        # New fields from preopenBook
-                        'preopen_buyQty': preopen.get('buyQty', 0),
-                        'preopen_sellQty': preopen.get('sellQty', 0),
-                        'ato_totalBuyQuantity': ato.get('totalBuyQuantity', 0),
-                        'ato_totalSellQuantity': ato.get('totalSellQuantity', 0),
-                        'totalBuyQuantity': preopen_book.get('totalBuyQuantity', 0),
-                        'totalSellQuantity': preopen_book.get('totalSellQuantity', 0),
-                        'totTradedQty': preopen_book.get('totTradedQty', 0),
-                        'lastUpdateTime': preopen_book.get('lastUpdateTime', '')
-                    }
-                    flattened_data.append(flattened_item)
-
-                # Create DataFrame from the flattened data
-                df = pd.DataFrame(flattened_data)
-
-                # Fix NaN values to avoid issues
-                df = df.fillna(0)  # Replace NaN with 0
-                df = df.replace({float('inf'): 0, float('-inf'): 0})  # Replace infinite values with 0
-
-                return df if not df.empty else None  # Return DataFrame if not empty
-            return None  # Return None if no data is found
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching Special Pre-Open data: {e}")
-            return None        
-
-    def ipo_tracker_summary(self, filter: str = None):
+    def nse_is_market_open(self, market: str = "Capital Market"):
         """
-        Fetch Year-To-Date IPO Tracker Summary from NSE India.
+        Return a ``rich.text.Text`` coloured status for *market*.
 
         Parameters
         ----------
-        filter : str, optional
-            Filter IPOs by 'MARKETTYPE' (e.g., "MAINBOARD", "SME").
-            The filter is case-insensitive — 'mainboard' or 'sme' will also work.
+        market : str, optional
+            Segment name as it appears in the NSE API, e.g.
+            ``"Capital Market"``, ``"Currency"``, ``"Commodity"``,
+            ``"Debt"``, or ``"currencyfuture"``.
+            Default is ``"Capital Market"``.
 
         Returns
         -------
-        pandas.DataFrame or None
-            Cleaned IPO summary DataFrame, or None if no valid data found.
+        rich.text.Text
+            Green text when the market is open, red when closed/halted.
+
+        Examples
+        --------
+        >>> from rich.console import Console
+        >>> Console().print(nse.nse_is_market_open("Capital Market"))
+        """
+        from rich.text import Text
+
+        data = self._get_json(
+            "https://www.nseindia.com/market-data/live-equity-market",
+            "https://www.nseindia.com/api/marketStatus",
+        )
+        if not data:
+            return Text("Error fetching market status", style="bold red")
+
+        sel = next(
+            (m for m in data.get("marketState", []) if m.get("market") == market),
+            None,
+        )
+        if not sel:
+            return Text(f"[{market}] Not found", style="bold yellow")
+
+        msg  = sel.get("marketStatusMessage", "").strip()
+        text = Text(f"[{market}] → ", style="bold white")
+        is_closed = any(w in msg.lower() for w in ("closed", "halted", "suspended"))
+        text.append(msg, style="bold red" if is_closed else "bold green")
+        return text
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    # IV. Global & Miscellaneous
+    # ══════════════════════════════════════════════════════════════════════════════
+
+    def nse_trading_holidays(self, list_only: bool = False):
+        """Return the NSE trading-holiday calendar for the current year.
+
+        Parameters
+        ----------
+        list_only : bool, optional
+            If ``True``, return a plain ``list`` of date strings
+            (``DD-MMM-YYYY``). Default is ``False``.
+
+        Returns
+        -------
+        pd.DataFrame or list or None
+
+        Examples
+        --------
+        >>> nse.nse_trading_holidays()
+        >>> nse.nse_trading_holidays(list_only=True)
+        """
+        return self._holidays("trading", "CM", list_only)
+
+    def nse_clearing_holidays(self, list_only: bool = False):
+        """Return the NSE clearing-holiday calendar for the current year.
+
+        Parameters
+        ----------
+        list_only : bool, optional
+            If ``True``, return a plain ``list`` of date strings.
+            Default is ``False``.
+
+        Returns
+        -------
+        pd.DataFrame or list or None
+
+        Examples
+        --------
+        >>> nse.nse_clearing_holidays()
+        >>> nse.nse_clearing_holidays(list_only=True)
+        """
+        return self._holidays("clearing", "CD", list_only)
+
+    def is_nse_trading_holiday(self, date_str: str | None = None) -> bool | None:
+        """Return ``True`` if *date_str* is a trading holiday.
+
+        Parameters
+        ----------
+        date_str : str, optional
+            Date in ``DD-MMM-YYYY`` format, e.g. ``"25-Dec-2026"``.
+            Defaults to today.
+
+        Returns
+        -------
+        bool or None
+
+        Examples
+        --------
+        >>> nse.is_nse_trading_holiday()
+        >>> nse.is_nse_trading_holiday("25-Dec-2026")
+        """
+        return self._is_holiday(self.nse_trading_holidays, date_str)
+
+    def is_nse_clearing_holiday(self, date_str: str | None = None) -> bool | None:
+        """Return ``True`` if *date_str* is a clearing holiday.
+
+        Parameters
+        ----------
+        date_str : str, optional
+            Date in ``DD-MMM-YYYY`` format. Defaults to today.
+
+        Returns
+        -------
+        bool or None
+
+        Examples
+        --------
+        >>> nse.is_nse_clearing_holiday()
+        >>> nse.is_nse_clearing_holiday("22-Oct-2025")
+        """
+        return self._is_holiday(self.nse_clearing_holidays, date_str)
+
+    def nse_live_market_turnover(self) -> pd.DataFrame:
+        """
+        Fetch live market turnover across all NSE segments.
+
+        Returns
+        -------
+        pd.DataFrame
+            Columns: Segment, Product, Vol, Value (₹ Cr), OI, No. of Trades,
+            Updated At, and previous-day equivalents.
+
+        Examples
+        --------
+        >>> nse.nse_live_market_turnover()
+        """
+        data = self._get_json(
+            "https://www.nseindia.com/option-chain",
+            "https://www.nseindia.com/api/NextApi/apiClient"
+            "?functionName=getMarketTurnoverSummary",
+        )
+        if not data:
+            return pd.DataFrame()
+
+        rows = []
+        for seg, records in data.get("data", {}).items():
+            if not isinstance(records, list):
+                continue
+            for rec in records:
+                rows.append({
+                    "Segment":                seg.upper(),
+                    "Product":                rec.get("instrument", ""),
+                    "Vol (Shares/Contracts)": rec.get("volume", 0),
+                    "Value (₹ Cr)":           round(rec.get("value", 0) / 1e7, 2),
+                    "OI (Contracts)":         rec.get("oivalue", 0),
+                    "No. of Orders#":         rec.get("noOfOrders", 0),
+                    "No. of Trades":          rec.get("noOfTrades", 0),
+                    "Avg Trade Value (₹)":    rec.get("averageTrade", 0),
+                    "Updated At":             rec.get("mktTimeStamp", ""),
+                    "Prev Vol":               rec.get("prevVolume", 0),
+                    "Prev Value (₹ Cr)":      round(rec.get("prevValue", 0) / 1e7, 2),
+                    "prev OI (Contracts)":    rec.get("prevOivalue", 0),
+                    "prev Orders#":           rec.get("prevNoOfOrders", 0),
+                    "prev Trades":            rec.get("prevNoOfTrades", 0),
+                    "prev Avg Trade Value (₹)": rec.get("prevAverageTrade", 0),
+                })
+        return _clean(pd.DataFrame(rows))
+
+    def nse_live_hist_circulars(
+        self,
+        from_date_str: str | None = None,
+        to_date_str:   str | None = None,
+        filter:        str | None = None,
+    ) -> pd.DataFrame:
+        """
+        Fetch NSE exchange-communication circulars between two dates.
+
+        Parameters
+        ----------
+        from_date_str : str, optional
+            Start date in ``DD-MM-YYYY`` format. Defaults to yesterday.
+        to_date_str : str, optional
+            End date in ``DD-MM-YYYY`` format. Defaults to today.
+        dept_filter : str, optional
+            Substring to filter the ``Department`` column (case-insensitive).
+
+        Returns
+        -------
+        pd.DataFrame
+            Columns: Date, Circulars No, Category, Department, Subject,
+            Attachment.
+
+        Examples
+        --------
+        >>> nse.nse_live_hist_circulars()
+        >>> nse.nse_live_hist_circulars("18-07-2025", "18-10-2025")
+        >>> nse.nse_live_hist_circulars(filter="NSE Listing")
         """
         self.rotate_user_agent()
-
-        ref_url = "https://www.nseindia.com/ipo-tracker?type=ipo_year"
-        api_url = "https://www.nseindia.com/api/NextApi/apiClient?functionName=getIPOTrackerSummary"
-
+        fd    = from_date_str or (datetime.now() - timedelta(days=1)).strftime("%d-%m-%Y")
+        td    = to_date_str   or datetime.now().strftime("%d-%m-%Y")
+        empty = pd.DataFrame(columns=["Date", "Circulars No", "Category", "Department",
+                                       "Subject", "Attachment"])
         try:
-            # Step 1: Fetch cookies from NSE IPO page
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()
-            cookies = ref_response.cookies.get_dict()
+            resp = self._live_ref_fetch(
+                "https://www.nseindia.com/resources/exchange-communication-circulars",
+                f"https://www.nseindia.com/api/circulars?&fromDate={fd}&toDate={td}",
+            )
+            if resp is None:
+                return empty
+            items = resp.json().get("data", [])
+            if not isinstance(items, list) or not items:
+                return empty
 
-            # Step 2: Fetch API JSON data
-            response = self.session.get(api_url, headers=self.headers, cookies=cookies, timeout=10)
-            response.raise_for_status()
-            data = response.json()
+            df = pd.DataFrame([{
+                "Date":         item.get("cirDisplayDate", ""),
+                "Circulars No": item.get("circDisplayNo",  ""),
+                "Category":     item.get("circCategory",   ""),
+                "Department":   item.get("circDepartment", ""),
+                "Subject":      item.get("sub",            ""),
+                "Attachment":   item.get("circFilelink",   ""),
+            } for item in items])
 
-            if not isinstance(data, dict) or "data" not in data:
-                print("⚠️ Unexpected API format or empty response.")
-                return None
-
-            df = pd.DataFrame(data["data"])
-            if df.empty:
-                print("⚠️ No IPO data available.")
-                return None
-
-            # Step 3: Ensure MARKETTYPE uppercase for consistent comparison
-            df["MARKETTYPE"] = df["MARKETTYPE"].str.upper().fillna("")
-
-            # Step 4: Apply filter (case-insensitive)
             if filter:
-                filter = filter.strip().upper()
-                df = df[df["MARKETTYPE"].str.contains(filter, case=False, na=False)]
-
-            # Step 5: Select & reorder columns
-            keep_cols = [
-                "SYMBOL", "COMPANYNAME", "LISTED_ON", "ISSUE_PRICE",
-                "LISTED_DAY_CLOSE", "LISTED_DAY_GAIN", "LISTED_DAY_GAIN_PER",
-                "LTP", "GAIN_LOSS", "GAIN_LOSS_PER", "MARKETTYPE"
-            ]
-            df = df[[col for col in keep_cols if col in df.columns]]
-
-            # Step 6: Convert numerics
-            num_cols = [
-                "ISSUE_PRICE", "LISTED_DAY_CLOSE", "LISTED_DAY_GAIN",
-                "LISTED_DAY_GAIN_PER", "LTP", "GAIN_LOSS", "GAIN_LOSS_PER"
-            ]
-            for col in num_cols:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-        
-            # Step 7: Convert LISTED_ON to datetime and sort latest first
-            if "LISTED_ON" in df.columns:
-                df["LISTED_ON"] = pd.to_datetime(df["LISTED_ON"], format="%d-%m-%Y", errors="coerce")
-                df = df.sort_values(by="LISTED_ON", ascending=False)
-
-            # Step 8: Convert datetime columns to string for export safety
-            datetime_cols = df.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns
-            for col in datetime_cols:
-                df[col] = df[col].dt.strftime("%Y-%m-%d")
-
-            return df.reset_index(drop=True)
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"❌ Error fetching IPO Tracker Summary data: {e}")
-            return None
-
-
-    #---------------------------------------------------------- Pre-Open Market ----------------------------------------------------------------
-
-    def pre_market_nifty_info(self, category='All'):
-        pre_market_xref = {"NIFTY 50": "NIFTY", "Nifty Bank": "BANKNIFTY", "Emerge": "SME", "Securities in F&O": "FO", "Others": "OTHERS", "All": "ALL"}
-        
-        self.rotate_user_agent()
-        ref_url = 'https://www.nseindia.com/market-data/pre-open-market-cm-and-emerge-market'
-        
-        try:
-            ref = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref.raise_for_status()
-            
-            url = f"https://www.nseindia.com/api/market-data-pre-open?key={pre_market_xref.get(category, 'ALL')}"
-            response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
-            response.raise_for_status()
-            
-            data = response.json()
-            
-            # Extract values from 'niftyPreopenStatus'
-            nifty_status = data.get("niftyPreopenStatus", {})
-            pChange = nifty_status.get("pChange", "N/A")
-            change = nifty_status.get("change", "N/A")
-            lastPrice = nifty_status.get("lastPrice", "N/A")
-            
-            # Extract Advances, Declines, Unchanged & Timestamp
-            advances = data.get("advances", 0)
-            declines = data.get("declines", 0)
-            unchanged = data.get("unchanged", 0)
-            timestamp = data.get("timestamp", "Unknown")
-
-            # Create a single-row DataFrame
-            df = pd.DataFrame([{
-                "lastPrice": lastPrice,
-                "change": change,
-                "pChange": pChange,
-                "advances": advances,
-                "declines": declines,
-                "unchanged": unchanged,
-                "timestamp": timestamp
-            }])
+                df = df[df["Department"].str.contains(filter, case=False, na=False)]
             return df
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching Nifty Advance-Decline data: {e}")
-            return None
-        
-    def pre_market_all_nse_adv_dec_info(self, category='All'):
-        pre_market_xref = {"NIFTY 50": "NIFTY", "Nifty Bank": "BANKNIFTY", "Emerge": "SME", "Securities in F&O": "FO", "Others": "OTHERS", "All": "ALL"}
-        
-        self.rotate_user_agent()
-        ref_url = 'https://www.nseindia.com/market-data/pre-open-market-cm-and-emerge-market'
-        
-        try:
-            ref = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref.raise_for_status()
-            
-            url = f"https://www.nseindia.com/api/market-data-pre-open?key={pre_market_xref.get(category, 'ALL')}"
-            response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
-            response.raise_for_status()
-            
-            data = response.json()
-            
-            # Extract Advances, Declines, Unchanged & Timestamp
-            advances = data.get("advances", 0)
-            declines = data.get("declines", 0)
-            unchanged = data.get("unchanged", 0)
-            timestamp = data.get("timestamp", "Unknown")
 
-            # Create a single-row DataFrame
-            df = pd.DataFrame([{
-                "advances": advances,
-                "declines": declines,
-                "unchanged": unchanged,
-                "timestamp": timestamp
-            }])
-            return df
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching All NSE Advance-Decline data: {e}")
-            return None
+        except Exception:
+            return empty
 
-    def pre_market_info(self, category='All'):
-        pre_market_xref = {"NIFTY 50": "NIFTY", "Nifty Bank": "BANKNIFTY", "Emerge": "SME", "Securities in F&O": "FO", "Others": "OTHERS", "All": "ALL"}
-
-        self.rotate_user_agent()
-        ref_url = 'https://www.nseindia.com/market-data/pre-open-market-cm-and-emerge-market'
-        ref = requests.get(ref_url, headers=self.headers)
-        url = f"https://www.nseindia.com/api/market-data-pre-open?key={pre_market_xref[category]}"
-        try:
-            response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
-            response.raise_for_status()
-            data = response.json()["data"]
-            processed_data = [{
-                "symbol": i["metadata"]["symbol"],
-                "previousClose": i["metadata"]["previousClose"],
-                "iep": i["metadata"]["iep"],
-                "change": i["metadata"]["change"],
-                "pChange": i["metadata"]["pChange"],
-                "lastPrice": i["metadata"]["lastPrice"],
-                "finalQuantity": i["metadata"]["finalQuantity"],
-                "totalTurnover": i["metadata"]["totalTurnover"],
-                "marketCap": i["metadata"]["marketCap"],
-                "yearHigh": i["metadata"]["yearHigh"],
-                "yearLow": i["metadata"]["yearLow"],
-                "totalBuyQuantity": i["detail"]["preOpenMarket"]["totalBuyQuantity"],
-                "totalSellQuantity": i["detail"]["preOpenMarket"]["totalSellQuantity"],
-                "atoBuyQty": i["detail"]["preOpenMarket"]["atoBuyQty"],
-                "atoSellQty": i["detail"]["preOpenMarket"]["atoSellQty"],
-                "lastUpdateTime": i["detail"]["preOpenMarket"]["lastUpdateTime"]
-            } for i in data]
-            df = pd.DataFrame(processed_data)
-            df = df.set_index("symbol", drop=False)
-            return df
-        except (requests.RequestException, ValueError):
-            return None
-        
-    def pre_market_derivatives_info(self, category='Index Futures'):
-        pre_market_xref = {"Index Futures": "FUTIDX", "Stock Futures": "FUTSTK"} 
-
-        self.rotate_user_agent()
-        ref_url = 'https://www.nseindia.com/market-data/pre-open-market-fno'
-        ref = requests.get(ref_url, headers=self.headers)
-        url = f"https://www.nseindia.com/api/market-data-pre-open-fno?key={pre_market_xref[category]}"
-        try:
-            response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
-            response.raise_for_status()
-            data = response.json()["data"]
-            processed_data = [{
-                "symbol": i["metadata"]["symbol"],
-                "expiryDate": i["metadata"]["expiryDate"],
-                "previousClose": i["metadata"]["previousClose"],
-                "iep": i["metadata"]["iep"],
-                "change": i["metadata"]["change"],
-                "pChange": i["metadata"]["pChange"],
-                "lastPrice": i["metadata"]["lastPrice"],
-                "finalQuantity": i["metadata"]["finalQuantity"],
-                "totalTurnover": i["metadata"]["totalTurnover"],
-                "totalBuyQuantity": i["detail"]["preOpenMarket"]["totalBuyQuantity"],
-                "totalSellQuantity": i["detail"]["preOpenMarket"]["totalSellQuantity"],
-                "atoBuyQty": i["detail"]["preOpenMarket"]["atoBuyQty"],
-                "atoSellQty": i["detail"]["preOpenMarket"]["atoSellQty"],
-                "lastUpdateTime": i["detail"]["preOpenMarket"]["lastUpdateTime"]
-            } for i in data]
-            df = pd.DataFrame(processed_data)
-            df = df.set_index("symbol", drop=False)
-            return df
-        except (requests.RequestException, ValueError):
-            return None
-
-
-    #---------------------------------------------------------- Index_Live_Data ----------------------------------------------------------------
-    
-    def index_live_all_indices_data(self):
-        self.rotate_user_agent()  # Rotating User-Agent
-
-        ref_url = 'https://www.nseindia.com/market-data/index-performances'
-        api_url = 'https://www.nseindia.com/api/allIndices'
-
-        try:
-            # Get reference cookies from the main page
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()  # Ensure request was successful
-
-            # Make API call using cookies from the previous request
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()  # Ensure request was successful
-
-            # Convert response to JSON
-            data = response.json()
-            
-            if 'data' in data and isinstance(data['data'], list):
-                df = pd.DataFrame(data['data'])
-
-                # Selecting and ordering columns
-                columns = ['key', 'index', 'indexSymbol', 'last', 'variation', 'percentChange', 'open', 'high', 'low',
-                        'previousClose', 'yearHigh', 'yearLow', 'pe', 'pb', 'dy', 'declines', 'advances', 'unchanged',
-                        'perChange30d', 'perChange365d', 'previousDayVal', 'oneWeekAgoVal', 'oneMonthAgoVal', 'oneYearAgoVal']
-                
-                df = df[columns]
-
-                # **Fix NaN values** to avoid JSON conversion issues
-                df = df.fillna(0)  # Replace NaN with 0
-                df = df.replace({float('inf'): 0, float('-inf'): 0})  # Replace infinite values with 0
-
-                return df if not df.empty else None  # Return DataFrame if not empty
-            return None  # Return None if no data is found
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching all indices data: {e}")
-            return None
-
-    def index_live_indices_stocks_data(self, category, list_only=False):
-        category = category.upper().replace('&', '%26').replace(' ', '%20')
-        self.rotate_user_agent()
-        url = f"https://www.nseindia.com/api/equity-stockIndices?index={category}"
-        try:
-            response = self.session.get(url, headers=self.headers, timeout=10)
-            response.raise_for_status()
-            data = response.json()["data"]
-            df = pd.DataFrame(data)
-
-            # Remove 'meta' column if it exists
-            df = df.drop(["meta"], axis=1, errors='ignore')
-
-            # Set index to 'symbol' for better readability
-            df = df.set_index("symbol", drop=False)
-
-            # If only the symbol list is required
-            # if list_only:
-            #     symbol_list = sorted(df.index.tolist())
-            #     return symbol_list
-            if list_only:
-                return df["symbol"].tolist()            
-
-            # Reorder columns as per your requirement
-            column_order = [
-                "symbol", "previousClose", "open", "dayHigh", "dayLow", "lastPrice", 
-                "change", "pChange", "totalTradedVolume", "totalTradedValue", 
-                "nearWKH", "nearWKL", "perChange30d", "perChange365d", "ffmc"
-            ]
-            # Filter only available columns to avoid KeyError
-            column_order = [col for col in column_order if col in df.columns]
-            df = df[column_order]
-
-            # Replace invalid float values with None immediately
-            df = df.replace([pd.NA, float('nan'), float('inf'), float('-inf')], None)
-            # Ensure all numeric columns are properly typed and NaN-free
-            for col in df.columns:
-                if df[col].dtype in ['float64', 'float32']:
-                    df[col] = pd.to_numeric(df[col], errors='coerce').replace(np.nan, None)
-
-            return df
-        except requests.RequestException:
-            self._initialize_session()
-            return self.get_index_details(category, list_only)
-        except (ValueError, KeyError):
-            return None
-
-    def index_live_nifty_50_returns(self):
-        self.rotate_user_agent()  # Rotating User-Agent
-
-        ref_url = 'https://www.nseindia.com'
-        api_url = 'https://www.nseindia.com/api/NextApi/apiClient/indexTrackerApi?functionName=getIndicesReturn&&index=NIFTY%2050'
-
-        try:
-            # Get reference cookies from the main page
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()  # Ensure request was successful
-
-            # Make API call using cookies from the previous request
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()  # Ensure request was successful
-
-            # Convert response to JSON
-            data = response.json()
-            
-            if 'data' in data and isinstance(data['data'], list):
-                df = pd.DataFrame(data['data'])
-
-                # Selecting and ordering columns
-                columns = ['one_week_chng_per', 'one_month_chng_per', 'three_month_chng_per', 'six_month_chng_per', 'one_year_chng_per', 'two_year_chng_per', 'three_year_chng_per', 'five_year_chng_per']
-                
-                df = df[columns]
-
-                # **Fix NaN values** to avoid JSON conversion issues
-                df = df.fillna(0)  # Replace NaN with 0
-                df = df.replace({float('inf'): 0, float('-inf'): 0})  # Replace infinite values with 0
-
-                return df if not df.empty else None  # Return DataFrame if not empty
-            return None  # Return None if no data is found
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching all indices data: {e}")
-            return None
-
-    def index_live_contribution(self, *args, Index: str = "NIFTY 50", Mode: str = "First Five"):
+    def nse_live_hist_press_releases(
+        self,
+        from_date_str: str | None = None,
+        to_date_str:   str | None = None,
+        filter:        str | None = None,
+    ) -> pd.DataFrame:
         """
-        Fetch index contribution data from NSE
+        Fetch NSE press releases between two dates, stripping any HTML tags
+        from the subject field.
 
-        Valid Calls:
-        -----------
-        index_live_contribution()
-        index_live_contribution("Full")
-        index_live_contribution("NIFTY BANK")
-        index_live_contribution("NIFTY BANK", "Full")
-        index_live_contribution(Index="NIFTY IT", Mode="Full")
+        Parameters
+        ----------
+        from_date_str : str, optional
+            Start date in ``DD-MM-YYYY`` format. Defaults to yesterday.
+        to_date_str : str, optional
+            End date in ``DD-MM-YYYY`` format. Defaults to today.
+        dept_filter : str, optional
+            Substring to filter the ``DEPARTMENT`` column (case-insensitive).
+            Valid departments: Corporate Communications, Investor Services
+            Cell, Member Compliance, NSE Clearing, NSE Indices, NSE Listing,
+            Surveillance.
+
+        Returns
+        -------
+        pd.DataFrame
+            Columns: DATE, DEPARTMENT, SUBJECT, ATTACHMENT URL, LAST UPDATED.
+
+        Examples
+        --------
+        >>> nse.nse_live_hist_press_releases()
+        >>> nse.nse_live_hist_press_releases("18-07-2025", "18-10-2025")
+        >>> nse.nse_live_hist_press_releases("01-10-2025", "04-10-2025", "NSE Listing")
         """
+        self.rotate_user_agent()
+        fd    = from_date_str or (datetime.now() - timedelta(days=1)).strftime("%d-%m-%Y")
+        td    = to_date_str   or datetime.now().strftime("%d-%m-%Y")
+        cols  = ["DATE", "DEPARTMENT", "SUBJECT", "ATTACHMENT URL", "LAST UPDATED"]
+        empty = pd.DataFrame(columns=cols)
 
-        # ----------------------------------
-        # Smart *args Resolver
-        # ----------------------------------
+        try:
+            resp = self._live_ref_fetch(
+                "https://www.nseindia.com/resources/exchange-communication-press-releases",
+                f"https://www.nseindia.com/api/press-release-cms20?fromDate={fd}&toDate={td}",
+            )
+            if resp is None:
+                return empty
+            items = resp.json()
+            if not isinstance(items, list):
+                return empty
+
+            rows = []
+            for item in items:
+                if not isinstance(item, dict) or "content" not in item:
+                    continue
+                c    = item["content"]
+                subj = c.get("body", "")
+                if "<" in subj and ">" in subj:
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
+                        subj = BeautifulSoup(subj, "html.parser").get_text(separator=" ").strip()
+                try:
+                    chg = datetime.strptime(
+                        item.get("changed", ""), "%a, %m/%d/%Y - %H:%M"
+                    ).strftime("%a %d-%b-%Y %I:%M %p")
+                except ValueError:
+                    chg = item.get("changed", "")
+
+                rows.append({
+                    "DATE":           c.get("field_date", ""),
+                    "SUBJECT":        subj,
+                    "DEPARTMENT":     c.get("field_type", ""),
+                    "ATTACHMENT URL": (c.get("field_file_attachement") or {}).get("url"),
+                    "LAST UPDATED":   chg,
+                })
+
+            if not rows:
+                return empty
+            df = pd.DataFrame(rows)
+            if filter:
+                df = df[df["DEPARTMENT"].str.contains(filter, case=False, na=False)]
+            return df[cols]
+
+        except Exception as exc:
+            self._log_error("nse_live_hist_press_releases", exc)
+            return empty
+
+    def nse_reference_rates(self) -> pd.DataFrame | None:
+        """
+        Fetch the latest NSE currency reference rates for major pairs.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Columns: currency, unit, value, prevDayValue.
+
+        Examples
+        --------
+        >>> nse.nse_reference_rates()
+        """
+        data = self._get_json(
+            "https://www.nseindia.com/option-chain",
+            "https://www.nseindia.com/api/NextApi/apiClient"
+            "?functionName=getReferenceRates&&type=null&&flag=CUR",
+        )
+        if not data:
+            return None
+        rates = data.get("data", {}).get("currencySpotRates", [])
+        if not rates:
+            return None
+        return pd.DataFrame(rates)[["currency", "unit", "value", "prevDayValue"]].fillna(0)
+
+    def nse_eod_top10_nifty50(self, trade_date: str) -> pd.DataFrame | None:
+        """
+        Fetch the top-10 Nifty 50 constituents by turnover for a date.
+
+        Parameters
+        ----------
+        trade_date : str
+            Trade date in ``DD-MM-YY`` (two-digit year) format,
+            e.g. ``"17-10-25"``.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.nse_eod_top10_nifty50("17-10-25")
+        """
+        dt  = _fmt_trade_date(trade_date, "%d%m%y")
+        raw = self._get_archive(
+            f"https://nsearchives.nseindia.com/content/indices/"
+            f"top10nifty50_{dt.upper()}.csv"
+        )
+        return pd.read_csv(BytesIO(raw)) if raw else None
+
+    def nse_6m_nifty_50(self, list_only: bool = False):
+        """Return the current Nifty 50 constituent list (updated 6-monthly).
+
+        Parameters
+        ----------
+        list_only : bool, optional
+            If ``True``, return a plain ``list`` of symbols.
+
+        Returns
+        -------
+        pd.DataFrame or list or None
+
+        Examples
+        --------
+        >>> nse.nse_6m_nifty_50()
+        >>> nse.nse_6m_nifty_50(list_only=True)
+        """
+        return self._nse_csv_list(
+            "https://nsearchives.nseindia.com/content/indices/ind_nifty50list.csv",
+            ["Company Name", "Industry", "Symbol", "Series", "ISIN Code"],
+            "Symbol", list_only,
+        )
+
+    def nse_6m_nifty_500(self, list_only: bool = False):
+        """Return the current Nifty 500 constituent list (updated 6-monthly).
+
+        Parameters
+        ----------
+        list_only : bool, optional
+            If ``True``, return a plain ``list`` of symbols.
+
+        Returns
+        -------
+        pd.DataFrame or list or None
+
+        Examples
+        --------
+        >>> nse.nse_6m_nifty_500()
+        >>> nse.nse_6m_nifty_500(list_only=True)
+        """
+        return self._nse_csv_list(
+            "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv",
+            ["Company Name", "Industry", "Symbol", "Series", "ISIN Code"],
+            "Symbol", list_only,
+        )
+
+    def nse_eod_equity_full_list(self, list_only: bool = False):
+        """Return the full NSE equity listing with symbols, names, and dates.
+
+        Parameters
+        ----------
+        list_only : bool, optional
+            If ``True``, return only a ``list`` of symbol strings.
+
+        Returns
+        -------
+        pd.DataFrame or list or None
+
+        Examples
+        --------
+        >>> nse.nse_eod_equity_full_list()
+        >>> nse.nse_eod_equity_full_list(list_only=True)
+        """
+        return self._nse_csv_list(
+            "https://archives.nseindia.com/content/equities/EQUITY_L.csv",
+            ["SYMBOL", "NAME OF COMPANY", "SERIES", "DATE OF LISTING", "FACE VALUE"],
+            "SYMBOL", list_only,
+        )
+
+    def nse_eom_fno_full_list(self, mode: str = "stocks", list_only: bool = False):
+        """
+        Return the full F&O underlying list (stocks or indices).
+
+        Parameters
+        ----------
+        mode : str, optional
+            ``"stocks"`` (default) for equity F&O underlyings, or
+            ``"index"`` for index F&O underlyings.
+        list_only : bool, optional
+            If ``True``, return a plain ``list`` of symbol strings instead
+            of the full ``DataFrame``.
+
+        Returns
+        -------
+        pd.DataFrame or list or None
+
+        Examples
+        --------
+        >>> nse.nse_eom_fno_full_list()
+        >>> nse.nse_eom_fno_full_list(list_only=True)
+        >>> nse.nse_eom_fno_full_list("index")
+        >>> nse.nse_eom_fno_full_list("index", list_only=True)
+        """
+        ref_url = (
+            "https://www.nseindia.com/products-services/"
+            "equity-derivatives-list-underlyings-information"
+        )
+        data = self._get_json(ref_url, "https://www.nseindia.com/api/underlying-information")
+        if not data:
+            return None
+        key = "IndexList" if mode.strip().lower() == "index" else "UnderlyingList"
+        df  = pd.DataFrame(data["data"][key]).rename(columns={
+            "serialNumber": "Serial Number",
+            "symbol":       "Symbol",
+            "underlying":   "Underlying",
+        })
+        return df["Symbol"].tolist() if list_only else df[["Serial Number", "Symbol", "Underlying"]]
+
+    def state_wise_registered_investors(self):
+        """Return state-wise count of registered NSE investors.
+
+        Returns
+        -------
+        dict or None
+            Raw JSON response from NSE.
+
+        Examples
+        --------
+        >>> nse.state_wise_registered_investors()
+        """
+        return self._get_json(
+            "https://www.nseindia.com/registered-investors/",
+            "https://www.nseindia.com/api/registered-investors",
+        )
+
+    def list_of_indices(self):
+        """Return the master list of all NSE index categories.
+
+        Returns
+        -------
+        dict or None
+            Raw JSON with index category metadata.
+
+        Examples
+        --------
+        >>> nse.list_of_indices()
+        """
+        return self._get_json(
+            "https://www.nseindia.com/option-chain",
+            "https://www.nseindia.com/api/equity-master",
+        )
+
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ── IPO ─────────────────────────────────────────────────────────────────
+
+    def ipo_current(self) -> pd.DataFrame | None:
+        """Fetch all currently active / ongoing IPOs on the NSE.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Columns: symbol, companyName, series, issueStartDate, issueEndDate,
+            status, issueSize, issuePrice, noOfSharesOffered,
+            noOfsharesBid, noOfTime.
+
+        Examples
+        --------
+        >>> nse.ipo_current()
+        """
+        data = self._get_json(
+            "https://www.nseindia.com/market-data/all-upcoming-issues-ipo",
+            "https://www.nseindia.com/api/ipo-current-issue",
+        )
+        if not isinstance(data, list):
+            return None
+        df   = pd.DataFrame(data)
+        cols = [
+            "symbol", "companyName", "series", "issueStartDate", "issueEndDate",
+            "status", "issueSize", "issuePrice", "noOfSharesOffered",
+            "noOfsharesBid", "noOfTime",
+        ]
+        return _clean(_keep_cols(df, cols).fillna(0)) if not df.empty else None
+
+    def ipo_preopen(self) -> pd.DataFrame | None:
+        """Fetch pre-open session data for IPOs listed today.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Includes IEP, order-book summary, ATO quantities, and
+            cancellation counts.
+
+        Examples
+        --------
+        >>> nse.ipo_preopen()
+        """
+        data = self._get_json(
+            "https://www.nseindia.com/market-data/new-stock-exchange-listings-today",
+            "https://www.nseindia.com/api/special-preopen-listing",
+        )
+        if not data or "data" not in data:
+            return None
+
+        rows = []
+        for item in data["data"]:
+            pb  = item.get("preopenBook", {})
+            pre = (pb.get("preopen") or [{}])[0]
+            ato = pb.get("ato", {})
+            row = {k: item.get(k, "") for k in [
+                "symbol", "series", "prevClose", "iep", "change", "perChange",
+                "ieq", "ieVal", "buyOrderCancCnt", "buyOrderCancVol",
+                "sellOrderCancCnt", "sellOrderCancVol", "isin", "status",
+            ]}
+            row.update({
+                "preopen_buyQty":          pre.get("buyQty",  0),
+                "preopen_sellQty":         pre.get("sellQty", 0),
+                "ato_totalBuyQuantity":    ato.get("totalBuyQuantity",  0),
+                "ato_totalSellQuantity":   ato.get("totalSellQuantity", 0),
+                "totalBuyQuantity":        pb.get("totalBuyQuantity",  0),
+                "totalSellQuantity":       pb.get("totalSellQuantity", 0),
+                "totTradedQty":            pb.get("totTradedQty",       0),
+                "lastUpdateTime":          pb.get("lastUpdateTime",     ""),
+            })
+            rows.append(row)
+
+        df = pd.DataFrame(rows).fillna(0)
+        return df if not df.empty else None
+
+    def ipo_tracker_summary(self, category_filter: str | None = None) -> pd.DataFrame | None:
+        """
+        Return the IPO tracker summary table from NSE.
+
+        Parameters
+        ----------
+        category_filter : str, optional
+            Substring to filter the ``MARKETTYPE`` column, e.g. ``"SME"``
+            or ``"Mainboard"`` (case-insensitive).
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.ipo_tracker_summary()
+        >>> nse.ipo_tracker_summary("SME")
+        >>> nse.ipo_tracker_summary("Mainboard")
+        """
+        data = self._get_json(
+            "https://www.nseindia.com/ipo-tracker?type=ipo_year",
+            "https://www.nseindia.com/api/NextApi/apiClient"
+            "?functionName=getIPOTrackerSummary",
+        )
+        if not isinstance(data, dict) or "data" not in data:
+            return None
+
+        df = pd.DataFrame(data["data"])
+        df["MARKETTYPE"] = df["MARKETTYPE"].str.upper().fillna("")
+        if category_filter:
+            df = df[df["MARKETTYPE"].str.contains(category_filter.upper(), case=False, na=False)]
+
+        keep = [
+            "SYMBOL", "COMPANYNAME", "LISTED_ON", "ISSUE_PRICE",
+            "LISTED_DAY_CLOSE", "LISTED_DAY_GAIN", "LISTED_DAY_GAIN_PER",
+            "LTP", "GAIN_LOSS", "GAIN_LOSS_PER", "MARKETTYPE",
+        ]
+        df = _keep_cols(df, keep)
+        for col in ["ISSUE_PRICE", "LISTED_DAY_CLOSE", "LISTED_DAY_GAIN",
+                    "LISTED_DAY_GAIN_PER", "LTP", "GAIN_LOSS", "GAIN_LOSS_PER"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        if "LISTED_ON" in df.columns:
+            df["LISTED_ON"] = pd.to_datetime(df["LISTED_ON"], format="%d-%m-%Y", errors="coerce")
+            df = df.sort_values("LISTED_ON", ascending=False)
+            df["LISTED_ON"] = df["LISTED_ON"].dt.strftime("%Y-%m-%d")
+
+        return df.reset_index(drop=True)
+
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ── Pre-Open ────────────────────────────────────────────────────────────
+
+    def pre_market_nifty_info(self, category: str = "All") -> pd.DataFrame | None:
+        """Return the pre-open summary for the selected index category.
+
+        Parameters
+        ----------
+        category : str, optional
+            One of ``"NIFTY 50"``, ``"Nifty Bank"``, ``"Emerge"``,
+            ``"Securities in F&O"``, ``"Others"``, or ``"All"``.
+            Default is ``"All"``.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Single-row with lastPrice, change, pChange, advances,
+            declines, unchanged, timestamp.
+
+        Examples
+        --------
+        >>> nse.pre_market_nifty_info("NIFTY 50")
+        """
+        data = self._pre_open(category)
+        if not data:
+            return None
+        ns = data.get("niftyPreopenStatus", {})
+        return pd.DataFrame([{
+            "lastPrice": ns.get("lastPrice"),
+            "change":    ns.get("change"),
+            "pChange":   ns.get("pChange"),
+            "advances":  data.get("advances",  0),
+            "declines":  data.get("declines",  0),
+            "unchanged": data.get("unchanged", 0),
+            "timestamp": data.get("timestamp", ""),
+        }])
+
+    def pre_market_all_nse_adv_dec_info(self, category: str = "All") -> pd.DataFrame | None:
+        """Return aggregate advances/declines for the pre-open session.
+
+        Parameters
+        ----------
+        category : str, optional
+            Index/segment filter. Default is ``"All"``.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.pre_market_all_nse_adv_dec_info()
+        """
+        data = self._pre_open(category)
+        if not data:
+            return None
+        return pd.DataFrame([{
+            "advances":  data.get("advances",  0),
+            "declines":  data.get("declines",  0),
+            "unchanged": data.get("unchanged", 0),
+            "timestamp": data.get("timestamp", ""),
+        }])
+
+    def pre_market_info(self, category: str = "All") -> pd.DataFrame | None:
+        """
+        Return detailed per-stock pre-open data for *category*.
+
+        Parameters
+        ----------
+        category : str, optional
+            One of ``"All"``, ``"NIFTY 50"``, ``"Nifty Bank"``,
+            ``"Emerge"``, ``"Securities in F&O"``. Default ``"All"``.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Indexed by symbol; includes IEP, turnover, 52-week range,
+            and order-book buy/sell quantities.
+
+        Examples
+        --------
+        >>> nse.pre_market_info("All")
+        >>> nse.pre_market_info("NIFTY 50")
+        >>> nse.pre_market_info("Securities in F&O")
+        """
+        data = self._pre_open(category)
+        if not data:
+            return None
+
+        rows = [{
+            "symbol":           i["metadata"]["symbol"],
+            "previousClose":    i["metadata"]["previousClose"],
+            "iep":              i["metadata"]["iep"],
+            "change":           i["metadata"]["change"],
+            "pChange":          i["metadata"]["pChange"],
+            "lastPrice":        i["metadata"]["lastPrice"],
+            "finalQuantity":    i["metadata"]["finalQuantity"],
+            "totalTurnover":    i["metadata"]["totalTurnover"],
+            "marketCap":        i["metadata"]["marketCap"],
+            "yearHigh":         i["metadata"]["yearHigh"],
+            "yearLow":          i["metadata"]["yearLow"],
+            "totalBuyQuantity": i["detail"]["preOpenMarket"]["totalBuyQuantity"],
+            "totalSellQuantity":i["detail"]["preOpenMarket"]["totalSellQuantity"],
+            "atoBuyQty":        i["detail"]["preOpenMarket"]["atoBuyQty"],
+            "atoSellQty":       i["detail"]["preOpenMarket"]["atoSellQty"],
+            "lastUpdateTime":   i["detail"]["preOpenMarket"]["lastUpdateTime"],
+        } for i in data.get("data", [])]
+
+        return pd.DataFrame(rows).set_index("symbol", drop=False)
+
+    def pre_market_derivatives_info(self, category: str = "Index Futures") -> pd.DataFrame | None:
+        """
+        Return pre-open data for F&O contracts.
+
+        Parameters
+        ----------
+        category : str, optional
+            ``"Index Futures"`` (default) or ``"Stock Futures"``.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.pre_market_derivatives_info("Index Futures")
+        >>> nse.pre_market_derivatives_info("Stock Futures")
+        """
+        xref = {"Index Futures": "FUTIDX", "Stock Futures": "FUTSTK"}
+        self.rotate_user_agent()
+
+        def _call():
+            resp = self._warm_and_fetch(
+                "https://www.nseindia.com/market-data/pre-open-market-fno",
+                f"https://www.nseindia.com/api/market-data-pre-open-fno?key={xref[category]}",
+                timeout=10
+            )
+            return resp.json().get("data", [])
+
+        try:
+            items = self._retry(_call)
+        except Exception as exc:
+            self._log_error("pre_market_derivatives_info", exc)
+            return None
+
+        rows = [{
+            "symbol":              i["metadata"]["symbol"],
+            "expiryDate":          i["metadata"]["expiryDate"],
+            "previousClose":       i["metadata"]["previousClose"],
+            "iep":                 i["metadata"]["iep"],
+            "change":              i["metadata"]["change"],
+            "pChange":             i["metadata"]["pChange"],
+            "lastPrice":           i["metadata"]["lastPrice"],
+            "finalQuantity":       i["metadata"]["finalQuantity"],
+            "totalTurnover":       i["metadata"]["totalTurnover"],
+            "totalBuyQuantity":    i["detail"]["preOpenMarket"]["totalBuyQuantity"],
+            "totalSellQuantity":   i["detail"]["preOpenMarket"]["totalSellQuantity"],
+            "atoBuyQty":           i["detail"]["preOpenMarket"]["atoBuyQty"],
+            "atoSellQty":          i["detail"]["preOpenMarket"]["atoSellQty"],
+            "lastUpdateTime":      i["detail"]["preOpenMarket"]["lastUpdateTime"],
+        } for i in items]
+
+        return pd.DataFrame(rows).set_index("symbol", drop=False)
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IV. Indices & VIX
+# ══════════════════════════════════════════════════════════════════════════════
+
+    def index_live_all_indices_data(self) -> pd.DataFrame | None:
+        """Return live snapshot for all NSE indices.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Columns include index, last, percentChange, pe, pb, dy,
+            advances, declines, perChange30d, perChange365d.
+
+        Examples
+        --------
+        >>> nse.index_live_all_indices_data()
+        """
+        df = self._json_data_df(
+            "https://www.nseindia.com/market-data/index-performances",
+            "https://www.nseindia.com/api/allIndices",
+        )
+        if df is None:
+            return None
+
+        cols = [
+            "key", "index", "indexSymbol", "last", "variation", "percentChange",
+            "open", "high", "low", "previousClose", "yearHigh", "yearLow",
+            "pe", "pb", "dy", "declines", "advances", "unchanged",
+            "perChange30d", "perChange365d", "previousDayVal",
+            "oneWeekAgoVal", "oneMonthAgoVal", "oneYearAgoVal",
+        ]
+        df = _keep_cols(df, cols)
+        return _clean(df.fillna(0))
+
+    def index_live_indices_stocks_data(
+        self,
+        category:  str,
+        list_only: bool = False,
+    ) -> pd.DataFrame | list | None:
+        """
+        Return live stock data for all constituents in an NSE index.
+
+        Parameters
+        ----------
+        category : str
+            Index name, e.g. ``"NIFTY 50"``, ``"NIFTY BANK"``,
+            ``"NIFTY IT"``.
+        list_only : bool, optional
+            If ``True``, return only the list of symbol strings.
+            Default is ``False``.
+
+        Returns
+        -------
+        pd.DataFrame or list or None
+
+        Examples
+        --------
+        >>> nse.index_live_indices_stocks_data("NIFTY 50")
+        >>> nse.index_live_indices_stocks_data("NIFTY IT", list_only=True)
+        """
+        try:
+            enc = category.upper().replace("&", "%26").replace(" ", "%20")
+            raw = self._get_json(
+                "https://www.nseindia.com/market-data/live-equity-market",
+                f"https://www.nseindia.com/api/equity-stockIndices?index={enc}"
+            )
+        except Exception as exc:
+            self._log_error("index_live_indices_stocks_data", exc)
+            return None
+
+        df = (
+            pd.DataFrame(raw["data"])
+            .drop(["meta"], axis=1, errors="ignore")
+            .set_index("symbol", drop=False)
+        )
+        if list_only:
+            return df["symbol"].tolist()
+
+        col_order = [
+            "symbol", "previousClose", "open", "dayHigh", "dayLow", "lastPrice",
+            "change", "pChange", "totalTradedVolume", "totalTradedValue",
+            "nearWKH", "nearWKL", "perChange30d", "perChange365d", "ffmc",
+        ]
+        return _clean(_keep_cols(df, col_order))
+
+    def index_live_nifty_50_returns(self) -> pd.DataFrame | None:
+        """Return the periodic returns of the Nifty 50 index (1W to 5Y).
+
+        Returns
+        -------
+        pd.DataFrame or None
+            One row with columns for 1W, 1M, 3M, 6M, 1Y, 2Y, 3Y, 5Y
+            percentage changes.
+
+        Examples
+        --------
+        >>> nse.index_live_nifty_50_returns()
+        """
+        df = self._json_data_df(
+            "https://www.nseindia.com/option-chain",
+            "https://www.nseindia.com/api/NextApi/apiClient/indexTrackerApi"
+            "?functionName=getIndicesReturn&&index=NIFTY%2050",
+        )
+        if df is None:
+            return None
+        cols = [
+            "one_week_chng_per", "one_month_chng_per", "three_month_chng_per",
+            "six_month_chng_per", "one_year_chng_per", "two_year_chng_per",
+            "three_year_chng_per", "five_year_chng_per",
+        ]
+        return _clean(_keep_cols(df, cols).fillna(0))
+
+    def index_live_contribution(
+        self,
+        *args,
+        Index: str = "NIFTY 50",
+        Mode:  str = "First Five",
+    ) -> pd.DataFrame | None:
+        """
+        Return per-stock contribution data for an NSE index.
+
+        Parameters
+        ----------
+        *args : str
+            Positional shorthand: pass an index name and/or ``"Full"``.
+        Index : str, optional
+            NSE index name. Default is ``"NIFTY 50"``.
+        Mode : str, optional
+            ``"First Five"`` for the top-5 contributors, or ``"Full"`` for
+            all constituents. Default is ``"First Five"``.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.index_live_contribution()
+        >>> nse.index_live_contribution("Full")
+        >>> nse.index_live_contribution("NIFTY IT")
+        >>> nse.index_live_contribution("NIFTY IT", "Full")
+        """
         if len(args) == 1:
             if args[0] in ("First Five", "Full"):
                 Mode = args[0]
             else:
                 Index = args[0]
-
         elif len(args) == 2:
             Index, Mode = args
 
-        elif len(args) > 2:
-            raise ValueError("Max 2 positional arguments allowed")
-
-        # ----------------------------------
-        # Validation & Normalization
-        # ----------------------------------
         Index = str(Index).upper()
         Mode  = str(Mode)
-
         if Mode not in ("First Five", "Full"):
             raise ValueError("Mode must be 'First Five' or 'Full'")
 
-        index_encoded = Index.replace("&", "%26").replace(" ", "%20")
+        enc   = Index.replace("&", "%26").replace(" ", "%20")
+        extra = "" if Mode == "First Five" else "&noofrecords=0"
+        flag  = "0" if Mode == "First Five" else "1"
 
-        self.rotate_user_agent()
-        ref_url = "https://www.nseindia.com"
-
-        # ----------------------------------
-        # API URL Selection
-        # ----------------------------------
-        if Mode == "First Five":
-            api_url = (
-                "https://www.nseindia.com/api/NextApi/apiClient/indexTrackerApi"
-                f"?functionName=getContributionData&index={index_encoded}&flag=0"
-            )
-        else:
-            api_url = (
-                "https://www.nseindia.com/api/NextApi/apiClient/indexTrackerApi"
-                f"?functionName=getContributionData&index={index_encoded}&noofrecords=0&flag=1"
-            )
-
-        try:
-            # Get reference cookies from the main page
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()  # Ensure request was successful
-
-            # Make API call using cookies from the previous request
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()  # Ensure request was successful
-
-            # Convert response to JSON
-            data = response.json()
-            
-            if 'data' in data and isinstance(data['data'], list):
-                df = pd.DataFrame(data['data'])
-
-                # Selecting and ordering columns
-                columns = ['icSymbol', 'icSecurity', 'lastTradedPrice', 'changePer', 'isPositive', 'rnNegative', 'changePoints']
-                
-                df = df[columns]
-
-                # **Fix NaN values** to avoid JSON conversion issues
-                df = df.fillna(0)  # Replace NaN with 0
-                df = df.replace({float('inf'): 0, float('-inf'): 0})  # Replace infinite values with 0
-
-                return df if not df.empty else None  # Return DataFrame if not empty
-            return None  # Return None if no data is found
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching all indices data: {e}")
+        df = self._json_data_df(
+            "https://www.nseindia.com/option-chain",
+            f"https://www.nseindia.com/api/NextApi/apiClient/indexTrackerApi"
+            f"?functionName=getContributionData&index={enc}{extra}&flag={flag}",
+        )
+        if df is None:
             return None
 
-        
-    #---------------------------------------------------------- Index_Eod_Data ----------------------------------------------------------------
+        cols = ["icSymbol", "icSecurity", "lastTradedPrice", "changePer",
+                "isPositive", "rnNegative", "changePoints"]
+        return _clean(_keep_cols(df, cols).fillna(0))
 
-    def index_eod_bhav_copy(self, trade_date: str):
-        self.rotate_user_agent()
-        trade_date = datetime.strptime(trade_date, "%d-%m-%Y")
-        url = f"https://nsearchives.nseindia.com/content/indices/ind_close_all_{str(trade_date.strftime('%d%m%Y').upper())}.csv"
-        try:
-            nse_resp = requests.get(url, headers=self.headers, timeout=10)
-            nse_resp.raise_for_status()
-            bhav_df = pd.read_csv(BytesIO(nse_resp.content))
-            return bhav_df
-        except (requests.RequestException, ValueError):
-            return None
-        
-    def index_historical_data(self, index: str, *args, from_date: str = None, to_date: str = None, period: str = None):
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ── Index — EOD & Historical ────────────────────────────────────────────
+
+    def index_eod_bhav_copy(self, trade_date: str) -> pd.DataFrame | None:
         """
-        Get historical index data for the specified time period.
-        Apply the index name as per the NSE India site.
-        
-        :param index: 'NIFTY 50'/'NIFTY BANK'
-        :param from_date: 'dd-mm-YYYY' (e.g., '17-03-2022')
-        :param to_date: 'dd-mm-YYYY' (e.g., '17-06-2023')
-        :param period: One of ['1D', '1W', '1M', '3M', '6M', '1Y', '2Y', '5Y', '10Y', 'YTD', 'MAX']
-        :param args: Allows flexible positional arguments for index, from_date, to_date, or period
-        :return: pandas.DataFrame
-        :raise ValueError: If the parameter input is not proper
+        Download the index bhavcopy (EOD close prices) for a trade date.
+
+        Parameters
+        ----------
+        trade_date : str
+            Date in ``DD-MM-YYYY`` format, e.g. ``"17-10-2025"``.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.index_eod_bhav_copy("17-10-2025")
         """
-        index_data_columns = ['Date', 'INDEX_NAME', 'Open', 'High', 'Close', 'Low', 'Shares Traded', 'Turnover (₹ Cr)']
-        
-        # Define period mappings
-        period_mappings = {
-            '1D': 1,
-            '1W': 7,
-            '1M': 30,
-            '3M': 90,
-            '6M': 180,
-            '1Y': 365,
-            '2Y': 730,
-            '5Y': 1825,
-            '10Y': 3650,
-            'YTD': (datetime.now() - datetime(datetime.now().year, 1, 1)).days,
-            'MAX': 3650  # Assuming MAX as 10 years for practical purposes
-        }
+        raw = self._get_archive(
+            f"https://nsearchives.nseindia.com/content/indices/"
+            f"ind_close_all_{_fmt_trade_date(trade_date)}.csv"
+        )
+        return pd.read_csv(BytesIO(raw)) if raw else None
 
-        # Handle *args for flexible input
-        if args:
-            if len(args) == 1:
-                # Check if the argument is a valid period or a date
-                if args[0] in period_mappings:
-                    period = args[0]
-                else:
-                    try:
-                        # Try parsing as a date to confirm it's a valid from_date
-                        datetime.strptime(args[0], "%d-%m-%Y")
-                        from_date = args[0]
-                    except ValueError:
-                        raise ValueError(f"Invalid argument '{args[0]}'. Must be a valid period {list(period_mappings.keys())} or date in dd-mm-YYYY format")
-            elif len(args) == 2:
-                # Case: index, from_date, to_date (e.g., 'NIFTY 50', '01-01-2024', '10-10-2025')
-                from_date, to_date = args
-            else:
-                raise ValueError("Invalid arguments provided. Use (index, period) or (index, from_date) or (index, from_date, to_date)")
-        
-        # Validate input combinations
-        if period and (from_date or to_date):
-            raise ValueError("Provide either 'period' or 'from_date' and optionally 'to_date', not both")
-        
-        # Set to_date to today if not provided
-        if from_date and not to_date and not period:
-            to_date = datetime.now().strftime("%d-%m-%Y")
-        
-        # Handle period-based date calculation
-        if period:
-            if period not in period_mappings:
-                raise ValueError(f"Invalid period. Choose from {list(period_mappings.keys())}")
-            to_dt = datetime.now()
-            from_dt = to_dt - timedelta(days=period_mappings[period])
-            from_date = from_dt.strftime("%d-%m-%Y")
-            to_date = to_dt.strftime("%d-%m-%Y")
-        
-        # Validate dates
-        if not from_date or not to_date:
-            raise ValueError("Both from_date and to_date must be provided or derived from period")
-        
-        try:
-            from_dt = datetime.strptime(from_date, "%d-%m-%Y")
-            to_dt = datetime.strptime(to_date, "%d-%m-%Y")
-            if to_dt < from_dt:
-                raise ValueError("to_date must be greater than or equal to from_date")
-        except ValueError as e:
-            raise ValueError(f"Invalid date format for from_date={from_date} or to_date={to_date}. Use dd-mm-YYYY")
-        
-        nse_df = pd.DataFrame(columns=index_data_columns)
-        from_date_dt = from_dt
-        to_date_dt = to_dt
-        load_days = (to_date_dt - from_date_dt).days
-        
-        while load_days > 0:
-            if load_days > 365:
-                end_date = (from_date_dt + timedelta(days=364)).strftime("%d-%m-%Y")
-                start_date = from_date_dt.strftime("%d-%m-%Y")
-            else:
-                end_date = to_date_dt.strftime("%d-%m-%Y")
-                start_date = from_date_dt.strftime("%d-%m-%Y")
-            
-            data_df = self.get_index_data(index=index, from_date=start_date, to_date=end_date)
-            from_date_dt = from_date_dt + timedelta(days=365)
-            load_days = (to_date_dt - from_date_dt).days
-            
-            if nse_df.empty:
-                nse_df = data_df
-            else:
-                nse_df = pd.concat([nse_df, data_df], ignore_index=True)
-        
-        return nse_df
-    
-    # sub function of def index_historical_data()
-    def get_index_data(self, index: str, from_date: str, to_date: str):
-        index_data_columns = ['Date', 'INDEX_NAME', 'Open', 'High', 'Low', 'Close', 'Shares Traded', 'Turnover (₹ Cr)']
-
-        index = index.replace(' ', '%20').upper()
-        ref_url = 'https://www.nseindia.com/reports-indices-historical-index-data'
-        ref = requests.get(ref_url, headers=self.headers)
-        url = f"https://www.nseindia.com/api/historicalOR/indicesHistory?indexType={index}&from={from_date}&to={to_date}"
-
-        try:
-            data_json = self.session.get(
-                url,
-                headers=self.headers,
-                cookies=ref.cookies.get_dict()
-            ).json()
-
-            records = data_json.get("data", [])
-
-            if not isinstance(records, list) or len(records) == 0:
-                raise ValueError("Empty or invalid NSE index response")
-
-            df = pd.DataFrame(records)
-
-        except Exception as e:
-            raise ValueError(f"Failed to fetch data from NSE API: {e}")
-
-        # Rename columns (new NSE format → standard format)
-        column_mapping = {
-            'EOD_TIMESTAMP': 'Date',
-            'EOD_INDEX_NAME': 'INDEX_NAME',
-            'EOD_OPEN_INDEX_VAL': 'Open',
-            'EOD_HIGH_INDEX_VAL': 'High',
-            'EOD_LOW_INDEX_VAL': 'Low',
-            'EOD_CLOSE_INDEX_VAL': 'Close',
-            'HIT_TRADED_QTY': 'Shares Traded',
-            'HIT_TURN_OVER': 'Turnover (₹ Cr)'
-        }
-
-        df = df.rename(columns=column_mapping)
-
-        # # Convert Date
-        # df['Date'] = pd.to_datetime(df['Date'], format='%d-%b-%Y', errors='coerce')
-
-        # # Sort for time-series integrity
-        # df = df.sort_values('Date').reset_index(drop=True)
-
-        return df[index_data_columns]
-
-
-    def index_pe_pb_div_historical_data(self, index: str, *args, from_date=None, to_date=None, period=None):
+    def index_historical_data(
+        self,
+        index: str,
+        *args,
+        from_date: str | None = None,
+        to_date:   str | None = None,
+        period:    str | None = None,
+    ) -> pd.DataFrame:
         """
-        Fetch historical P/E, P/B, and Dividend Yield data for a given NSE index.
-        Automatically splits requests into safe 89-day chunks to avoid API blocking.
-        Handles YTD, MAX, and fixed period formats.
+        Return OHLCV + turnover history for an NSE index.
 
         Parameters
         ----------
         index : str
-            Example: 'NIFTY 50', 'NIFTY BANK'
-        from_date, to_date : str, optional
-            In 'dd-mm-yyyy' format
+            Index name, e.g. ``"NIFTY 50"``, ``"NIFTY BANK"``.
+        *args : str
+            Positional shorthand for from_date, to_date, or period.
+        from_date : str, optional
+            Start date in ``DD-MM-YYYY``.
+        to_date : str, optional
+            End date in ``DD-MM-YYYY``. Defaults to today.
         period : str, optional
-            One of ['1D','1W','1M','3M','6M','1Y','2Y','5Y','10Y','YTD','MAX']
-        """
-
-        date_pattern = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-        today = datetime.now()
-        today_str = today.strftime("%d-%m-%Y")
-
-        # --- Auto-detect arguments ---
-        for arg in args:
-            if isinstance(arg, str):
-                if date_pattern.match(arg):
-                    if not from_date:
-                        from_date = arg
-                    elif not to_date:
-                        to_date = arg
-                elif arg.upper() in [
-                    '1D','1W','1M','3M','6M','1Y','2Y','5Y','10Y','YTD','MAX'
-                ]:
-                    period = arg.upper()
-
-        # --- Period mapping ---
-        delta_map = {
-            "1D": timedelta(days=1),
-            "1W": timedelta(weeks=1),
-            "1M": timedelta(days=30),
-            "3M": timedelta(days=90),
-            "6M": timedelta(days=180),
-            "1Y": timedelta(days=365),
-            "2Y": timedelta(days=730),
-            "5Y": timedelta(days=1825),
-            "10Y": timedelta(days=3650),
-        }
-
-        if period:
-            if period == "YTD":
-                from_date = datetime(today.year, 1, 1).strftime("%d-%m-%Y")
-                to_date = today_str
-            elif period == "MAX":
-                from_date = "01-01-2008"
-                to_date = today_str
-            else:
-                delta = delta_map.get(period, timedelta(days=365))
-                from_date = (today - delta).strftime("%d-%m-%Y")
-                to_date = today_str
-
-        from_date = from_date or (today - timedelta(days=365)).strftime("%d-%m-%Y")
-        to_date = to_date or today_str
-
-        ref_url = "https://www.nseindia.com/reports-indices-yield"
-        base_api = "https://www.nseindia.com/api/historicalOR/indicesYield?indexType={}&from={}&to={}"
-
-        index_encoded = index.replace(" ", "%20").upper()
-
-        # --- Start Session ---
-        self.rotate_user_agent()
-        try:
-            ref_resp = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_resp.raise_for_status()
-            cookies = ref_resp.cookies.get_dict()
-        except Exception as e:
-            print(f"❌ NSE session initialization failed: {e}")
-            return pd.DataFrame()
-
-        start_dt = datetime.strptime(from_date, "%d-%m-%Y")
-        end_dt = datetime.strptime(to_date, "%d-%m-%Y")
-        all_data = []
-        chunk_days = 89
-        max_retries = 3
-        fail_chunks = []
-
-        # --- Data Fetch Loop ---
-        while start_dt <= end_dt:
-            chunk_start = start_dt
-            chunk_end = min(start_dt + timedelta(days=chunk_days), end_dt)
-            api_url = base_api.format(
-                index_encoded,
-                chunk_start.strftime("%d-%m-%Y"),
-                chunk_end.strftime("%d-%m-%Y"),
-            )
-
-            success = False
-            for attempt in range(1, max_retries + 1):
-                try:
-                    response = self.session.get(
-                        api_url, headers=self.headers, cookies=cookies, timeout=15 + attempt * 5
-                    )
-                    if response.status_code == 200:
-                        data = response.json()
-                        if "data" in data and isinstance(data["data"], list):
-                            all_data.extend(data["data"])
-                        success = True
-                        break
-                    elif response.status_code == 429:
-                        time.sleep(random.uniform(8, 12))
-                    else:
-                        time.sleep(random.uniform(2, 4))
-                except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError):
-                    time.sleep(random.uniform(3, 6))
-                except Exception:
-                    time.sleep(random.uniform(3, 6))
-
-            if not success:
-                fail_chunks.append(f"{chunk_start.strftime('%d-%b-%Y')} → {chunk_end.strftime('%d-%b-%Y')}")
-                # Refresh session after consecutive failures
-                try:
-                    self.rotate_user_agent()
-                    ref_resp = self.session.get(ref_url, headers=self.headers, timeout=10)
-                    ref_resp.raise_for_status()
-                    cookies = ref_resp.cookies.get_dict()
-                except:
-                    time.sleep(random.uniform(5, 10))
-
-            # Safe spacing
-            time.sleep(random.uniform(1.5, 3.5))
-            start_dt = chunk_end + timedelta(days=1)
-
-        # --- Data Handling ---
-        if not all_data:
-            print(f"⚠️ No data for {index} between {from_date} and {to_date}.")
-            if fail_chunks:
-                print(f"❌ Failed chunks ({len(fail_chunks)}): {fail_chunks}")
-            return pd.DataFrame()
-
-        df = pd.DataFrame(all_data)
-        expected_cols = ["IY_INDEX", "IY_DT", "IY_PE", "IY_PB", "IY_DY"]
-        df = df[[c for c in expected_cols if c in df.columns]]
-
-        df.rename(columns={
-            "IY_INDEX": "Index Name",
-            "IY_DT": "Date",
-            "IY_PE": "P/E",
-            "IY_PB": "P/B",
-            "IY_DY": "Div Yield%"
-        }, inplace=True)
-
-        for col in ["P/E", "P/B", "Div Yield%"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        df.replace([float("inf"), float("-inf")], None, inplace=True)
-        df.dropna(subset=["P/E"], inplace=True)
-        df.ffill(inplace=True)
-
-        df["Date"] = pd.to_datetime(df["Date"], format="%d-%b-%Y", errors="coerce")
-        df.sort_values("Date", inplace=True)
-        df.drop_duplicates(subset=["Date"], keep="last", inplace=True)
-        df["Date"] = df["Date"].dt.strftime("%d-%b-%Y")
-
-        # # --- Final Summary ---
-        # if fail_chunks:
-        #     print(f"⚠️ {index}: {len(fail_chunks)} failed chunks → {fail_chunks}")
-        # else:
-        #     print(f"✅ {index} data fetched successfully: {from_date} → {to_date}")
-
-        return df.reset_index(drop=True)
-
-
-    def india_vix_historical_data(self, *args, from_date=None, to_date=None, period=None):
-        """
-        Fetch India VIX historical data from NSE's API.
-
-        Supports:
-            • Direct date inputs: "01-08-2025", "01-10-2025"
-            • Period shorthand: "1M", "3M", "6M", "1Y", "2Y", "5Y", "10Y", "YTD", "MAX"
-            • Automatically splits requests into ~3-month chunks to avoid API limits.
-
-        Returns:
-            pandas.DataFrame with columns:
-            ['Date', 'Symbol', 'Open Price', 'High Price', 'Low Price', 'Close Price',
-            'Prev Close', 'VIX Pts Chg', 'VIX % Chg']
-        """
-        symbol = "INDIA VIX"
-        date_pattern = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-        today = datetime.now()
-        today_str = today.strftime("%d-%m-%Y")
-
-        # --- Auto-detect arguments ---
-        for arg in args:
-            if isinstance(arg, str):
-                if date_pattern.match(arg):
-                    if not from_date:
-                        from_date = arg
-                    elif not to_date:
-                        to_date = arg
-                elif arg.upper() in ['1D','1W','1M','3M','6M','1Y','2Y','5Y','10Y','YTD','MAX']:
-                    period = arg.upper()
-
-        # --- Compute date range from period ---
-        delta_map = {
-            "1D": timedelta(days=1),
-            "1W": timedelta(weeks=1),
-            "1M": timedelta(days=30),
-            "3M": timedelta(days=90),
-            "6M": timedelta(days=180),
-            "1Y": timedelta(days=365),
-            "2Y": timedelta(days=730),
-            "5Y": timedelta(days=1825),
-            "10Y": timedelta(days=3650),
-        }
-
-        if period:
-            if period == "YTD":
-                from_date = datetime(today.year, 1, 1).strftime("%d-%m-%Y")
-                to_date = today_str
-            elif period == "MAX":
-                from_date = "01-01-2008"
-                to_date = today_str
-            else:
-                delta = delta_map.get(period, timedelta(days=365))
-                from_date = (today - delta).strftime("%d-%m-%Y")
-                to_date = today_str
-
-        from_date = from_date or (today - timedelta(days=365)).strftime("%d-%m-%Y")
-        to_date = to_date or today_str
-
-        # --- Setup session and headers ---
-        self.rotate_user_agent()
-        ref_url = "https://www.nseindia.com/report-detail/eq_security"
-        base_api = "https://www.nseindia.com/api/historicalOR/vixhistory?from={}&to={}"
-
-        try:
-            ref_resp = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_resp.raise_for_status()
-            cookies = ref_resp.cookies.get_dict()
-        except Exception as e:
-            print(f"❌ NSE session init failed: {e}")
-            return pd.DataFrame()
-
-        start_dt = datetime.strptime(from_date, "%d-%m-%Y")
-        end_dt = datetime.strptime(to_date, "%d-%m-%Y")
-
-        all_data = []
-        chunk_days = 89  # ~3 months
-        max_retries = 3
-        fail_chunks = []
-
-        # --- Fetch data in chunks ---
-        while start_dt <= end_dt:
-            chunk_start = start_dt
-            chunk_end = min(start_dt + timedelta(days=chunk_days), end_dt)
-            api_url = base_api.format(
-                chunk_start.strftime("%d-%m-%Y"),
-                chunk_end.strftime("%d-%m-%Y")
-            )
-
-            success = False
-            for attempt in range(1, max_retries + 1):
-                try:
-                    response = self.session.get(
-                        api_url, headers=self.headers, cookies=cookies, timeout=15 + attempt*5
-                    )
-                    if response.status_code == 200:
-                        data = response.json()
-                        if "data" in data and isinstance(data["data"], list):
-                            all_data.extend(data["data"])
-                        success = True
-                        break
-                    elif response.status_code == 429:
-                        # Rate limit hit, wait longer
-                        time.sleep(random.uniform(8, 12))
-                    else:
-                        time.sleep(random.uniform(2, 4))
-                except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError):
-                    time.sleep(random.uniform(3, 6))
-                except Exception:
-                    time.sleep(random.uniform(3, 6))
-
-            if not success:
-                fail_chunks.append(f"{chunk_start.strftime('%d-%b-%Y')} → {chunk_end.strftime('%d-%b-%Y')}")
-                # Rotate session after repeated failures
-                try:
-                    self.rotate_user_agent()
-                    ref_resp = self.session.get(ref_url, headers=self.headers, timeout=10)
-                    ref_resp.raise_for_status()
-                    cookies = ref_resp.cookies.get_dict()
-                except:
-                    time.sleep(random.uniform(5, 10))
-
-            # Safe spacing
-            time.sleep(random.uniform(1.5, 3.5))
-            start_dt = chunk_end + timedelta(days=1)
-
-        # --- Check if any data fetched ---
-        if not all_data:
-            print(f"⚠️ No data returned for {symbol} between {from_date} and {to_date}.")
-            if fail_chunks:
-                print(f"❌ Failed chunks ({len(fail_chunks)}): {fail_chunks}")
-            return pd.DataFrame()
-
-        # --- Convert to DataFrame ---
-        df = pd.DataFrame(all_data)
-        expected_cols = [
-            "EOD_TIMESTAMP", "EOD_INDEX_NAME",
-            "EOD_OPEN_INDEX_VAL", "EOD_HIGH_INDEX_VAL",
-            "EOD_LOW_INDEX_VAL", "EOD_CLOSE_INDEX_VAL",
-            "EOD_PREV_CLOSE", "VIX_PTS_CHG", "VIX_PERC_CHG"
-        ]
-        df = df[[c for c in expected_cols if c in df.columns]]
-
-        rename_map = {
-            "EOD_TIMESTAMP": "Date",
-            "EOD_INDEX_NAME": "Symbol",
-            "EOD_OPEN_INDEX_VAL": "Open Price",
-            "EOD_HIGH_INDEX_VAL": "High Price",
-            "EOD_LOW_INDEX_VAL": "Low Price",
-            "EOD_CLOSE_INDEX_VAL": "Close Price",
-            "EOD_PREV_CLOSE": "Prev Close",
-            "VIX_PTS_CHG": "VIX Pts Chg",
-            "VIX_PERC_CHG": "VIX % Chg"
-        }
-        df.rename(columns=rename_map, inplace=True)
-
-        numeric_cols = [
-            "Open Price", "High Price", "Low Price",
-            "Close Price", "Prev Close", "VIX Pts Chg", "VIX % Chg"
-        ]
-        for col in numeric_cols:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        df.replace([float("inf"), float("-inf")], None, inplace=True)
-        df.ffill(inplace=True)
-
-        df["Date"] = pd.to_datetime(df["Date"], format="%d-%b-%Y", errors="coerce")
-        df.sort_values("Date", inplace=True)
-        df.drop_duplicates(subset=["Date"], keep="last", inplace=True)
-        df["Date"] = df["Date"].dt.strftime("%d-%b-%Y")
-
-        # # --- Print final summary ---
-        # if fail_chunks:
-        #     print(f"⚠️ {symbol}: {len(fail_chunks)} failed chunks → {fail_chunks}")
-        # else:
-        #     print(f"✅ {symbol} data fetched successfully: {from_date} → {to_date}")
-
-        return df.reset_index(drop=True)
-
-    #---------------------------------------------------------- Gifty_Nifty ----------------------------------------------------------------
-
-    def cm_live_gifty_nifty(self):
-        self.rotate_user_agent()  # Rotating User-Agent
-
-        ref_url = 'https://www.nseindia.com/'
-        api_url = 'https://www.nseindia.com/api/NextApi/apiClient?functionName=getGiftNifty'
-
-        try:
-            # Get reference cookies from the main page
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()  # Ensure request was successful
-
-            # Make API call using cookies from the previous request
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()  # Ensure request was successful
-
-            # Convert response to JSON
-            data = response.json()
-
-            # Extract Gift Nifty and USDINR data
-            if isinstance(data, dict) and "data" in data:
-                gift_nifty_data = data["data"].get("giftNifty", {})
-                usd_inr_data = data["data"].get("usdInr", {})
-
-                # Convert to DataFrame
-                df = pd.DataFrame([{
-                    "symbol": gift_nifty_data.get("symbol"),
-                    "lastprice": gift_nifty_data.get("lastprice"),
-                    "daychange": gift_nifty_data.get("daychange"),
-                    "perchange": gift_nifty_data.get("perchange"),
-                    "contractstraded": gift_nifty_data.get("contractstraded"),
-                    "timestmp": gift_nifty_data.get("timestmp"),
-                    "expirydate": gift_nifty_data.get("expirydate"),
-                    "usdInr_symbol": usd_inr_data.get("symbol"),  # USDINR Symbol
-                    "usdInr_ltp": usd_inr_data.get("ltp"),  # USDINR Last Traded Price
-                    "usdInr_updated_time": usd_inr_data.get("updated_time"),  # USDINR Last Updated Time
-                    "usdInr_expiry_dt": usd_inr_data.get("expiry_dt"),  # USDINR Expiry Date
-                }])
-
-                return df if not df.empty else None  # Return DataFrame if not empty
-            return None  # Return None if data is missing
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching Gift Nifty and USDINR data: {e}")
-            return None
-        
-    #---------------------------------------------------------- market_statistics ----------------------------------------------------------------
-
-    def cm_live_market_statistics(self):
-        """
-        Fetch live Capital Market statistics from NSE India.
+            Shorthand: ``"1D"``, ``"1W"``, ``"1M"``, ``"3M"``, ``"6M"``,
+            ``"1Y"``, ``"2Y"``, ``"5Y"``, ``"10Y"``, ``"YTD"``, ``"MAX"``.
 
         Returns
         -------
-        pandas.DataFrame or None
-            A single-row DataFrame containing:
-            Total, Advances, Declines, Unchanged, 52W High, 52W Low,
-            Upper Circuit, Lower Circuit, Market Cap ₹ Lac Crs,
-            Market Cap Tn $, Registered Investors (Raw), Registered Investors (Cr), Date
+        pd.DataFrame
+            Columns: Date, Index Name, Open, High, Low, Close,
+            Shares Traded, Turnover (₹ Cr).
+
+        Examples
+        --------
+        >>> nse.index_historical_data("NIFTY 50", "01-01-2025", "17-10-2025")
+        >>> nse.index_historical_data("NIFTY 50", "01-12-2025")
+        >>> nse.index_historical_data("NIFTY BANK", "1W")
         """
-        self.rotate_user_agent()  # Rotate User-Agent for reliability
+        from_date, to_date, period, _ = _unpack_args(args, from_date, to_date, period)
+        from_date, to_date = _resolve_dates(from_date, to_date, period)
+        enc = index.replace(" ", "%20").upper()
 
-        ref_url = 'https://www.nseindia.com'
-        api_url = 'https://www.nseindia.com/api/NextApi/apiClient?functionName=getMarketStatistics'
+        return self._hist_index_df(
+            "https://www.nseindia.com/reports-indices-historical-index-data",
+            f"https://www.nseindia.com/api/historicalOR/indicesHistory"
+            f"?indexType={enc}&from={{}}&to={{}}",
+            from_date, to_date,
+            {
+                "EOD_TIMESTAMP":      "Date",
+                "EOD_INDEX_NAME":     "Index Name",
+                "EOD_OPEN_INDEX_VAL": "Open",
+                "EOD_HIGH_INDEX_VAL": "High",
+                "EOD_LOW_INDEX_VAL":  "Low",
+                "EOD_CLOSE_INDEX_VAL":"Close",
+                "HIT_TRADED_QTY":     "Shares Traded",
+                "HIT_TURN_OVER":      "Turnover (₹ Cr)",
+            },
+        )
 
-        try:
-            # Step 1: Get reference cookies
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()
+    def index_pe_pb_div_historical_data(
+        self,
+        index: str,
+        *args,
+        from_date: str | None = None,
+        to_date:   str | None = None,
+        period:    str | None = None,
+    ) -> pd.DataFrame:
+        """
+        Return historical P/E, P/B, and dividend-yield data for an NSE index.
 
-            # Step 2: Fetch market statistics using cookies
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()
-            data = response.json()
+        Parameters
+        ----------
+        index : str
+            Index name, e.g. ``"NIFTY 50"``.
+        *args : str
+            Positional shorthand for from_date, to_date, or period.
+        from_date : str, optional
+            Start date in ``DD-MM-YYYY``.
+        to_date : str, optional
+            End date in ``DD-MM-YYYY``. Defaults to today.
+        period : str, optional
+            Shorthand period code (same set as :meth:`index_historical_data`).
 
-            if 'data' in data:
-                d = data['data']
-                snapshot = d.get('snapshotCapitalMarket', {})
-                fifty_two_week = d.get('fiftyTwoWeek', {})
-                circuit = d.get('circuit', {})
+        Returns
+        -------
+        pd.DataFrame
+            Columns: Index Name, Date, P/E, P/B, Div Yield%.
 
-                # Convert Registered Investors string to crores (Cr) rounded to 2 decimals
-                reg_inv_str = d.get('regInvestors', '0')
-                if reg_inv_str:
-                    reg_inv_num = int(reg_inv_str.replace(',', '').strip())
-                    reg_inv_cr = round(reg_inv_num / 1e7, 2)  # 1 Cr = 10,000,000
-                else:
-                    reg_inv_cr = 0.0
+        Examples
+        --------
+        >>> nse.index_pe_pb_div_historical_data("NIFTY 50", "01-01-2025", "17-10-2025")
+        >>> nse.index_pe_pb_div_historical_data("NIFTY 50", "01-12-2025")
+        >>> nse.index_pe_pb_div_historical_data("NIFTY BANK", "1Y")
+        """
+        from_date, to_date, period, _ = _unpack_args(args, from_date, to_date, period)
+        from_date, to_date = _resolve_dates(from_date, to_date, period)
+        enc = index.replace(" ", "%20").upper()
 
-                # Step 3: Build DataFrame with both Registered Investors columns
-                df = pd.DataFrame([{
-                    'Total': snapshot.get('total'),
-                    'Advances': snapshot.get('advances'),
-                    'Declines': snapshot.get('declines'),
-                    'Unchanged': snapshot.get('unchange'),
-                    '52W High': fifty_two_week.get('high'),
-                    '52W Low': fifty_two_week.get('low'),
-                    'Upper Circuit': circuit.get('upper'),
-                    'Lower Circuit': circuit.get('lower'),
-                    'Market Cap ₹ Lac Crs': round(d.get('tlMKtCapLacCr', 0), 2),
-                    'Market Cap Tn $': round(d.get('tlMKtCapTri', 0), 3),
-                    'Registered Investors': reg_inv_str,           # Raw string
-                    'Registered Investors (Cr)': reg_inv_cr,       # Crores
-                    'Date': d.get('asOnDate'),
-                }])
+        df = self._hist_index_df(
+            "https://www.nseindia.com/reports-indices-yield",
+            f"https://www.nseindia.com/api/historicalOR/indicesYield"
+            f"?indexType={enc}&from={{}}&to={{}}",
+            from_date, to_date,
+            {
+                "IY_INDEX": "Index Name",
+                "IY_DT":    "Date",
+                "IY_PE":    "P/E",
+                "IY_PB":    "P/B",
+                "IY_DY":    "Div Yield%",
+            },
+        )
+        for col in ("P/E", "P/B", "Div Yield%"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
 
-                return df if not df.empty else None
+        df.replace([float("inf"), float("-inf")], None, inplace=True)
+        if "P/E" in df.columns:
+            df.dropna(subset=["P/E"], inplace=True)
+            df.ffill(inplace=True)
+        return df
 
-            return None  # No valid data field found
+    def india_vix_historical_data(
+        self,
+        *args,
+        from_date: str | None = None,
+        to_date:   str | None = None,
+        period:    str | None = None,
+    ) -> pd.DataFrame:
+        """
+        Return historical India VIX OHLC and percentage-change data.
 
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"❌ Error fetching market statistics: {e}")
+        Parameters
+        ----------
+        *args : str
+            Positional shorthand for from_date, to_date, or period.
+        from_date : str, optional
+            Start date in ``DD-MM-YYYY``.
+        to_date : str, optional
+            End date in ``DD-MM-YYYY``. Defaults to today.
+        period : str, optional
+            Shorthand: ``"1M"``, ``"3M"``, ``"6M"``, ``"1Y"`` etc.
+
+        Returns
+        -------
+        pd.DataFrame
+            Columns: Date, Symbol, Open Price, High Price, Low Price,
+            Close Price, Prev Close, VIX Pts Chg, VIX % Chg.
+
+        Examples
+        --------
+        >>> nse.india_vix_historical_data("01-08-2025", "17-10-2025")
+        >>> nse.india_vix_historical_data("1M")
+        """
+        from_date, to_date, period, _ = _unpack_args(args, from_date, to_date, period)
+        from_date, to_date = _resolve_dates(from_date, to_date, period)
+
+        return self._hist_index_df(
+            "https://www.nseindia.com/report-detail/eq_security",
+            "https://www.nseindia.com/api/historicalOR/vixhistory?from={}&to={}",
+            from_date, to_date,
+            {
+                "EOD_TIMESTAMP":      "Date",
+                "EOD_INDEX_NAME":     "Symbol",
+                "EOD_OPEN_INDEX_VAL": "Open Price",
+                "EOD_HIGH_INDEX_VAL": "High Price",
+                "EOD_LOW_INDEX_VAL":  "Low Price",
+                "EOD_CLOSE_INDEX_VAL":"Close Price",
+                "EOD_PREV_CLOSE":     "Prev Close",
+                "VIX_PTS_CHG":        "VIX Pts Chg",
+                "VIX_PERC_CHG":       "VIX % Chg",
+            },
+        )
+
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ── Index — Charts ──────────────────────────────────────────────────────
+
+    def index_chart(self, index: str, timeframe: str = "1D") -> pd.DataFrame | None:
+        """
+        Return intraday / short-term chart data for an NSE index.
+
+        Parameters
+        ----------
+        index : str
+            Index name, e.g. ``"NIFTY 50"``, ``"NIFTY BANK"``.
+        timeframe : str, optional
+            Chart span: ``"1D"`` (default), ``"1M"``, ``"3M"``, ``"6M"``,
+            ``"1Y"``.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Columns: datetime_utc, price, change, pct_change.
+
+        Examples
+        --------
+        >>> nse.index_chart("NIFTY 50", "1D")
+        >>> nse.index_chart("NIFTY 50", "3M")
+        """
+        enc  = index.upper().replace(" ", "%20").replace("&", "%26")
+        data = self._chart_fetch(
+            f"https://www.nseindia.com/api/NextApi/apiClient/indexTrackerApi"
+            f"?functionName=getIndexChart&&index={enc}&flag={timeframe}"
+        )
+        if not data:
             return None
-
-    #---------------------------------------------------------- CM_Live_Data ----------------------------------------------------------------
-    
-    def cm_live_equity_info(self, symbol):
-        symbol = symbol.replace(' ', '%20').replace('&', '%26')
-        self.rotate_user_agent()
-        ref_url = f'https://www.nseindia.com/get-quotes/equity?symbol={symbol}'
-        ref = requests.get(ref_url, headers=self.headers)
-        try:
-            url = f'https://www.nseindia.com/api/quote-equity?symbol={symbol}'
-            data = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10).json()
-            if not data or 'error' in data:
-                return None
-            return {
-                "Symbol": symbol,
-                "companyName": data['info']['companyName'],
-                "industry": data['info']['industry'],
-                "boardStatus": data['securityInfo']['boardStatus'],
-                "tradingStatus": data['securityInfo']['tradingStatus'],
-                "tradingSegment": data['securityInfo']['tradingSegment'],
-                "derivatives": data['securityInfo']['derivatives'],
-                "surveillance": data['securityInfo']['surveillance']['surv'],
-                "surveillanceDesc": data['securityInfo']['surveillance']['desc'],
-                "Facevalue": data['securityInfo']['faceValue'],
-                "TotalSharesIssued": data['securityInfo']['issuedSize']
-
+        rows = [
+            {
+                "datetime_utc": pd.to_datetime(r[0], unit="ms", utc=True).strftime("%Y-%m-%d %H:%M:%S"),
+                "price":        r[1],
+                "change":       r[3] if len(r) > 3 else None,
+                "pct_change":   r[4] if len(r) > 4 else None,
+                "flag":         r[2] if len(r) > 2 else None,
             }
-        except (requests.RequestException, ValueError):
-            return None
+            for r in (data.get("data") or {}).get("grapthData", [])
+        ]
+        return pd.DataFrame(rows)
 
-    def cm_live_equity_price_info(self, symbol):
-        symbol = symbol.replace(' ', '%20').replace('&', '%26')
+    def india_vix_chart(self) -> pd.DataFrame | None:
+        """Return live intraday chart data for the India VIX index.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Columns: datetime_utc, price, flag.
+
+        Examples
+        --------
+        >>> nse.india_vix_chart()
+        """
         self.rotate_user_agent()
-        ref_url = f'https://www.nseindia.com/get-quotes/equity?symbol={symbol}'
-        ref = requests.get(ref_url, headers=self.headers)
 
         try:
-            url = f'https://www.nseindia.com/api/quote-equity?symbol={symbol}'
-            data = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10).json()
-            url = f'https://www.nseindia.com/api/quote-equity?symbol={symbol}&section=trade_info'
-            trade_data = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10).json()
-
-            if not data or 'error' in data:
-                return None
-
-            # Extract bid and ask data (handling missing values)
-            bid_data = trade_data.get('marketDeptOrderBook', {}).get('bid', [])
-            ask_data = trade_data.get('marketDeptOrderBook', {}).get('ask', [])
-            total_buy_qty = trade_data.get('marketDeptOrderBook', {}).get('totalBuyQuantity', 0)
-            total_sell_qty = trade_data.get('marketDeptOrderBook', {}).get('totalSellQuantity', 0)
-
-            # Extract first 5 bid/ask levels (fill missing with 0)
-            bid_prices = [entry.get("price", 0) or 0 for entry in bid_data[:5]] + [0] * (5 - len(bid_data))
-            bid_quantities = [entry.get("quantity", 0) or 0 for entry in bid_data[:5]] + [0] * (5 - len(bid_data))
-
-            ask_prices = [entry.get("price", 0) or 0 for entry in ask_data[:5]] + [0] * (5 - len(ask_data))
-            ask_quantities = [entry.get("quantity", 0) or 0 for entry in ask_data[:5]] + [0] * (5 - len(ask_data))
-
-            return {
-                "Symbol": symbol,
-                "PreviousClose": data['priceInfo']['previousClose'],
-                "LastTradedPrice": data['priceInfo']['lastPrice'],
-                "Change": data['priceInfo']['change'],
-                "PercentChange": data['priceInfo']['pChange'],
-                "deliveryToTradedQuantity": trade_data['securityWiseDP']['deliveryToTradedQuantity'],
-                "Open": data['priceInfo']['open'],
-                "Close": data['priceInfo']['close'],
-                "High": data['priceInfo']['intraDayHighLow']['max'],
-                "Low": data['priceInfo']['intraDayHighLow']['min'],
-                "VWAP": data['priceInfo']['vwap'],
-                "UpperCircuit": data['priceInfo']['upperCP'],
-                "LowerCircuit": data['priceInfo']['lowerCP'],
-                "Macro": data['industryInfo']['macro'],
-                "Sector": data['industryInfo']['sector'],
-                "Industry": data['industryInfo']['industry'],
-                "BasicIndustry": data['industryInfo']['basicIndustry'],
-                # Store bid/ask levels separately instead of lists
-                "Bid Price 1": bid_prices[0], "Bid Quantity 1": bid_quantities[0],
-                "Bid Price 2": bid_prices[1], "Bid Quantity 2": bid_quantities[1],
-                "Bid Price 3": bid_prices[2], "Bid Quantity 3": bid_quantities[2],
-                "Bid Price 4": bid_prices[3], "Bid Quantity 4": bid_quantities[3],
-                "Bid Price 5": bid_prices[4], "Bid Quantity 5": bid_quantities[4],
-                "Ask Price 1": ask_prices[0], "Ask Quantity 1": ask_quantities[0],
-                "Ask Price 2": ask_prices[1], "Ask Quantity 2": ask_quantities[1],
-                "Ask Price 3": ask_prices[2], "Ask Quantity 3": ask_quantities[2],
-                "Ask Price 4": ask_prices[3], "Ask Quantity 4": ask_quantities[3],
-                "Ask Price 5": ask_prices[4], "Ask Quantity 5": ask_quantities[4],
-                "totalBuyQuantity": total_buy_qty,
-                "totalSellQuantity": total_sell_qty
-            }
-        except (requests.RequestException, ValueError):
+            obj = self._get_json(
+                "https://www.nseindia.com/market-data/live-market-indices",
+                "https://www.nseindia.com/api/chart-databyindex-dynamic?index=INDIA%20VIX&type=index"
+            )
+        except Exception as exc:
+            self._log_error("india_vix_chart", exc)
             return None
-    
 
-    def cm_live_equity_full_info(self, symbol):
+        if obj is None:
+            return None
+
+        rows = [
+            {
+                "datetime_utc": pd.to_datetime(ts, unit="ms", utc=True).strftime("%Y-%m-%d %H:%M:%S"),
+                "price": price,
+                "flag":  flag,
+            }
+            for ts, price, flag in obj.get("grapthData", [])
+        ]
+        return pd.DataFrame(rows)
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# V. Capital Market (Equities)
+# ══════════════════════════════════════════════════════════════════════════════
+
+    def cm_live_gifty_nifty(self) -> pd.DataFrame | None:
+        """Return the live Gift Nifty price along with USD/INR spot info.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Single-row with Gift Nifty symbol, lastprice, daychange,
+            perchange, and USD/INR ltp.
+
+        Examples
+        --------
+        >>> nse.cm_live_gifty_nifty()
+        """
+        data = self._get_json(
+            "https://www.nseindia.com/option-chain",
+            "https://www.nseindia.com/api/NextApi/apiClient"
+            "?functionName=getGiftNifty",
+        )
+        if not data or "data" not in data:
+            return None
+        gn = data["data"].get("giftNifty", {})
+        ui = data["data"].get("usdInr",    {})
+        return pd.DataFrame([{
+            "symbol":           gn.get("symbol"),
+            "lastprice":        gn.get("lastprice"),
+            "daychange":        gn.get("daychange"),
+            "perchange":        gn.get("perchange"),
+            "contractstraded":  gn.get("contractstraded"),
+            "timestmp":         gn.get("timestmp"),
+            "expirydate":       gn.get("expirydate"),
+            "usdInr_symbol":    ui.get("symbol"),
+            "usdInr_ltp":       ui.get("ltp"),
+            "usdInr_updated_time": ui.get("updated_time"),
+            "usdInr_expiry_dt": ui.get("expiry_dt"),
+        }])
+
+    def cm_live_market_statistics(self) -> pd.DataFrame | None:
+        """
+        Return today's market breadth summary.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Single row: Total, Advances, Declines, Unchanged, 52W High/Low,
+            Upper/Lower Circuit, Market Cap ₹ Lac Crs, Market Cap Tn $,
+            Registered Investors.
+
+        Examples
+        --------
+        >>> nse.cm_live_market_statistics()
+        """
+        data = self._get_json(
+            "https://www.nseindia.com/option-chain",
+            "https://www.nseindia.com/api/NextApi/apiClient"
+            "?functionName=getMarketStatistics",
+        )
+        if not data or "data" not in data:
+            return None
+
+        d    = data["data"]
+        snap = d.get("snapshotCapitalMarket", {})
+        fw   = d.get("fiftyTwoWeek",          {})
+        ckt  = d.get("circuit",               {})
+        ri   = d.get("regInvestors", "0")
+        ri_cr = round(int(ri.replace(",", "").strip()) / 1e7, 2) if ri else 0.0
+
+        return pd.DataFrame([{
+            "Total":                      snap.get("total"),
+            "Advances":                   snap.get("advances"),
+            "Declines":                   snap.get("declines"),
+            "Unchanged":                  snap.get("unchange"),
+            "52W High":                   fw.get("high"),
+            "52W Low":                    fw.get("low"),
+            "Upper Circuit":              ckt.get("upper"),
+            "Lower Circuit":              ckt.get("lower"),
+            "Market Cap ₹ Lac Crs":       round(d.get("tlMKtCapLacCr",  0), 2),
+            "Market Cap Tn $":            round(d.get("tlMKtCapTri",     0), 3),
+            "Registered Investors":       ri,
+            "Registered Investors (Cr)":  ri_cr,
+            "Date":                       d.get("asOnDate"),
+        }])
+
+    def cm_live_equity_info(self, symbol: str) -> dict | None:
+        """
+        Return basic equity information for a symbol.
+
+        Parameters
+        ----------
+        symbol : str
+            NSE equity symbol, e.g. ``"RELIANCE"``.
+
+        Returns
+        -------
+        dict or None
+            Keys: Symbol, companyName, industry, boardStatus,
+            tradingStatus, tradingSegment, derivatives, surveillance,
+            surveillanceDesc, Facevalue, TotalSharesIssued.
+
+        Examples
+        --------
+        >>> nse.cm_live_equity_info("RELIANCE")
+        """
         symbol = symbol.replace(" ", "%20").replace("&", "%26")
         self.rotate_user_agent()
 
-        ref_url = f'https://www.nseindia.com/get-quotes/equity?symbol={symbol}'
+        def _call():
+            data = self._get_json(
+                f"https://www.nseindia.com/get-quotes/equity?symbol={symbol}",
+                f"https://www.nseindia.com/api/quote-equity?symbol={symbol}"
+            )
+            if not data or "error" in data:
+                raise ValueError("No data")
+            return {
+                "Symbol":          symbol,
+                "companyName":     data["info"]["companyName"],
+                "industry":        data["info"]["industry"],
+                "boardStatus":     data["securityInfo"]["boardStatus"],
+                "tradingStatus":   data["securityInfo"]["tradingStatus"],
+                "tradingSegment":  data["securityInfo"]["tradingSegment"],
+                "derivatives":     data["securityInfo"]["derivatives"],
+                "surveillance":    data["securityInfo"]["surveillance"]["surv"],
+                "surveillanceDesc":data["securityInfo"]["surveillance"]["desc"],
+                "Facevalue":       data["securityInfo"]["faceValue"],
+                "TotalSharesIssued":data["securityInfo"]["issuedSize"],
+            }
+
+        try:
+            return self._retry(_call)
+        except Exception as exc:
+            self._log_error("cm_live_equity_info", exc)
+            return None
+
+    def cm_live_equity_price_info(self, symbol: str) -> dict | None:
+        """
+        Return live price info including OHLC, VWAP, and the 5-level order book.
+
+        Parameters
+        ----------
+        symbol : str
+            NSE equity symbol, e.g. ``"RELIANCE"``.
+
+        Returns
+        -------
+        dict or None
+            Keys: Symbol, PreviousClose, LastTradedPrice, Change,
+            PercentChange, Open, Close, High, Low, VWAP, UpperCircuit,
+            LowerCircuit, Sector, Bid/Ask Price & Quantity 1–5.
+
+        Examples
+        --------
+        >>> nse.cm_live_equity_price_info("RELIANCE")
+        """
+        symbol = symbol.replace(" ", "%20").replace("&", "%26")
+        self.rotate_user_agent()
+
+        def _call():
+            ref_url = f"https://www.nseindia.com/get-quotes/equity?symbol={symbol}"
+            data = self._get_json(
+                ref_url,
+                f"https://www.nseindia.com/api/quote-equity?symbol={symbol}"
+            )
+            trd  = self._get_json(
+                ref_url,
+                f"https://www.nseindia.com/api/quote-equity?symbol={symbol}&section=trade_info"
+            )
+
+            if not data or "error" in data:
+                raise ValueError("No data")
+
+            # Bug 3 fix: trade-info call may return None; guard before accessing .get()
+            trd  = trd or {}
+            ob   = trd.get("marketDeptOrderBook", {})
+            bids = ob.get("bid", [])
+            asks = ob.get("ask", [])
+            bp   = [e.get("price",    0) for e in bids[:5]] + [0] * (5 - len(bids))
+            bq   = [e.get("quantity", 0) for e in bids[:5]] + [0] * (5 - len(bids))
+            ap   = [e.get("price",    0) for e in asks[:5]] + [0] * (5 - len(asks))
+            aq   = [e.get("quantity", 0) for e in asks[:5]] + [0] * (5 - len(asks))
+            pi   = data["priceInfo"]
+            ii   = data["industryInfo"]
+
+            result = {
+                "Symbol":                    symbol,
+                "PreviousClose":             pi["previousClose"],
+                "LastTradedPrice":           pi["lastPrice"],
+                "Change":                    pi["change"],
+                "PercentChange":             pi["pChange"],
+                "deliveryToTradedQuantity":  trd.get("securityWiseDP", {}).get("deliveryToTradedQuantity"),
+                "Open":                      pi["open"],
+                "Close":                     pi["close"],
+                "High":                      pi["intraDayHighLow"]["max"],
+                "Low":                       pi["intraDayHighLow"]["min"],
+                "VWAP":                      pi["vwap"],
+                "UpperCircuit":              pi["upperCP"],
+                "LowerCircuit":              pi["lowerCP"],
+                "Macro":                     ii["macro"],
+                "Sector":                    ii["sector"],
+                "Industry":                  ii["industry"],
+                "BasicIndustry":             ii["basicIndustry"],
+                "totalBuyQuantity":          ob.get("totalBuyQuantity",  0),
+                "totalSellQuantity":         ob.get("totalSellQuantity", 0),
+            }
+            for i in range(5):
+                result[f"Bid Price {i+1}"]    = bp[i]
+                result[f"Bid Quantity {i+1}"] = bq[i]
+                result[f"Ask Price {i+1}"]    = ap[i]
+                result[f"Ask Quantity {i+1}"] = aq[i]
+            return result
+
+        try:
+            return self._retry(_call)
+        except Exception as exc:
+            self._log_error("cm_live_equity_price_info", exc)
+            return None
+
+    def cm_live_equity_full_info(self, symbol: str) -> dict | None:
+        """
+        Return comprehensive live data for a symbol.
+
+        Combines price, trade, security, margin, order-book, and
+        fundamental data (P/E, market cap, annualised volatility) into
+        a single flat dict.
+
+        Parameters
+        ----------
+        symbol : str
+            NSE equity symbol, e.g. ``"RELIANCE"``.
+
+        Returns
+        -------
+        dict or None
+            ~40 keys covering all aspects of the live quote.
+
+        Examples
+        --------
+        >>> nse.cm_live_equity_full_info("RELIANCE")
+        """
+        symbol = symbol.replace(" ", "%20").replace("&", "%26")
+        self.rotate_user_agent()
+        ref_url = f"https://www.nseindia.com/get-quotes/equity?symbol={symbol}"
         api_url = (
-            "https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
+            f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
             f"?functionName=getSymbolData&marketType=N&series=EQ&symbol={symbol}"
         )
 
+        def _call():
+            resp = self._warm_and_fetch(ref_url, api_url, timeout=10)
+            eq = (resp.json().get("equityResponse") or [None])[0]
+            if not eq:
+                raise ValueError("Empty equityResponse")
+            return eq
+
         try:
-            # Warm-up request
-            ref = self.session.get(ref_url, headers=self.headers, timeout=10)
+            eq = self._retry(_call)
+        except Exception as exc:
+            self._log_error("cm_live_equity_full_info", exc)
+            return None
 
-            response = self.session.get(
-                api_url,
-                headers=self.headers,
-                cookies=ref.cookies.get_dict(),
-                timeout=10
-            ).json()
+        meta  = eq.get("metaData", {})
+        trade = eq.get("tradeInfo", {})
+        price = eq.get("priceInfo", {})
+        sec   = eq.get("secInfo",   {})
+        order = eq.get("orderBook", {})
 
-            equity = response.get("equityResponse", [])
-            if not equity:
-                return None
-
-            eq = equity[0]
-
-            meta   = eq.get("metaData", {})
-            trade  = eq.get("tradeInfo", {})
-            price  = eq.get("priceInfo", {})
-            sec    = eq.get("secInfo", {})
-            order  = eq.get("orderBook", {})
-
-            return {
+        result = {
                 # ================= BASIC =================
-                "Symbol": meta.get("symbol"),
-                "CompanyName": meta.get("companyName"),
-                "Index": sec.get("index"),
-                "ISIN": meta.get("isinCode"),
-                "Series": meta.get("series"),
-                "MarketType": meta.get("marketType"),
-                "BoardStatus": sec.get("boardStatus"),
-                "TradingSegment": sec.get("tradingSegment"),
-                "SecurityStatus": sec.get("secStatus"),
+                "Symbol":                   meta.get("symbol"),
+                "CompanyName":              meta.get("companyName"),
+                "Index":                    sec.get("index"),
+                "ISIN":                     meta.get("isinCode"),
+                "Series":                   meta.get("series"),
+                "MarketType":               meta.get("marketType"),
+                "BoardStatus":              sec.get("boardStatus"),
+                "TradingSegment":           sec.get("tradingSegment"),
+                "SecurityStatus":           sec.get("secStatus"),
 
                 # ================= PRICE =================
-                "Open": meta.get("open"),
-                "DayHigh": meta.get("dayHigh"),
-                "DayLow": meta.get("dayLow"),
-                "PreviousClose": meta.get("previousClose"),
-                "LastTradedPrice": order.get("lastPrice"),
-                "closePrice": meta.get("closePrice"),
-                "Change": meta.get("change"),
-                "PercentChange": meta.get("pChange"),
-                "VWAP": meta.get("averagePrice"),
+                "Open":                     meta.get("open"),
+                "DayHigh":                  meta.get("dayHigh"),
+                "DayLow":                   meta.get("dayLow"),
+                "PreviousClose":            meta.get("previousClose"),
+                "LastTradedPrice":          order.get("lastPrice"),
+                "closePrice":               meta.get("closePrice"),
+                "Change":                   meta.get("change"),
+                "PercentChange":            meta.get("pChange"),
+                "VWAP":                     meta.get("averagePrice"),
 
                 # ================= VOLUME =================
-                "TotalTradedVolume": trade.get("totalTradedVolume"),
-                "TotalTradedValue": trade.get("totalTradedValue"),
-                "Quantity raded": trade.get("quantitytraded"),
-                "DeliveryQty": trade.get("deliveryquantity"),
-                "DeliveryPercent": trade.get("deliveryToTradedQuantity"),
-                "ImpactCost": trade.get("impactCost"),                
+                "TotalTradedVolume":        trade.get("totalTradedVolume"),
+                "TotalTradedValue":         trade.get("totalTradedValue"),
+                "Quantity Traded":          trade.get("quantitytraded"),
+                "DeliveryQty":              trade.get("deliveryquantity"),
+                "DeliveryPercent":          trade.get("deliveryToTradedQuantity"),
+                "ImpactCost":               trade.get("impactCost"),                
 
                 # ================= CIRCUIT =================
-                "PriceBandRange": price.get("priceBand"),
-                "PriceBand": price.get("ppriceBand"),
-                "TickSize": price.get("tickSize"),
+                "PriceBandRange":           price.get("priceBand"),
+                "PriceBand":                price.get("ppriceBand"),
+                "TickSize":                 price.get("tickSize"),
                 
                 # ================= ORDER BOOK =================
                 "Bid Price 1": order.get("buyPrice1"), "Bid Quantity 1": order.get("buyQuantity1"),
@@ -2074,964 +3536,612 @@ class Nse:
                 "Ask Price 4": order.get("sellPrice4"), "Ask Quantity 4": order.get("sellQuantity4"),
                 "Ask Price 5": order.get("sellPrice5"), "Ask Quantity 5": order.get("sellQuantity5"),
 
-                "TotalBuyQuantity": order.get("totalBuyQuantity"),
-                "TotalSellQuantity": order.get("totalSellQuantity"),
-                # "BuyQuantity%": order.get("perBuyQty"),
-                # "SellQuantity%": order.get("perSellQty"),
-                # "BuyQuantity%": f"{order.get('perBuyQty', 0):.2f} %",
-                # "SellQuantity%": f"{order.get('perSellQty', 0):.2f} %",
-                "BuyQuantity%": f"{order.get('perBuyQty', 0):.2f}",
-                "SellQuantity%": f"{order.get('perSellQty', 0):.2f}",  
+                "TotalBuyQuantity":         order.get("totalBuyQuantity"),
+                "TotalSellQuantity":        order.get("totalSellQuantity"),
+                "BuyQuantity%":             f"{pd.to_numeric(order.get('perBuyQty', 0), errors='coerce') or 0:.2f}",
+                "SellQuantity%":            f"{pd.to_numeric(order.get('perSellQty', 0), errors='coerce') or 0:.2f}",  
                               
                 # ================= FUNDAMENTAL =================
-                "52WeekHigh": price.get("yearHigh"),
-                "52WeekLow": price.get("yearLow"),
-                "52WeekHighDate": price.get("yearHightDt"),
-                "52WeekLowDate": price.get("yearLowDt"),
-                "DailyVolatility": price.get("cmDailyVolatility"),
-                "AnnualisedVolatility": price.get("cmAnnualVolatility"),               
-                "SymbolPE": sec.get("pdSymbolPe"),                
-                "FaceValue": trade.get("faceValue"),
-                "TotalIssuedShares": trade.get("issuedSize"),
-                "MarketCap": trade.get("totalMarketCap"),
-                "FreeFloatMcap": trade.get("ffmc"),
-                "DateOfListing": sec.get("listingDate"),                
+                "52WeekHigh":               price.get("yearHigh"),
+                "52WeekLow":                price.get("yearLow"),
+                "52WeekHighDate":           price.get("yearHightDt"),
+                "52WeekLowDate":            price.get("yearLowDt"),
+                "DailyVolatility":          price.get("cmDailyVolatility"),
+                "AnnualisedVolatility":     price.get("cmAnnualVolatility"),               
+                "SymbolPE":                 sec.get("pdSymbolPe"),                
+                "FaceValue":                trade.get("faceValue"),
+                "TotalIssuedShares":        trade.get("issuedSize"),
+                "MarketCap":                trade.get("totalMarketCap"),
+                "FreeFloatMcap":            trade.get("ffmc"),
+                "DateOfListing":            sec.get("listingDate"),   
+
+                # ================= Value at Risk (%) =================   
+                "Security VaR":             sec.get("securityvar"),
+                "Index VaR":                sec.get("indexvar"),
+                "VaR Margin":               sec.get("varMargin"),                          
+                "Extreme Loss Rate":        sec.get("extremelossMargin"),
+                "Adhoc Margin":             sec.get("adhocMargin"),
+                "Applicable Margin Rate":   sec.get("applicableMargin"),
 
                 # ================= SECTOR =================
-                "Macro": sec.get("macro"),
-                "Sector": sec.get("sector"),
-                "Industry": sec.get("industryInfo"),
-                "BasicIndustry": sec.get("basicIndustry"),
+                "Macro":                    sec.get("macro"),
+                "Sector":                   sec.get("sector"),
+                "Industry":                 sec.get("industryInfo"),
+                "BasicIndustry":            sec.get("basicIndustry"),
 
                 # ================= META =================
-                "LastUpdated": eq.get("lastUpdateTime")
-            }
-
-        except (requests.RequestException, ValueError, KeyError):
-            return None
-
-
-    def cm_live_most_active_equity_by_value(self):
-        self.rotate_user_agent()
-        ref_url = 'https://www.nseindia.com/market-data/most-active-equities'
-        ref = requests.get(ref_url, headers=self.headers)
-        url = 'https://www.nseindia.com/api/live-analysis-most-active-securities?index=value'
-        try:
-            response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
-            data = response.json()
-            df = pd.DataFrame(data['data'])
-            return df if not df.empty else None
-        except (requests.RequestException, ValueError):
-            return None
-
-    def cm_live_most_active_equity_by_vol(self):
-        self.rotate_user_agent()
-        ref_url = 'https://www.nseindia.com/market-data/most-active-equities'
-        ref = requests.get(ref_url, headers=self.headers)
-        url = 'https://www.nseindia.com/api/live-analysis-most-active-securities?index=volume'
-        try:
-            response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
-            data = response.json()
-            df = pd.DataFrame(data['data'])
-            return df if not df.empty else None
-        except (requests.RequestException, ValueError):
-            return None
-
-    def cm_live_volume_spurts(self):
-        self.rotate_user_agent()  # Rotating User-Agent
-
-        ref_url = 'https://www.nseindia.com/market-data/volume-gainers-spurts'
-        api_url = 'https://www.nseindia.com/api/live-analysis-volume-gainers'
-
-        try:
-            # Get reference cookies from the main page
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()
-
-            # Make API call using cookies from the previous request
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()
-
-            # Convert response to JSON
-            data = response.json()
-            
-            if 'data' in data and isinstance(data['data'], list):
-                df = pd.DataFrame(data['data'])
-
-                # Selecting and ordering columns
-                df = df[['symbol', 'companyName', 'volume', 'week1AvgVolume', 'week1volChange',
-                        'week2AvgVolume', 'week2volChange', 'ltp', 'pChange', 'turnover']]
-
-                # Rename columns to more user-friendly names
-                df.rename(columns={
-                    'symbol': 'Symbol',
-                    'companyName': 'Security',
-                    'volume': 'Today Volume',
-                    'week1AvgVolume': '1 Week Avg. Volume',
-                    'week1volChange': '1 Week Change (×)',
-                    'week2AvgVolume': '2 Week Avg. Volume',
-                    'week2volChange': '2 Week Change (×)',
-                    'ltp': 'LTP',
-                    'pChange': '% Change',
-                    'turnover': 'Turnover (₹ Lakhs)'
-                }, inplace=True)
-
-                return df if not df.empty else None
-            return None
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching Volume Spurts data: {e}")
-            return None
-
-
-    def cm_live_52week_high(self):
-        self.rotate_user_agent()  # Rotating User-Agent
-
-        ref_url = 'https://www.nseindia.com/market-data/52-week-high-equity-market'
-        api_url = 'https://www.nseindia.com/api/live-analysis-data-52weekhighstock'
-
-        try:
-            # Get reference cookies from the main page
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()  # Ensure request was successful
-
-            # Make API call using cookies from the previous request
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()  # Ensure request was successful
-
-            # Convert response to JSON
-            data = response.json()
-            
-            if 'data' in data and isinstance(data['data'], list):
-                df = pd.DataFrame(data['data'])
-
-                # Selecting and ordering columns
-                df = df[['symbol', 'series', 'ltp', 'pChange', 'new52WHL', 'prev52WHL', 'prevHLDate']]
-
-                return df if not df.empty else None  # Return DataFrame if not empty
-            return None  # Return None if no data is found
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching 52-week high data: {e}")
-            return None
+                "LastUpdated":              eq.get("lastUpdateTime")
+        }
         
-    def cm_live_52week_low(self):
-        self.rotate_user_agent()  # Rotating User-Agent
+        return result
 
-        ref_url = 'https://www.nseindia.com/market-data/52-week-low-equity-market'
-        api_url = 'https://www.nseindia.com/api/live-analysis-data-52weeklowstock'
+    # ══════════════════════════════════════════════════════════════════════════════
+    # VI. Capital Market (Equities)
+    # ══════════════════════════════════════════════════════════════════════════════
 
-        try:
-            # Get reference cookies from the main page
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()  # Ensure request was successful
-
-            # Make API call using cookies from the previous request
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()  # Ensure request was successful
-
-            # Convert response to JSON
-            data = response.json()
-            
-            if 'data' in data and isinstance(data['data'], list):
-                df = pd.DataFrame(data['data'])
-
-                # Selecting and ordering columns
-                df = df[['symbol', 'series', 'ltp', 'pChange', 'new52WHL', 'prev52WHL', 'prevHLDate']]
-
-                return df if not df.empty else None  # Return DataFrame if not empty
-            return None  # Return None if no data is found
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching 52-week low data: {e}")
-            return None
-
-    def cm_live_block_deal(self):
-        self.rotate_user_agent()  # Rotating User-Agent
-
-        ref_url = 'https://www.nseindia.com/market-data/block-deal-watch'
-        api_url = 'https://www.nseindia.com/api/block-deal'
-
-        try:
-            # Get reference cookies from the main page
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()  # Ensure request was successful
-
-            # Make API call using cookies from the previous request
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()  # Ensure request was successful
-
-            # Convert response to JSON
-            data = response.json()
-            
-            if 'data' in data and isinstance(data['data'], list):
-                df = pd.DataFrame(data['data'])
-
-                # Selecting and ordering columns
-                df = df[['session','symbol', 'series', 'open', 'dayHigh', 'dayLow', 'lastPrice', 'previousClose', 'pchange', 'totalTradedVolume', 'totalTradedValue']]
-
-                return df if not df.empty else None  # Return DataFrame if not empty
-            return None  # Return None if no data is found
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching Block deal data: {e}")
-            return None
-
-    def cm_live_hist_insider_trading(self, *args, from_date=None, to_date=None, period=None, symbol=None):
-        """
-        Fetch insider trading disclosures from NSE India.
-
-        Parameters
-        ----------
-        *args : str
-            Can contain symbol and/or dates (format: DD-MM-YYYY).
-        from_date : str, optional
-            Start date (DD-MM-YYYY)
-        to_date : str, optional
-            End date (DD-MM-YYYY)
-        symbol : str, optional
-            NSE symbol (e.g., 'RELIANCE')
+    def cm_live_most_active_equity_by_value(self) -> pd.DataFrame | None:
+        """Return today's most actively traded equities ranked by traded value.
 
         Returns
         -------
         pd.DataFrame or None
-            Insider trading disclosures as a DataFrame, or None if unavailable.
+
+        Examples
+        --------
+        >>> nse.cm_live_most_active_equity_by_value()
         """
-
-        date_pattern = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-        today = datetime.now()
-        today_str = today.strftime("%d-%m-%Y")
-
-        # --- Auto-detect arguments --- #
-        for arg in args:
-            if isinstance(arg, str):
-                if date_pattern.match(arg):
-                    if not from_date:
-                        from_date = arg
-                    elif not to_date:
-                        to_date = arg
-                elif arg.upper() in ["1D", "1W", "1M", "3M", "6M", "1Y"]:
-                    period = arg.upper()
-                else:
-                    symbol = arg.upper()
-
-        # --- Compute date range from period --- #
-        if period:
-            delta_map = {
-                "1D": timedelta(days=1),
-                "1W": timedelta(weeks=1),
-                "1M": timedelta(days=30),
-                "3M": timedelta(days=90),
-                "6M": timedelta(days=180),
-                "1Y": timedelta(days=365),
-            }
-            delta = delta_map.get(period, timedelta(days=365))
-            from_date = (today - delta).strftime("%d-%m-%Y")
-            if not to_date:
-                to_date = today_str
-
-        # --- Default fallback if symbol/date missing --- #
-        if not from_date:
-            from_date = today_str
-        if not to_date:
-            to_date = today_str
-
-        # --- Rotate user-agent for reliability ---
-        self.rotate_user_agent()
-
-        # --- Reference URL (for cookies/session setup) ---
-        ref_url = "https://www.nseindia.com/companies-listing/corporate-filings-insider-trading"
-
-        # --- API URL logic ---
-        if symbol and from_date and to_date:
-            api_url = (
-                f"https://www.nseindia.com/api/corporates-pit?"
-                f"index=equities&from_date={from_date}&to_date={to_date}&symbol={symbol}"
-            )
-        elif symbol:
-            api_url = f"https://www.nseindia.com/api/corporates-pit?index=equities&symbol={symbol}"
-        elif from_date and to_date:
-            api_url = f"https://www.nseindia.com/api/corporates-pit?index=equities&from_date={from_date}&to_date={to_date}"
-        else:
-            api_url = "https://www.nseindia.com/api/cmsNote?url=corporate-filings-insider-trading"
-
-        # --- Fetch and process data ---
-        try:
-            # Step 1: Establish session and cookies
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()
-
-            # Step 2: Attempt retries for main request
-            for attempt in range(3):
-                try:
-                    response = self.session.get(
-                        api_url,
-                        headers=self.headers,
-                        cookies=ref_response.cookies.get_dict(),
-                        timeout=15,
-                    )
-                    response.raise_for_status()
-                    break
-                except requests.RequestException as e:
-                    if attempt < 2:
-                        print(f"⚠️ Retry {attempt+1}/3 insider trading for {symbol or 'ALL'}... ({e})")
-                        time.sleep(2)
-                    else:
-                        raise
-
-            # Step 3: Parse JSON response
-            data = response.json()
-            records = data.get("data") if isinstance(data, dict) else data
-
-            if not records or not isinstance(records, list):
-                # print(f"ℹ️ No insider trading found for {symbol or 'ALL'} between {from_date} and {to_date}")
-                return None
-
-            df = pd.DataFrame(records)
-
-            # --- Clean columns ---
-            expected_cols = [
-                "symbol", "company", "acqName", "personCategory", "secType", "befAcqSharesNo",
-                "befAcqSharesPer", "remarks", "secAcq", "secVal", "tdpTransactionType",
-                "securitiesTypePost", "afterAcqSharesNo", "afterAcqSharesPer", "acqfromDt",
-                "acqtoDt", "intimDt", "acqMode", "derivativeType", "tdpDerivativeContractType",
-                "buyValue", "buyQuantity", "sellValue", "sellquantity", "exchange", "date", "xbrl"
-            ]
-
-            df = df[[c for c in expected_cols if c in df.columns]]
-            df = df.fillna("").replace({float("inf"): "", float("-inf"): ""})
-
-            # print(f"✅ Insider trading fetched for {symbol or 'ALL'} ({len(df)} records)")
-            return df
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"❌ Error fetching insider trading: {e}")
-            return None
-        
-    def cm_live_hist_corporate_announcement(self, *args, from_date=None, to_date=None, symbol=None):
-        """
-        Fetch corporate announcements from NSE India.
-        Auto-detects whether inputs are dates or symbol.
-
-        Logic:
-        - If symbol only → use symbol-only API
-        - If symbol + dates → always use date-range API (even if both = today)
-        - If dates only → fetch all symbols for date range
-        - If nothing → fetch all symbols for today's date
-
-        Returns:
-            pd.DataFrame: Empty DataFrame if no announcements found.
-        """
-
-        # --- Detect date pattern ---
-        date_pattern = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-        today_str = datetime.now().strftime("%d-%m-%Y")
-
-        # --- Auto-detect arguments (dates or symbol) ---
-        for arg in args:
-            if isinstance(arg, str):
-                if date_pattern.match(arg):
-                    if not from_date:
-                        from_date = arg
-                    elif not to_date:
-                        to_date = arg
-                else:
-                    symbol = arg.upper()
-
-        # --- Default dates only if no symbol is provided ---
-        if not symbol:
-            from_date = from_date or today_str
-            to_date = to_date or today_str
-
-        # --- Rotate user-agent for reliability ---
-        self.rotate_user_agent()
-
-        # --- NSE reference URL ---
-        ref_url = "https://www.nseindia.com/companies-listing/corporate-filings-announcements"
-
-        # --- Final URL selection logic ---
-        if symbol and from_date and to_date:
-            # Symbol + date range
-            api_url = (
-                f"https://www.nseindia.com/api/corporate-announcements?"
-                f"index=equities&from_date={from_date}&to_date={to_date}&symbol={symbol}&reqXbrl=false"
-            )
-        elif symbol:
-            # Symbol only
-            api_url = (
-                f"https://www.nseindia.com/api/corporate-announcements?"
-                f"index=equities&symbol={symbol}&reqXbrl=false"
-            )
-        else:
-            # Dates only (all symbols)
-            api_url = (
-                f"https://www.nseindia.com/api/corporate-announcements?"
-                f"index=equities&from_date={from_date}&to_date={to_date}&reqXbrl=false"
-            )
-
-        # --- Fetch & process ---
-        try:
-            # Step 1: Establish session
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()
-
-            # Step 2: API request
-            response = self.session.get(
-                api_url,
-                headers=self.headers,
-                cookies=ref_response.cookies.get_dict(),
-                timeout=10,
-            )
-            response.raise_for_status()
-
-            # Step 3: Parse JSON → DataFrame
-            data = response.json()
-            if isinstance(data, list) and len(data) > 0:
-                df = pd.DataFrame(data)
-                expected_cols = [
-                    'symbol', 'sm_name', 'smIndustry', 'desc',
-                    'attchmntText', 'attchmntFile', 'fileSize', 'an_dt'
-                ]
-                df = df[[c for c in expected_cols if c in df.columns]]
-                df = df.fillna("").replace({float('inf'): "", float('-inf'): ""})
-                return df
-            else:
-                print(f"ℹ️  No corporate announcements found for {symbol} between {from_date} and {to_date}")
-                return None
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"❌ Error fetching corporate announcements: {e}")
-            return None
-
-    def cm_live_hist_corporate_action(self, *args, from_date=None, to_date=None, period=None, symbol=None, filter=None):
-        """
-        Fetch corporate_action disclosures from NSE India.
-
-        Flexible calling patterns:
-        - cm_live_hist_corporate_action("RELIANCE")            -> symbol-only API (no dates)
-        - cm_live_hist_corporate_action()                      -> base API (no params)
-        - cm_live_hist_corporate_action(period="1M")           -> date-based (computed from period)
-        - cm_live_hist_corporate_action("01-10-2025","31-10-2025")
-        - cm_live_hist_corporate_action("RELIANCE","01-10-2025","31-10-2025")
-        - filter parameter applies a case-insensitive substring match on PURPOSE
-        """
-
-        import re
-        import time
-        import requests
-        import pandas as pd
-        from datetime import datetime, timedelta
-
-        date_pattern = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-        today = datetime.now()
-        today_str = today.strftime("%d-%m-%Y")
-
-        # --- Auto-detect arguments --- #
-        for arg in args:
-            if isinstance(arg, str):
-                if date_pattern.match(arg):
-                    if not from_date:
-                        from_date = arg
-                    elif not to_date:
-                        to_date = arg
-                elif arg.upper() in ["1D", "1W", "1M", "3M", "6M", "1Y"]:
-                    period = arg.upper()
-                else:
-                    symbol = arg.upper()
-
-        # --- Rotate user-agent for reliability --- #
-        self.rotate_user_agent()
-
-        # --- Reference URL for cookies/session setup --- #
-        ref_url = "https://www.nseindia.com/companies-listing/corporate-filings-actions"
-
-        # --- Decide which API to call ---
-        # 1) SYMBOL ONLY — no date/period provided
-        if symbol and not any([from_date, to_date, period]):
-            api_url = f"https://www.nseindia.com/api/corporates-corporateActions?index=equities&symbol={symbol}"
-
-        # 3) Otherwise, compute dates (from period or defaults) and include them
-        else:
-            # Compute from period if provided
-            if period:
-                delta_map = {
-                    "1D": timedelta(days=1),
-                    "1W": timedelta(weeks=1),
-                    "1M": timedelta(days=30),
-                    "3M": timedelta(days=90),
-                    "6M": timedelta(days=180),
-                    "1Y": timedelta(days=365),
-                }
-                delta = delta_map.get(period, timedelta(days=365))
-                from_date = (today - delta).strftime("%d-%m-%Y")
-                if not to_date:
-                    to_date = today_str
-
-            # Default date window if still missing
-            if not from_date:
-                from_date = (today - timedelta(days=1)).strftime("%d-%m-%Y")
-            if not to_date:
-                to_date = (today + timedelta(days=90)).strftime("%d-%m-%Y")
-
-            if symbol:
-                api_url = (
-                    f"https://www.nseindia.com/api/corporates-corporateActions?"
-                    f"index=equities&from_date={from_date}&to_date={to_date}&symbol={symbol}"
-                )
-            elif from_date and to_date:
-                api_url = (
-                    f"https://www.nseindia.com/api/corporates-corporateActions?"
-                    f"index=equities&from_date={from_date}&to_date={to_date}"
-                )
-            else:
-                api_url = "https://www.nseindia.com/api/corporates-corporateActions?index=equities"
-
-        # --- Fetch and process data --- #
-        try:
-            # Step 1: get cookies/session
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()
-
-            # Step 2: request with simple retry logic
-            for attempt in range(3):
-                try:
-                    response = self.session.get(
-                        api_url,
-                        headers=self.headers,
-                        cookies=ref_response.cookies.get_dict(),
-                        timeout=15,
-                    )
-                    response.raise_for_status()
-                    break
-                except requests.RequestException as e:
-                    if attempt < 2:
-                        print(f"⚠️ Retry {attempt+1}/3 corporate action request... ({e})")
-                        time.sleep(2)
-                    else:
-                        raise
-
-            # Step 3: parse JSON (API sometimes returns dict with 'data' key)
-            data = response.json()
-            records = data.get("data") if isinstance(data, dict) else data
-
-            if not records or not isinstance(records, list):
-                print(f"ℹ️ No corporate actions found for {symbol or 'ALL'} with URL: {api_url}")
-                return None
-
-            df = pd.DataFrame(records)
-
-            # --- Clean and rename columns --- #
-            column_mapping = {
-                "symbol": "SYMBOL",
-                "comp": "COMPANY NAME",
-                "series": "SERIES",
-                "subject": "PURPOSE",
-                "faceVal": "FACE VALUE",
-                "exDate": "EX-DATE",
-                "recDate": "RECORD DATE",
-                "bcStartDate": "BOOK CLOSURE START DATE",
-                "bcEndDate": "BOOK CLOSURE END DATE",
-            }
-            df.rename(columns=column_mapping, inplace=True)
-
-            # --- Optional filter on PURPOSE ---
-            if filter:
-                df = df[df["PURPOSE"].str.contains(filter, case=False, na=False)]
-
-            # --- Reorder and clean columns ---
-            col_order = [
-                "SYMBOL",
-                "COMPANY NAME",
-                "SERIES",
-                "PURPOSE",
-                "FACE VALUE",
-                "EX-DATE",
-                "RECORD DATE",
-                "BOOK CLOSURE START DATE",
-                "BOOK CLOSURE END DATE",
-            ]
-            df = df[[c for c in col_order if c in df.columns]]
-            df = df.fillna("").replace({float("inf"): "", float("-inf"): ""})
-
-            # print(f"✅ Corporate Actions fetched: {len(df)} records for {symbol or 'ALL'}")
-            return df
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"❌ Error fetching corporate actions: {e}")
-            return None
-
-    def cm_live_today_event_calendar(self, from_date=None, to_date=None):
-        # --- Default date handling ---
-        today_str = datetime.now().strftime("%d-%m-%Y")
-        from_date = from_date or today_str
-        to_date = to_date or today_str
-
-        # --- Rotate user-agent for reliability ---
-        self.rotate_user_agent()
-
-        # --- NSE URLs ---
-        ref_url = "https://www.nseindia.com/companies-listing/corporate-filings-event-calendar"
-        api_url = (
-            f"https://www.nseindia.com/api/event-calendar?"
-            f"index=equities&from_date={from_date}&to_date={to_date}"
+        return self._cm_live_simple(
+            "https://www.nseindia.com/market-data/most-active-equities",
+            "https://www.nseindia.com/api/live-analysis-most-active-securities?index=value",
         )
 
-        try:
-            # Step 1: Get session cookies
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()
+    def cm_live_most_active_equity_by_vol(self) -> pd.DataFrame | None:
+        """Return today's most actively traded equities ranked by traded volume.
 
-            # Step 2: API request with valid session cookies
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()
+        Returns
+        -------
+        pd.DataFrame or None
 
-            # Step 3: Convert JSON to DataFrame
-            data = response.json()
-
-            if isinstance(data, list) and len(data) > 0:
-                df = pd.DataFrame(data)
-
-                # Expected NSE JSON keys
-                columns = ['symbol', 'company', 'purpose', 'bm_desc', 'date']
-                df = df[[col for col in columns if col in df.columns]]
-
-                # Data cleaning
-                df = df.fillna("").replace({float('inf'): "", float('-inf'): ""})
-
-                return df if not df.empty else None
-            else:
-                print(f"No corporate Event found for {from_date} to {to_date}")
-                return None
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"❌ Error fetching corporate Event: {e}")
-            return None
-        
-    def cm_live_upcoming_event_calendar(self):
-        self.rotate_user_agent()  # Rotating User-Agent
-
-        ref_url = 'https://www.nseindia.com/companies-listing/corporate-filings-event-calendar'
-        api_url = 'https://www.nseindia.com/api/event-calendar?'
-
-        try:
-            # Get reference cookies from the main page
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()  # Ensure request was successful
-
-            # Make API call using cookies from the previous request
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()  # Ensure request was successful
-
-            # Convert response to JSON
-            data = response.json()
-            
-            # Directly assume data is a list instead of checking 'data' key
-            if isinstance(data, list):
-                df = pd.DataFrame(data)
-
-                # Selecting and ordering columns
-                required_columns = ['symbol', 'company', 'purpose', 'bm_desc', 'date']
-                df = df[required_columns]
-
-                return df if not df.empty else None  # Return DataFrame if not empty
-            return None  # Return None if data is not a list or is empty
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching Event Calendar data: {e}")
-            return None
-        
-    def cm_live_hist_board_meetings(self, *args, from_date=None, to_date=None, symbol=None):
-        # --- Detect date pattern ---
-        date_pattern = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-        today_str = datetime.now().strftime("%d-%m-%Y")
-
-        # --- Auto-detect arguments (dates or symbol) ---
-        for arg in args:
-            if isinstance(arg, str):
-                if date_pattern.match(arg):
-                    if not from_date:
-                        from_date = arg
-                    elif not to_date:
-                        to_date = arg
-                else:
-                    symbol = arg.upper()
-
-        # # --- Default dates only if no symbol is provided ---
-        # if not symbol:
-        #     from_date = from_date or today_str
-        #     to_date = to_date or today_str
-
-        # --- Rotate user-agent for reliability ---
-        self.rotate_user_agent()
-
-        # --- NSE reference URL ---
-        ref_url = "https://www.nseindia.com/companies-listing/corporate-filings-board-meetings"
-
-        # --- Final URL selection logic ---
-        if symbol and from_date and to_date:
-            # Symbol + date range
-            api_url = (
-                f"https://www.nseindia.com/api/corporate-board-meetings?"
-                f"index=equities&from_date={from_date}&to_date={to_date}&symbol={symbol}"
-            )
-        elif symbol:
-            # Symbol only
-            api_url = (f"https://www.nseindia.com/api/corporate-board-meetings?index=equities&symbol={symbol}"
-            )
-
-        elif not symbol and from_date and to_date:
-            # Date only
-            api_url = (f"https://www.nseindia.com/api/corporate-board-meetings?index=equities&from_date={from_date}&to_date={to_date}"
-            )
-
-        else:
-            api_url = ("https://www.nseindia.com/api/corporate-board-meetings?index=equities")
-
-        # --- Fetch & process ---
-        try:
-            # Step 1: Establish session
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()
-
-            # Step 2: API request
-            response = self.session.get(
-                api_url,
-                headers=self.headers,
-                cookies=ref_response.cookies.get_dict(),
-                timeout=10,
-            )
-            response.raise_for_status()
-
-            # Step 3: Parse JSON → DataFrame
-            data = response.json()
-            if isinstance(data, list) and len(data) > 0:
-                df = pd.DataFrame(data)
-                expected_cols = [
-                    'bm_symbol', 'sm_name', 'sm_indusrty', 'bm_purpose',
-                    'bm_desc', 'bm_date', 'attachment', 'attFileSize','bm_timestamp'
-                ]
-                df = df[[c for c in expected_cols if c in df.columns]]
-                df = df.fillna("").replace({float('inf'): "", float('-inf'): ""})
-                return df
-            else:
-                print(f"ℹ️  No Board Meetings found for {symbol} between {from_date} and {to_date}")
-                return None
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"❌ Error fetching Board Meetings: {e}")
-            return None
-        
-    def cm_live_hist_Shareholder_meetings(self, *args, from_date=None, to_date=None, symbol=None):
+        Examples
+        --------
+        >>> nse.cm_live_most_active_equity_by_vol()
         """
-        Fetch NSE shareholder meetings (AGM, EGM, Postal Ballot) data.
-        Handles flexible inputs: symbol, date range, or none (fetch all).
+        return self._cm_live_simple(
+            "https://www.nseindia.com/market-data/most-active-equities",
+            "https://www.nseindia.com/api/live-analysis-most-active-securities?index=volume",
+        )
+
+    def cm_live_volume_spurts(self) -> pd.DataFrame | None:
         """
-
-        # --- Detect date pattern ---
-        date_pattern = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-        today_str = datetime.now().strftime("%d-%m-%Y")
-
-        # --- Auto-detect arguments (dates or symbol) ---
-        for arg in args:
-            if isinstance(arg, str):
-                if date_pattern.match(arg):
-                    if not from_date:
-                        from_date = arg
-                    elif not to_date:
-                        to_date = arg
-                else:
-                    symbol = arg.upper()
-
-        # --- Rotate user-agent for reliability ---
-        self.rotate_user_agent()
-
-        # --- NSE reference URL ---
-        ref_url = "https://www.nseindia.com/companies-listing/corporate-filings-postal-ballot"
-
-        # --- Final API URL selection logic ---
-        if symbol and from_date and to_date:
-            api_url = f"https://www.nseindia.com/api/postal-ballot?index=equities&from_date={from_date}&to_date={to_date}&symbol={symbol}"
-        elif symbol:
-            api_url = f"https://www.nseindia.com/api/postal-ballot?index=equities&symbol={symbol}"
-        elif from_date and to_date:
-            api_url = f"https://www.nseindia.com/api/postal-ballot?index=equities&from_date={from_date}&to_date={to_date}"
-        else:
-            api_url = "https://www.nseindia.com/api/postal-ballot?index=equities"
-
-        # --- Fetch & process ---
-        try:
-            # Step 1: Establish session
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()
-
-            # Step 2: API request
-            response = self.session.get(
-                api_url,
-                headers=self.headers,
-                cookies=ref_response.cookies.get_dict(),
-                timeout=10,
-            )
-            response.raise_for_status()
-
-            # Step 3: Parse JSON → DataFrame
-            data_json = response.json()
-            data = data_json.get("data", [])  # ✅ Correct key
-
-            if isinstance(data, list) and len(data) > 0:
-                df = pd.DataFrame(data)
-                expected_cols = ["symbol", "sLN", "bdt", "text", "type", "attachment", "date"]
-                df = df[[c for c in expected_cols if c in df.columns]]
-                df = df.fillna("").replace({float("inf"): "", float("-inf"): ""})
-                return df
-
-            else:
-                scope = symbol or "All symbols"
-                print(f"ℹ️  No Shareholder Meetings found for {scope} between {from_date or '-'} and {to_date or '-'}")
-                return None
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"❌ Error fetching Shareholder Meetings: {e}")
+        Return equities with unusual intraday volume spikes (1-week and
+        2-week average comparison).
+        """
+        df = self._json_data_df(
+            "https://www.nseindia.com/market-data/volume-gainers-spurts",
+            "https://www.nseindia.com/api/live-analysis-volume-gainers",
+        )
+        if df is None:
             return None
+        df = df[[
+            "symbol", "companyName", "volume", "week1AvgVolume", "week1volChange",
+            "week2AvgVolume", "week2volChange", "ltp", "pChange", "turnover",
+        ]]
+        return df.rename(columns={
+            "symbol":         "Symbol",
+            "companyName":    "Security",
+            "volume":         "Today Volume",
+            "week1AvgVolume": "1 Week Avg. Volume",
+            "week1volChange": "1 Week Change (×)",
+            "week2AvgVolume": "2 Week Avg. Volume",
+            "week2volChange": "2 Week Change (×)",
+            "ltp":            "LTP",
+            "pChange":        "% Change",
+            "turnover":       "Turnover (₹ Lakhs)",
+        })
 
-    def cm_live_hist_qualified_institutional_placement(self, *args, from_date=None, to_date=None, period=None, symbol=None, stage=None):
+    def cm_live_52week_high(self) -> pd.DataFrame | None:
+        """Return equities that hit a new 52-week high today.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Columns: symbol, series, ltp, pChange, new52WHL, prev52WHL,
+            prevHLDate.
+
+        Examples
+        --------
+        >>> nse.cm_live_52week_high()
         """
-        Fetch Qualified Institutional Placement (QIP) data from NSE (In-Principle or Listing Stage).
+        return self._cm_live_52wk(
+            "https://www.nseindia.com/market-data/52-week-high-equity-market",
+            "https://www.nseindia.com/api/live-analysis-data-52weekhighstock",
+        )
 
-        Args (auto-detected from *args):
-            - stage: "In-Principle" or "Listing Stage"
-            - symbol: NSE symbol (e.g., "RELIANCE")
-            - from_date: dd-mm-yyyy (e.g., "20-10-2024")
-            - to_date: dd-mm-yyyy (e.g., "10-01-2025")
-            - period: "1D", "1W", "1M", "3M", "6M", "1Y"
+    def cm_live_52week_low(self) -> pd.DataFrame | None:
+        """Return equities that hit a new 52-week low today.
 
-        Returns:
-            pandas.DataFrame or None
+        Returns
+        -------
+        pd.DataFrame or None
+            Columns: symbol, series, ltp, pChange, new52WHL, prev52WHL,
+            prevHLDate.
+
+        Examples
+        --------
+        >>> nse.cm_live_52week_low()
         """
+        return self._cm_live_52wk(
+            "https://www.nseindia.com/market-data/52-week-low-equity-market",
+            "https://www.nseindia.com/api/live-analysis-data-52weeklowstock",
+        )
 
-        today = datetime.now()
-        today_str = today.strftime("%d-%m-%Y")
-        date_pattern = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-        period_pattern = re.compile(r"^(1D|1W|1M|3M|6M|1Y)$", re.IGNORECASE)
+    def cm_live_block_deal(self) -> pd.DataFrame | None:
+        """Return today's block-deal data with session, OHLC, and volume.
 
-        # --- Auto-detect args ---
-        for arg in args:
-            if isinstance(arg, str):
-                arg_title = arg.title()
-                # Stage
-                if arg_title in ["In-Principle", "Listing Stage"]:
-                    stage = arg_title
-                # Date
-                elif date_pattern.match(arg):
-                    if not from_date:
-                        from_date = arg
-                    elif not to_date:
-                        to_date = arg
-                # Period
-                elif period_pattern.match(arg.upper()):
-                    period = arg.upper()
-                # Symbol
-                else:
-                    symbol = arg.upper()
-            elif isinstance(arg, datetime):
-                if not from_date:
-                    from_date = arg.strftime("%d-%m-%Y")
-                elif not to_date:
-                    to_date = arg.strftime("%d-%m-%Y")
+        Returns
+        -------
+        pd.DataFrame or None
+            Columns: session, symbol, series, open, dayHigh, dayLow,
+            lastPrice, previousClose, pchange, totalTradedVolume,
+            totalTradedValue.
 
-        # --- Compute from period if no explicit dates ---
-        if period and not (from_date and to_date):
-            delta_map = {
-                "1D": timedelta(days=1),
-                "1W": timedelta(weeks=1),
-                "1M": timedelta(days=30),
-                "3M": timedelta(days=90),
-                "6M": timedelta(days=180),
-                "1Y": timedelta(days=365),
+        Examples
+        --------
+        >>> nse.cm_live_block_deal()
+        """
+        df = self._json_data_df(
+            "https://www.nseindia.com/market-data/block-deal-watch",
+            "https://www.nseindia.com/api/block-deal",
+        )
+        if df is None:
+            return None
+        if df.empty:
+            return None
+        return df[[
+            "session", "symbol", "series", "open", "dayHigh", "dayLow",
+            "lastPrice", "previousClose", "pchange", "totalTradedVolume",
+            "totalTradedValue",
+        ]]
+
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ── CM — Charts ─────────────────────────────────────────────────────────
+
+    def stock_chart(self, symbol: str, timeframe: str = "1D") -> pd.DataFrame | None:
+        """
+        Return intraday / short-term chart data for an NSE-listed stock.
+
+        Parameters
+        ----------
+        symbol : str
+            NSE equity ticker, e.g. ``"RELIANCE"``.
+        timeframe : str, optional
+            Chart span: ``"1D"`` (default), ``"1W"``.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Columns: datetime_utc, price, change, pct_change.
+
+        Examples
+        --------
+        >>> nse.stock_chart("RELIANCE", "1D")
+        >>> nse.stock_chart("INFY", "1W")
+        """
+        data = self._chart_fetch(
+            f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
+            f"?functionName=getSymbolChartData&symbol={symbol}EQN&days={timeframe}"
+        )
+        if not data or "grapthData" not in data:
+            return None
+        rows = [
+            {
+                "datetime_utc": pd.to_datetime(r[0], unit="ms", utc=True).strftime("%Y-%m-%d %H:%M:%S"),
+                "price":        r[1],
+                "change":       r[3] if len(r) > 3 else None,
+                "pct_change":   r[4] if len(r) > 4 else None,
+                "flag":         r[2] if len(r) > 2 else None,
             }
-            from_date = (today - delta_map[period]).strftime("%d-%m-%Y")
-            to_date = today_str
+            for r in data["grapthData"]
+        ]
+        return pd.DataFrame(rows)
 
-        # --- Defaults and validation ---
-        stage = (stage or "In-Principle").title()
-        if stage not in ["In-Principle", "Listing Stage"]:
-            print(f"❌ Invalid stage: {stage}. Must be 'In-Principle' or 'Listing Stage'.")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ── CM — Corporate Filings (Live) ───────────────────────────────────────
+
+    def cm_live_hist_insider_trading(
+        self,
+        *args,
+        from_date: str | None = None,
+        to_date:   str | None = None,
+        period:    str | None = None,
+        symbol:    str | None = None,
+    ) -> pd.DataFrame | None:
+        """
+        Return historical insider-trading (PIT) disclosures.
+
+        Parameters
+        ----------
+        *args : str
+            Positional shorthand — pass a symbol, date range, or period.
+        from_date : str, optional
+            Start date in ``DD-MM-YYYY``.
+        to_date : str, optional
+            End date in ``DD-MM-YYYY``.
+        period : str, optional
+            Shorthand: ``"1D"``, ``"1W"``, ``"1M"``, ``"3M"``, ``"6M"``,
+            ``"1Y"``.
+        symbol : str, optional
+            NSE equity symbol to filter, e.g. ``"RELIANCE"``.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.cm_live_hist_insider_trading()
+        >>> nse.cm_live_hist_insider_trading("1M")
+        >>> nse.cm_live_hist_insider_trading("01-01-2025", "15-10-2025")
+        >>> nse.cm_live_hist_insider_trading("RELIANCE")
+        >>> nse.cm_live_hist_insider_trading("RELIANCE", "1M")
+        >>> nse.cm_live_hist_insider_trading("RELIANCE", "01-01-2025", "15-10-2025")
+        """
+        cols = [
+            "symbol", "company", "acqName", "personCategory", "secType",
+            "befAcqSharesNo", "befAcqSharesPer", "remarks", "secAcq", "secVal",
+            "tdpTransactionType", "securitiesTypePost", "afterAcqSharesNo",
+            "afterAcqSharesPer", "acqfromDt", "acqtoDt", "intimDt", "acqMode",
+            "derivativeType", "tdpDerivativeContractType", "buyValue",
+            "buyQuantity", "sellValue", "sellquantity", "exchange", "date", "xbrl",
+        ]
+        return self._corp_filing(
+            "https://www.nseindia.com/companies-listing/corporate-filings-insider-trading",
+            "https://www.nseindia.com/api/corporates-pit",
+            *args,
+            from_date=from_date, to_date=to_date, symbol=symbol, period=period,
+            keep_cols=cols,
+        )
+
+    def cm_live_hist_corporate_announcement(
+        self,
+        *args,
+        from_date: str | None = None,
+        to_date:   str | None = None,
+        symbol:    str | None = None,
+    ) -> pd.DataFrame | None:
+        """
+        Return corporate announcements filed on the NSE.
+
+        Parameters
+        ----------
+        *args : str
+            Positional shorthand — pass a symbol, date range, or both.
+        from_date : str, optional
+            Start date in ``DD-MM-YYYY``.
+        to_date : str, optional
+            End date in ``DD-MM-YYYY``.
+        symbol : str, optional
+            NSE equity symbol, e.g. ``"RELIANCE"``.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.cm_live_hist_corporate_announcement()
+        >>> nse.cm_live_hist_corporate_announcement("12-10-2025", "15-10-2025")
+        >>> nse.cm_live_hist_corporate_announcement("RELIANCE")
+        >>> nse.cm_live_hist_corporate_announcement("RELIANCE", "01-01-2025", "15-10-2025")
+        """
+        # default → today (only when nothing provided)
+        if not args and not from_date and not to_date and not symbol:
+            today = datetime.now().strftime("%d-%m-%Y")
+            from_date = today
+            to_date   = today
+            
+        cols = [
+            "symbol", "sm_name", "smIndustry", "desc",
+            "attchmntText", "attchmntFile", "fileSize", "an_dt",
+        ]
+        return self._corp_filing(
+            "https://www.nseindia.com/companies-listing/corporate-filings-announcements",
+            "https://www.nseindia.com/api/corporate-announcements",
+            *args,
+            from_date=from_date, to_date=to_date, symbol=symbol,
+            extra="&reqXbrl=false", keep_cols=cols,
+        )
+
+    def cm_live_hist_corporate_action(
+        self,
+        *args,
+        from_date: str | None = None,
+        to_date:   str | None = None,
+        period:    str | None = None,
+        symbol:    str | None = None,
+        filter:    str | None = None,
+    ) -> pd.DataFrame | None:
+        """
+        Return corporate actions — dividends, splits, bonus, buybacks, etc.
+
+        When called with a *symbol* only (no date), returns all upcoming
+        actions for that company.  An optional *filter* kwarg performs a
+        substring search on the ``PURPOSE`` column.
+
+        Parameters
+        ----------
+        *args : str
+            Positional shorthand — symbol, date range, period, or purpose
+            filter string (e.g. ``"Dividend"``).
+        from_date : str, optional
+            Start date in ``DD-MM-YYYY``.
+        to_date : str, optional
+            End date in ``DD-MM-YYYY``. Defaults to 90 days from today.
+        period : str, optional
+            Shorthand: ``"1D"``, ``"1W"``, ``"1M"``, ``"3M"``, ``"6M"``,
+            ``"1Y"``.
+        symbol : str, optional
+            NSE equity symbol.
+        filter : str, optional
+            Substring to filter the ``PURPOSE`` column (case-insensitive).
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.cm_live_hist_corporate_action()
+        >>> nse.cm_live_hist_corporate_action("1M")
+        >>> nse.cm_live_hist_corporate_action("01-01-2025", "15-10-2025")
+        >>> nse.cm_live_hist_corporate_action("LAURUSLABS")
+        >>> nse.cm_live_hist_corporate_action("RELIANCE", "01-01-2025", "15-10-2025")
+        >>> nse.cm_live_hist_corporate_action("01-01-2025", "15-03-2025", "Dividend")
+        """
+        from_date, to_date, period, symbol = _unpack_args(
+            args, from_date, to_date, period, symbol, short=True
+        )
+        today     = datetime.now()
+        ref_url   = "https://www.nseindia.com/companies-listing/corporate-filings-actions"
+        base      = "https://www.nseindia.com/api/corporates-corporateActions"
+
+        if symbol and not any([from_date, to_date, period]):
+            api = f"{base}?index=equities&symbol={symbol}"
+        else:
+            if period:
+                from_date, to_date = _resolve_dates(period=period)
+            from_date = from_date or (today - timedelta(days=1)).strftime("%d-%m-%Y")
+            to_date   = to_date   or (today + timedelta(days=90)).strftime("%d-%m-%Y")
+            api = (
+                f"{base}?index=equities&from_date={from_date}&to_date={to_date}"
+                f"&symbol={symbol}" if symbol
+                else f"{base}?index=equities&from_date={from_date}&to_date={to_date}"
+            )
+
+        data    = self._get_json(ref_url, api)
+        records = data.get("data") if isinstance(data, dict) else data
+        if not records:
             return None
 
-        if from_date and to_date:
-            try:
-                datetime.strptime(from_date, "%d-%m-%Y")
-            except ValueError:
-                print(f"❌ Invalid from_date: {from_date}. Using today's date.")
-                from_date = today_str
-            try:
-                datetime.strptime(to_date, "%d-%m-%Y")
-            except ValueError:
-                print(f"❌ Invalid to_date: {to_date}. Using today's date.")
-                to_date = today_str
+        df = pd.DataFrame(records).rename(columns={
+            "symbol":       "SYMBOL",
+            "comp":         "COMPANY NAME",
+            "series":       "SERIES",
+            "subject":      "PURPOSE",
+            "faceVal":      "FACE VALUE",
+            "exDate":       "EX-DATE",
+            "recDate":      "RECORD DATE",
+            "bcStartDate":  "BOOK CLOSURE START DATE",
+            "bcEndDate":    "BOOK CLOSURE END DATE",
+        })
+        if filter and "PURPOSE" in df.columns:
+            df = df[df["PURPOSE"].str.contains(filter, case=False, na=False)]
 
-        # --- Build API URL ---
-        base_url = "https://www.nseindia.com/api/corporate-further-issues-qip"
-        index_map = {"In-Principle": "FIQIPIP", "Listing Stage": "FIQIPLS"}
-        params = {"index": index_map[stage]}
+        cols = [
+            "SYMBOL", "COMPANY NAME", "SERIES", "PURPOSE", "FACE VALUE",
+            "EX-DATE", "RECORD DATE", "BOOK CLOSURE START DATE", "BOOK CLOSURE END DATE",
+        ]
+        return _clean_str(_keep_cols(df, cols))
 
-        if symbol:
-            params["symbol"] = symbol.upper()
+    def cm_live_today_event_calendar(
+        self,
+        from_date: str | None = None,
+        to_date:   str | None = None,
+    ) -> pd.DataFrame | None:
+        """Return the corporate event calendar for today (or a date range).
+
+        Parameters
+        ----------
+        from_date : str, optional
+            Start date in ``DD-MM-YYYY``. Defaults to today.
+        to_date : str, optional
+            End date in ``DD-MM-YYYY``. Defaults to today.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Columns: symbol, company, purpose, bm_desc, date.
+
+        Examples
+        --------
+        >>> nse.cm_live_today_event_calendar()
+        >>> nse.cm_live_today_event_calendar("01-01-2025", "01-01-2025")
+        """
+        today     = datetime.now().strftime("%d-%m-%Y")
+        from_date = from_date or today
+        to_date   = to_date   or today
+        return self._corp_filing(
+            "https://www.nseindia.com/companies-listing/corporate-filings-event-calendar",
+            "https://www.nseindia.com/api/event-calendar",
+            from_date=from_date, to_date=to_date,
+            keep_cols=["symbol", "company", "purpose", "bm_desc", "date"],
+        )
+
+    def cm_live_upcoming_event_calendar(self) -> pd.DataFrame | None:
+        """Return all upcoming corporate events in the NSE event calendar.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Columns: symbol, company, purpose, bm_desc, date.
+
+        Examples
+        --------
+        >>> nse.cm_live_upcoming_event_calendar()
+        """
+        data = self._get_json(
+            "https://www.nseindia.com/companies-listing/corporate-filings-event-calendar",
+            "https://www.nseindia.com/api/event-calendar?",
+        )
+        if not isinstance(data, list):
+            return None
+        df = pd.DataFrame(data)
+        return df[["symbol", "company", "purpose", "bm_desc", "date"]] if not df.empty else None
+
+    def cm_live_hist_board_meetings(
+        self,
+        *args,
+        from_date: str | None = None,
+        to_date:   str | None = None,
+        symbol:    str | None = None,
+    ) -> pd.DataFrame | None:
+        """Return historical board meeting announcements filed on NSE.
+
+        Parameters
+        ----------
+        *args : str
+            Positional shorthand — symbol, date range, or both.
+        from_date : str, optional
+            Start date in ``DD-MM-YYYY``.
+        to_date : str, optional
+            End date in ``DD-MM-YYYY``.
+        symbol : str, optional
+            NSE equity symbol.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.cm_live_hist_board_meetings()
+        >>> nse.cm_live_hist_board_meetings("01-01-2025", "15-10-2025")
+        >>> nse.cm_live_hist_board_meetings("RELIANCE")
+        >>> nse.cm_live_hist_board_meetings("RELIANCE", "01-01-2025", "15-10-2025")
+        """
+        cols = [
+            "bm_symbol", "sm_name", "sm_indusrty", "bm_purpose", "bm_desc",
+            "bm_date", "attachment", "attFileSize", "bm_timestamp",
+        ]
+        return self._corp_filing(
+            "https://www.nseindia.com/companies-listing/corporate-filings-board-meetings",
+            "https://www.nseindia.com/api/corporate-board-meetings",
+            *args,
+            from_date=from_date, to_date=to_date, symbol=symbol,
+            keep_cols=cols,
+        )
+
+    def cm_live_hist_Shareholder_meetings(
+        self,
+        *args,
+        from_date: str | None = None,
+        to_date:   str | None = None,
+        symbol:    str | None = None,
+    ) -> pd.DataFrame | None:
+        """Return postal ballot and shareholder meeting filings.
+
+        Parameters
+        ----------
+        *args : str
+            Positional shorthand — symbol, date range, or both.
+        from_date : str, optional
+            Start date in ``DD-MM-YYYY``. When omitted (and no symbol given),
+            NSE returns all available records.
+        to_date : str, optional
+            End date in ``DD-MM-YYYY``.
+        symbol : str, optional
+            NSE equity symbol.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.cm_live_hist_Shareholder_meetings()
+        >>> nse.cm_live_hist_Shareholder_meetings("01-01-2025", "15-10-2025")
+        >>> nse.cm_live_hist_Shareholder_meetings("RELIANCE")
+        >>> nse.cm_live_hist_Shareholder_meetings("RELIANCE", "01-01-2025", "15-10-2025")
+        """
+        # Parse positional args manually (no period support — match old behaviour)
+        for arg in args:
+            if not isinstance(arg, str):
+                continue
+            if _DATE_PATTERN.match(arg):
+                if not from_date:
+                    from_date = arg
+                elif not to_date:
+                    to_date = arg
+            else:
+                symbol = arg.upper()
+
+        # Build URL — intentionally NO date defaulting to match old code:
+        # calling with no args fetches the full listing from NSE.
+        ref_url  = "https://www.nseindia.com/companies-listing/corporate-filings-postal-ballot"
+        base_api = "https://www.nseindia.com/api/postal-ballot"
+
+        if symbol and from_date and to_date:
+            api = f"{base_api}?index=equities&from_date={from_date}&to_date={to_date}&symbol={symbol}"
+        elif symbol:
+            api = f"{base_api}?index=equities&symbol={symbol}"
         elif from_date and to_date:
-            params["from_date"] = from_date
-            params["to_date"] = to_date
+            api = f"{base_api}?index=equities&from_date={from_date}&to_date={to_date}"
+        else:
+            api = f"{base_api}?index=equities"
 
-        query_string = "&".join(f"{k}={v}" for k, v in params.items())
-        api_url = f"{base_url}?{query_string}"
+        data    = self._get_json(ref_url, api)
+        records = data.get("data") if isinstance(data, dict) else data
+        if not records or not isinstance(records, list):
+            return None
 
-        # --- Rotate user agent ---
-        self.rotate_user_agent()
+        df   = pd.DataFrame(records)
+        cols = ["symbol", "sLN", "bdt", "text", "type", "attachment", "date"]
+        df   = _keep_cols(df, cols)
+        return _clean_str(df)
 
-        try:
-            headers = self.headers.copy()
-            headers.update({
-                "Accept": "application/json",
-                "Referer": "https://www.nseindia.com/companies-listing/corporate-filings-QIP"
-            })
+    def cm_live_hist_qualified_institutional_placement(self, *args, **kw) -> pd.DataFrame | None:
+        """Return QIP filings — In-Principle or Listing Stage.
 
-            session = requests.Session()
-            # Fetch cookies
-            session.get("https://www.nseindia.com/companies-listing/corporate-filings-QIP", headers=headers, timeout=10)
+        Parameters
+        ----------
+        *args : str
+            Positional shorthand — stage, symbol, date range, or period.
+            Stage values: ``"In-Principle"``, ``"Listing Stage"``.
+        **kw
+            Keyword overrides: ``stage``, ``symbol``, ``from_date``,
+            ``to_date``, ``period``.
 
-            # Retry logic
-            for attempt in range(3):
-                try:
-                    response = session.get(api_url, headers=headers, cookies=session.cookies.get_dict(), timeout=10)
-                    response.raise_for_status()
-                    break
-                except requests.RequestException as e:
-                    if attempt < 2:
-                        time.sleep(2 ** attempt)
-                        continue
-                    else:
-                        print(f"❌ Failed to fetch data: {e}")
-                        return None
+        Returns
+        -------
+        pd.DataFrame or None
 
-            # Parse JSON
-            try:
-                data_json = response.json()
-            except ValueError as e:
-                print(f"❌ Failed to parse JSON: {e}")
-                return None
-
-            data = data_json.get("data", [])
-            if not data:
-                print(f"ℹ️ No QIP records found for {symbol or period or 'All symbols'} ({stage})")
-                return None
-
-            df = pd.DataFrame(data)
-
-            # --- Column renaming ---
-            rename_map = {
+        Examples
+        --------
+        >>> nse.cm_live_hist_qualified_institutional_placement("In-Principle")
+        >>> nse.cm_live_hist_qualified_institutional_placement("Listing Stage")
+        >>> nse.cm_live_hist_qualified_institutional_placement("In-Principle", "1Y")
+        >>> nse.cm_live_hist_qualified_institutional_placement("RELIANCE")
+        """
+        return self._further_issue(
+            "https://www.nseindia.com/api/corporate-further-issues-qip",
+            "https://www.nseindia.com/companies-listing/corporate-filings-QIP",
+            {"In-Principle": "FIQIPIP", "Listing Stage": "FIQIPLS"},
+            {
                 "In-Principle": {
-                    "nseSymbol": "Symbol",
-                    "companyName": "Company Name",
-                    "stage": "Stage",
-                    "issue_type": "Issue Type",
+                    "nseSymbol": "Symbol", "companyName": "Company Name",
+                    "stage": "Stage", "issue_type": "Issue Type",
                     "dateBrdResol": "Board Resolution Date",
                     "dateOfSHApp": "Shareholder Approval Date",
                     "totalAmtOfIssueSize": "Total Issue Size",
@@ -3041,10 +4151,8 @@ class Nse:
                     "xmlFileName": "XML Link",
                 },
                 "Listing Stage": {
-                    "nsesymbol": "Symbol",
-                    "companyName": "Company Name",
-                    "stage": "Stage",
-                    "issue_type": "Issue Type",
+                    "nsesymbol": "Symbol", "companyName": "Company Name",
+                    "stage": "Stage", "issue_type": "Issue Type",
                     "boardResolutionDate": "Board Resolution Date",
                     "dtOfBIDOpening": "BID Opening Date",
                     "dtOfBIDClosing": "BID Closing Date",
@@ -3059,161 +4167,41 @@ class Nse:
                     "dateOfListing": "Listing Date",
                     "dateOfTradingApproval": "Trading Approval Date",
                     "xmlFileName": "XML Link",
-                }
-            }
+                },
+            },
+            *args, **kw,
+        )
 
-            df = df[[c for c in rename_map[stage] if c in df.columns]]
-            df.rename(columns=rename_map[stage], inplace=True)
+    def cm_live_hist_preferential_issue(self, *args, **kw) -> pd.DataFrame | None:
+        """Return preferential-issue filings — In-Principle or Listing Stage.
 
-            # --- Keep Submission Date as-is; other dates can remain string ---
-            df = df.fillna("").replace({float("inf"): "", float("-inf"): ""})
+        Parameters
+        ----------
+        *args : str
+            Stage (``"In-Principle"`` / ``"Listing Stage"``), symbol,
+            date range, or period codes.
+        **kw
+            Keyword overrides for ``stage``, ``symbol``, ``from_date``,
+            ``to_date``, ``period``.
 
-            # print(f"ℹ️ Successfully fetched {len(df)} QIP records for {symbol or period or 'All symbols'} ({stage})")
-            return df
+        Returns
+        -------
+        pd.DataFrame or None
 
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"❌ Error fetching QIP data ({stage}): {e}")
-            return None
-
-    def cm_live_hist_preferential_issue(self, *args, from_date=None, to_date=None, period=None, symbol=None, stage=None):
+        Examples
+        --------
+        >>> nse.cm_live_hist_preferential_issue("In-Principle")
+        >>> nse.cm_live_hist_preferential_issue("Listing Stage", "1Y")
+        >>> nse.cm_live_hist_preferential_issue("In-Principle", "RELIANCE", "01-01-2025")
         """
-        Fetch Preferential Issue (PREF) data from NSE (In-Principle or Listing Stage).
-
-        Args (auto-detected from *args):
-            - stage: "In-Principle" or "Listing Stage"
-            - symbol: NSE symbol (e.g., "RELIANCE")
-            - from_date: dd-mm-yyyy (e.g., "20-10-2024")
-            - to_date: dd-mm-yyyy (e.g., "10-01-2025")
-            - period: "1D", "1W", "1M", "3M", "6M", "1Y"
-
-        Returns:
-            pandas.DataFrame or None
-        """
-
-        today = datetime.now()
-        today_str = today.strftime("%d-%m-%Y")
-        date_pattern = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-        period_pattern = re.compile(r"^(1D|1W|1M|3M|6M|1Y)$", re.IGNORECASE)
-
-        # --- Auto-detect args ---
-        for arg in args:
-            if isinstance(arg, str):
-                arg_title = arg.title()
-                # Stage
-                if arg_title in ["In-Principle", "Listing Stage"]:
-                    stage = arg_title
-                # Date
-                elif date_pattern.match(arg):
-                    if not from_date:
-                        from_date = arg
-                    elif not to_date:
-                        to_date = arg
-                # Period
-                elif period_pattern.match(arg.upper()):
-                    period = arg.upper()
-                # Symbol
-                else:
-                    symbol = arg.upper()
-            elif isinstance(arg, datetime):
-                if not from_date:
-                    from_date = arg.strftime("%d-%m-%Y")
-                elif not to_date:
-                    to_date = arg.strftime("%d-%m-%Y")
-
-        # --- Compute from period if no explicit dates ---
-        if period and not (from_date and to_date):
-            delta_map = {
-                "1D": timedelta(days=1),
-                "1W": timedelta(weeks=1),
-                "1M": timedelta(days=30),
-                "3M": timedelta(days=90),
-                "6M": timedelta(days=180),
-                "1Y": timedelta(days=365),
-            }
-            from_date = (today - delta_map[period]).strftime("%d-%m-%Y")
-            to_date = today_str
-
-        # --- Defaults and validation ---
-        stage = (stage or "In-Principle").title()
-        if stage not in ["In-Principle", "Listing Stage"]:
-            print(f"❌ Invalid stage: {stage}. Must be 'In-Principle' or 'Listing Stage'.")
-            return None
-
-        if from_date and to_date:
-            try:
-                datetime.strptime(from_date, "%d-%m-%Y")
-            except ValueError:
-                print(f"❌ Invalid from_date: {from_date}. Using today's date.")
-                from_date = today_str
-            try:
-                datetime.strptime(to_date, "%d-%m-%Y")
-            except ValueError:
-                print(f"❌ Invalid to_date: {to_date}. Using today's date.")
-                to_date = today_str
-
-        # --- Build API URL ---
-        base_url = "https://www.nseindia.com/api/corporate-further-issues-pref"
-        index_map = {"In-Principle": "FIPREFIP", "Listing Stage": "FIPREFLS"}
-        params = {"index": index_map[stage]}
-
-        if symbol:
-            params["symbol"] = symbol.upper()
-        elif from_date and to_date:
-            params["from_date"] = from_date
-            params["to_date"] = to_date
-
-        query_string = "&".join(f"{k}={v}" for k, v in params.items())
-        api_url = f"{base_url}?{query_string}"
-
-        # --- Rotate user agent ---
-        self.rotate_user_agent()
-
-        try:
-            headers = self.headers.copy()
-            headers.update({
-                "Accept": "application/json",
-                "Referer": "https://www.nseindia.com/companies-listing/corporate-filings-PREF"
-            })
-
-            session = requests.Session()
-            # Fetch cookies
-            session.get("https://www.nseindia.com/companies-listing/corporate-filings-PREF", headers=headers, timeout=10)
-
-            # Retry logic
-            for attempt in range(3):
-                try:
-                    response = session.get(api_url, headers=headers, cookies=session.cookies.get_dict(), timeout=10)
-                    response.raise_for_status()
-                    break
-                except requests.RequestException as e:
-                    if attempt < 2:
-                        time.sleep(2 ** attempt)
-                        continue
-                    else:
-                        print(f"❌ Failed to fetch data: {e}")
-                        return None
-
-            # Parse JSON
-            try:
-                data_json = response.json()
-            except ValueError as e:
-                print(f"❌ Failed to parse JSON: {e}")
-                return None
-
-            data = data_json.get("data", [])
-            if not data:
-                print(f"ℹ️ No Preferential Issue records found for {symbol or period or 'All symbols'} ({stage})")
-                return None
-
-            df = pd.DataFrame(data)
-
-            # --- Column renaming ---
-            rename_map = {
+        return self._further_issue(
+            "https://www.nseindia.com/api/corporate-further-issues-pref",
+            "https://www.nseindia.com/companies-listing/corporate-filings-PREF",
+            {"In-Principle": "FIPREFIP", "Listing Stage": "FIPREFLS"},
+            {
                 "In-Principle": {
-                    "nseSymbol": "Symbol",
-                    "nameOfTheCompany": "Company Name",
-                    "stage": "Stage",
-                    "issueType": "Issue Type",
+                    "nseSymbol": "Symbol", "nameOfTheCompany": "Company Name",
+                    "stage": "Stage", "issueType": "Issue Type",
                     "dateBrdResoln": "Date of Board Resolution",
                     "boardResDate": "Board Resolution Date",
                     "categoryOfAllottee": "category Of Allottee",
@@ -3221,13 +4209,11 @@ class Nse:
                     "considerationBy": "considerationBy",
                     "descriptionOfOtherCon": "descriptionOfOtherCon",
                     "dateOfSubmission": "Submission Date",
-                    "checklist_zip_file_name": "zip Link"
+                    "checklist_zip_file_name": "zip Link",
                 },
                 "Listing Stage": {
-                    "nseSymbol": "Symbol",
-                    "nameOfTheCompany": "Company Name",
-                    "stage": "Stage",
-                    "issueType": "Issue Type",
+                    "nseSymbol": "Symbol", "nameOfTheCompany": "Company Name",
+                    "stage": "Stage", "issueType": "Issue Type",
                     "boardResDate": "Board Resolution Date",
                     "dateOfAllotmentOfShares": "Allotment Date",
                     "totalNumOfSharesAllotted": "No of Shares Allotted",
@@ -3237,175 +4223,52 @@ class Nse:
                     "dateOfSubmission": "Submission Date",
                     "dateOfListing": "Listing Date",
                     "dateOfTradingApproval": "Trading Approval Date",
-                    "xmlFileName": "XML Link"
-                }
-            }
+                    "xmlFileName": "XML Link",
+                },
+            },
+            *args, **kw,
+        )
 
-            df = df[[c for c in rename_map[stage] if c in df.columns]]
-            df.rename(columns=rename_map[stage], inplace=True)
+    def cm_live_hist_right_issue(self, *args, **kw) -> pd.DataFrame | None:
+        """Return rights-issue filings — In-Principle or Listing Stage.
 
-            # --- Keep Submission Date as-is; other dates can remain string ---
-            df = df.fillna("").replace({float("inf"): "", float("-inf"): ""})
+        Parameters
+        ----------
+        *args : str
+            Stage, symbol, date range, or period.
+        **kw
+            Keyword overrides for ``stage``, ``symbol``, ``from_date``,
+            ``to_date``, ``period``.
 
-            # print(f"ℹ️ Successfully fetched {len(df)} QIP records for {symbol or period or 'All symbols'} ({stage})")
-            return df
+        Returns
+        -------
+        pd.DataFrame or None
 
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"❌ Error fetching QIP data ({stage}): {e}")
-            return None
-
-    def cm_live_hist_right_issue(self, *args, from_date=None, to_date=None, period=None, symbol=None, stage=None):
+        Examples
+        --------
+        >>> nse.cm_live_hist_right_issue("In-Principle")
+        >>> nse.cm_live_hist_right_issue("Listing Stage", "1Y")
+        >>> nse.cm_live_hist_right_issue("In-Principle", "RELIANCE", "01-01-2025")
         """
-        Fetch Right Issue (RI) data from NSE (In-Principle or Listing Stage).
-
-        Args (auto-detected from *args):
-            - stage: "In-Principle" or "Listing Stage"
-            - symbol: NSE symbol (e.g., "RELIANCE")
-            - from_date: dd-mm-yyyy (e.g., "20-10-2024")
-            - to_date: dd-mm-yyyy (e.g., "10-01-2025")
-            - period: "1D", "1W", "1M", "3M", "6M", "1Y"
-
-        Returns:
-            pandas.DataFrame or None
-        """
-
-        today = datetime.now()
-        today_str = today.strftime("%d-%m-%Y")
-        date_pattern = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-        period_pattern = re.compile(r"^(1D|1W|1M|3M|6M|1Y)$", re.IGNORECASE)
-
-        # --- Auto-detect args ---
-        for arg in args:
-            if isinstance(arg, str):
-                arg_title = arg.title()
-                # Stage
-                if arg_title in ["In-Principle", "Listing Stage"]:
-                    stage = arg_title
-                # Date
-                elif date_pattern.match(arg):
-                    if not from_date:
-                        from_date = arg
-                    elif not to_date:
-                        to_date = arg
-                # Period
-                elif period_pattern.match(arg.upper()):
-                    period = arg.upper()
-                # Symbol
-                else:
-                    symbol = arg.upper()
-            elif isinstance(arg, datetime):
-                if not from_date:
-                    from_date = arg.strftime("%d-%m-%Y")
-                elif not to_date:
-                    to_date = arg.strftime("%d-%m-%Y")
-
-        # --- Compute from period if no explicit dates ---
-        if period and not (from_date and to_date):
-            delta_map = {
-                "1D": timedelta(days=1),
-                "1W": timedelta(weeks=1),
-                "1M": timedelta(days=30),
-                "3M": timedelta(days=90),
-                "6M": timedelta(days=180),
-                "1Y": timedelta(days=365),
-            }
-            from_date = (today - delta_map[period]).strftime("%d-%m-%Y")
-            to_date = today_str
-
-        # --- Defaults and validation ---
-        stage = (stage or "In-Principle").title()
-        if stage not in ["In-Principle", "Listing Stage"]:
-            print(f"❌ Invalid stage: {stage}. Must be 'In-Principle' or 'Listing Stage'.")
-            return None
-
-        if from_date and to_date:
-            try:
-                datetime.strptime(from_date, "%d-%m-%Y")
-            except ValueError:
-                print(f"❌ Invalid from_date: {from_date}. Using today's date.")
-                from_date = today_str
-            try:
-                datetime.strptime(to_date, "%d-%m-%Y")
-            except ValueError:
-                print(f"❌ Invalid to_date: {to_date}. Using today's date.")
-                to_date = today_str
-
-        # --- Build API URL ---
-        base_url = "https://www.nseindia.com/api/corporate-further-issues-ri"
-        index_map = {"In-Principle": "FIPREFIP", "Listing Stage": "FIPREFLS"}
-        params = {"index": index_map[stage]}
-
-        if symbol:
-            params["symbol"] = symbol.upper()
-        elif from_date and to_date:
-            params["from_date"] = from_date
-            params["to_date"] = to_date
-
-        query_string = "&".join(f"{k}={v}" for k, v in params.items())
-        api_url = f"{base_url}?{query_string}"
-
-        # --- Rotate user agent ---
-        self.rotate_user_agent()
-
-        try:
-            headers = self.headers.copy()
-            headers.update({
-                "Accept": "application/json",
-                "Referer": "https://www.nseindia.com/companies-listing/corporate-filings-RI"
-            })
-
-            session = requests.Session()
-            # Fetch cookies
-            session.get("https://www.nseindia.com/companies-listing/corporate-filings-RI", headers=headers, timeout=10)
-
-            # Retry logic
-            for attempt in range(3):
-                try:
-                    response = session.get(api_url, headers=headers, cookies=session.cookies.get_dict(), timeout=10)
-                    response.raise_for_status()
-                    break
-                except requests.RequestException as e:
-                    if attempt < 2:
-                        time.sleep(2 ** attempt)
-                        continue
-                    else:
-                        print(f"❌ Failed to fetch data: {e}")
-                        return None
-
-            # Parse JSON
-            try:
-                data_json = response.json()
-            except ValueError as e:
-                print(f"❌ Failed to parse JSON: {e}")
-                return None
-
-            data = data_json.get("data", [])
-            if not data:
-                print(f"ℹ️ No Preferential Issue records found for {symbol or period or 'All symbols'} ({stage})")
-                return None
-
-            df = pd.DataFrame(data)
-
-            # --- Column renaming ---
-            rename_map = {
+        return self._further_issue(
+            "https://www.nseindia.com/api/corporate-further-issues-ri",
+            "https://www.nseindia.com/companies-listing/corporate-filings-RI",
+            {"In-Principle": "FIPREFIP", "Listing Stage": "FIPREFLS"},
+            {
                 "In-Principle": {
-                    "nseSymbol": "Symbol",
-                    "companyName": "Company Name",
-                    "stage": "Stage",
-                    "issueType": "Issue Type",
+                    "nseSymbol": "Symbol", "companyName": "Company Name",
+                    "stage": "Stage", "issueType": "Issue Type",
                     "boardResolutionDt": "Board Resolution Date",
                     "dateOfBrdResIssueApproving": "Board Approval Date",
                     "dateOfSubmission": "Submission Date",
                     "considerationBy": "Consideration Type",
                     "descOfOtherConsideration": "Other Consideration Description",
                     "totalAmntRaised": "Total Amount Raised",
-                    "xmlFileName": "XML Link"
+                    "xmlFileName": "XML Link",
                 },
                 "Listing Stage": {
-                    "nseSymbol": "Symbol",
-                    "companyName": "Company Name",
-                    "stage": "Stage",
-                    "issueType": "Issue Type",
+                    "nseSymbol": "Symbol", "companyName": "Company Name",
+                    "stage": "Stage", "issueType": "Issue Type",
                     "boardResolutionDt": "Board Resolution Date",
                     "recordDate": "Record Date",
                     "rightRatio": "Rights Ratio",
@@ -3422,4099 +4285,3048 @@ class Nse:
                     "dtOfSubmission": "Submission Date",
                     "dateOfListing": "Listing Date",
                     "dateOfTradingApp": "Trading Approval Date",
-                    "xmlFileName": "XML Link"
-                }
-            }
+                    "xmlFileName": "XML Link",
+                },
+            },
+            *args, **kw,
+        )
 
-            df = df[[c for c in rename_map[stage] if c in df.columns]]
-            df.rename(columns=rename_map[stage], inplace=True)
+    # def cm_live_voting_results(self) -> pd.DataFrame | None:
+    #     """Return corporate voting results with per-agenda breakdown.
 
-            # --- Keep Submission Date as-is; other dates can remain string ---
-            df = df.fillna("").replace({float("inf"): "", float("-inf"): ""})
+    #     Returns
+    #     -------
+    #     pd.DataFrame or None
+    #         One row per agenda item, flattened from the nested JSON.
 
-            # print(f"ℹ️ Successfully fetched {len(df)} QIP records for {symbol or period or 'All symbols'} ({stage})")
-            return df
+    #     Examples
+    #     --------
+    #     >>> nse.cm_live_voting_results()
+    #     """
+    #     ref_url = "https://www.nseindia.com/companies-listing/corporate-filings-voting-results"
+    #     data    = self._get_json(
+    #         ref_url, "https://www.nseindia.com/api/corporate-voting-results?"
+    #     )
+    #     if not data:
+    #         return None
 
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"❌ Error fetching QIP data ({stage}): {e}")
-            return None
+    #     rows = []
+    #     for item in data:
+    #         meta    = item.get("metadata", {})
+    #         agendas = meta.get("agendas", []) or item.get("agendas", [])
+    #         if agendas:
+    #             for ag in agendas:
+    #                 rows.append({**meta, **ag})
+    #         else:
+    #             rows.append(meta)
 
-    def cm_live_voting_results(self):
+    #     if not rows:
+    #         return None
+
+    #     df = pd.DataFrame(rows)
+    #     df.replace({float("inf"): None, float("-inf"): None}, inplace=True)
+    #     df.fillna("", inplace=True)
+
+    #     def _flatten(v):
+    #         if isinstance(v, (list, dict)):
+    #             return json.dumps(v, ensure_ascii=False)
+    #         return "" if v is None else str(v)
+
+    #     for col in df.columns:
+    #         df[col] = df[col].map(_flatten)
+    #     return df.reset_index(drop=True)
+
+    def cm_live_voting_results(self) -> pd.DataFrame | None:
+        """Return corporate voting results with per-agenda breakdown.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            One row per agenda item, flattened from the nested JSON.
+
+        Examples
+        --------
+        >>> nse.cm_live_voting_results()
         """
-        Fetch and process corporate voting results from NSE India.
-        Handles both metadata and nested agendas, and flattens data
-        for Google Sheets compatibility.
-        """
-
-        self.rotate_user_agent()
-
         ref_url = "https://www.nseindia.com/companies-listing/corporate-filings-voting-results"
-        api_url = "https://www.nseindia.com/api/corporate-voting-results?"
+        data = self._get_json(
+            ref_url,
+            "https://www.nseindia.com/api/corporate-voting-results?"
+        )
 
-        try:
-            # --- Step 1: Retrieve cookies for authentication ---
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()
-
-            # --- Step 2: Fetch API data ---
-            response = self.session.get(api_url, headers=self.headers,
-                                        cookies=ref_response.cookies.get_dict(), timeout=15)
-            response.raise_for_status()
-            raw_data = response.json()
-
-            all_rows = []
-
-            # --- Step 3: Process metadata and nested agendas ---
-            for item in raw_data:
-                meta = item.get("metadata", {})
-                agendas = meta.get("agendas", []) or item.get("agendas", [])
-                if agendas:
-                    for ag in agendas:
-                        merged = {**meta, **ag}
-                        all_rows.append(merged)
-                else:
-                    all_rows.append(meta)
-
-            if not all_rows:
-                print("⚠️ No data found in NSE voting results API.")
-                return None
-
-            # --- Step 4: Convert to DataFrame ---
-            df = pd.DataFrame(all_rows)
-
-            # --- Step 5: Replace NaN, inf values, and ensure string compatibility ---
-            df.replace({float("inf"): None, float("-inf"): None}, inplace=True)
-            df.fillna("", inplace=True)
-
-            # --- Step 6: Flatten nested objects for Google Sheets ---
-            def flatten_value(v):
-                if isinstance(v, (list, dict)):
-                    return json.dumps(v, ensure_ascii=False)
-                elif v is None:
-                    return ""
-                else:
-                    return str(v)
-
-            for col in df.columns:
-                df[col] = df[col].map(flatten_value)
-
-            # --- Step 7: Reorder key columns for readability ---
-            preferred_cols = [
-                "vrSymbol", "vrCompanyName", "vrMeetingType", "vrTimestamp",
-                "vrTypeOfSubmission", "vrAttachment", "vrbroadcastDt",
-                "vrRevisedDate", "vrRevisedRemark", "vrResolution",
-                "vrResReq", "vrGrpInterested", "vrTotSharesOnRec",
-                "vrTotSharesProPer", "vrTotSharesPublicPer",
-                "vrTotSharesProVid", "vrTotSharesPublicVid",
-                "vrTotPercFor", "vrTotPercAgainst"
-            ]
-            existing_cols = [c for c in preferred_cols if c in df.columns]
-            df = df[existing_cols + [c for c in df.columns if c not in existing_cols]]
-
-            if "vrbroadcastDt" in df.columns:
-                try:
-                    df["vrbroadcastDt_dt"] = pd.to_datetime(df["vrbroadcastDt"], errors="coerce")
-                    df.sort_values(by=["vrbroadcastDt_dt"], ascending=False, inplace=True)
-                    df.drop(columns=["vrbroadcastDt_dt"], inplace=True)
-                except Exception as e:
-                    print(f"⚠️ Date sort issue: {e}")
-
-            df.reset_index(drop=True, inplace=True)
-
-            return df
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"❌ Error fetching voting results: {e}")
+        if not data:
             return None
 
-    def cm_live_qtly_shareholding_patterns(self):
-        self.rotate_user_agent()  # Rotating User-Agent
+        # -----------------------------
+        # Flatten metadata + agendas
+        # -----------------------------
+        rows = []
+        for item in data:
+            meta = item.get("metadata", {})
+            agendas = meta.pop("agendas", [])   # remove nested list
 
-        ref_url = 'https://www.nseindia.com/companies-listing/corporate-filings-shareholding-pattern'
-        api_url = 'https://www.nseindia.com/api/corporate-share-holdings-master?index=equities'
-
-        try:
-            # Get reference cookies from the main page
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()  # Ensure request was successful
-
-            # Make API call using cookies from the previous request
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()  # Ensure request was successful
-
-            # Convert response to JSON
-            data = response.json()
-            
-            # Directly assume data is a list instead of checking 'data' key
-            if isinstance(data, list):
-                df = pd.DataFrame(data)
-
-                # Selecting and ordering columns
-                required_columns = ['symbol', 'name', 'pr_and_prgrp', 'public_val', 'employeeTrusts', 'revisedStatus', 'date', 'submissionDate', 'revisionDate', 'xbrl', 'broadcastDate', 'systemDate', 'timeDifference']
-                df = df[required_columns]
-
-                return df if not df.empty else None  # Return DataFrame if not empty
-            return None  # Return None if data is not a list or is empty
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching Shareholding Patterns data: {e}")
-            return None
-
-    def cm_live_hist_br_sr(self, *args, from_date=None, to_date=None, symbol=None):
-        
-        # --- Detect date pattern ---
-        date_pattern = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-        today_str = datetime.now().strftime("%d-%m-%Y")
-
-        # --- Auto-detect arguments (dates or symbol) ---
-        for arg in args:
-            if isinstance(arg, str):
-                if date_pattern.match(arg):
-                    if not from_date:
-                        from_date = arg
-                    elif not to_date:
-                        to_date = arg
-                else:
-                    symbol = arg.upper()
-
-        # --- Rotate user-agent for reliability ---
-        self.rotate_user_agent()
-
-        # --- NSE reference URL ---
-        ref_url = "https://www.nseindia.com/companies-listing/corporate-filings-bussiness-sustainabilitiy-reports"
-
-        # --- Final API URL selection logic ---
-        if symbol and from_date and to_date:
-            api_url = f"https://www.nseindia.com/api/corporate-bussiness-sustainabilitiy?index=equities&from_date={from_date}&to_date={to_date}&symbol={symbol}"
-        elif symbol:
-            api_url = f"https://www.nseindia.com/api/corporate-bussiness-sustainabilitiy?index=equities&symbol={symbol}"
-        elif from_date and to_date:
-            api_url = f"https://www.nseindia.com/api/corporate-bussiness-sustainabilitiy?index=equities&from_date={from_date}&to_date={to_date}"
-        else:
-            api_url = "https://www.nseindia.com/api/corporate-bussiness-sustainabilitiy"
-
-        # --- Fetch & process ---
-        try:
-            # Step 1: Establish session
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()
-
-            # Step 2: API request
-            response = self.session.get(
-                api_url,
-                headers=self.headers,
-                cookies=ref_response.cookies.get_dict(),
-                timeout=10,
-            )
-            response.raise_for_status()
-
-            # Step 3: Parse JSON → DataFrame
-            data_json = response.json()
-            data = data_json.get("data", [])  # ✅ Correct key
-
-            if isinstance(data, list) and len(data) > 0:
-                df = pd.DataFrame(data)
-                expected_cols = ['symbol', 'companyName', 'fyFrom', 'fyTo','submissionDate', 'revisionDate']
-                df = df[[c for c in expected_cols if c in df.columns]]
-                df = df.fillna("").replace({float("inf"): "", float("-inf"): ""})
-                return df
-
+            if agendas:
+                for ag in agendas:
+                    rows.append({**meta, **ag})
             else:
-                scope = symbol or "All symbols"
-                print(f"ℹ️  No Annual Reports found for {scope} between {from_date or '-'} and {to_date or '-'}")
-                return None
+                rows.append(meta)
 
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"❌ Error fetching Annual Reports: {e}")
+        if not rows:
             return None
 
-    
-    #---------------------------------------------------------- Live Chart Data ----------------------------------------------------------------
- 
-    def index_chart(self, index: str, timeframe: str = "1D"):
-        """
-        Fetches chart data for NSE index.
-        timeframe: "1D", "1M", "3M", "6M", "1Y"
-        """
-        index = index.upper().replace(' ', '%20').replace('&', '%26')
-        self.rotate_user_agent()
-
-        home_url = "https://www.nseindia.com/"
-        api_url = (f"https://www.nseindia.com/api/NextApi/apiClient/indexTrackerApi?functionName=getIndexChart&&index={index}&flag={timeframe}")
-
-        try:
-            # Step 1: Get cookies
-            resp0 = self.session.get(home_url, headers=self.headers, timeout=10)
-            resp0.raise_for_status()
-            cookies = resp0.cookies.get_dict()
-
-            time.sleep(0.5)
-
-            # Step 2: Fetch chart data
-            resp = self.session.get(api_url, headers=self.headers,
-                                    cookies=cookies, timeout=10)
-            resp.raise_for_status()
-            obj = resp.json()
-
-            data = obj.get("data")
-            if not data or "grapthData" not in data:
-                raise ValueError("No 'grapthData' in response JSON")
-
-            rows = []
-            for row in data["grapthData"]:
-                ts, price, flag, chng, pct = row
-
-                dt_utc = pd.to_datetime(ts, unit="ms", utc=True)
-
-                rows.append({
-                    "datetime_utc": dt_utc,
-                    "price": price,
-                    "change": chng,
-                    "pct_change": pct,
-                    "flag": flag
-                })
-
-            df = pd.DataFrame(rows)
-
-            # Excel / JSON safe
-            df["datetime_utc"] = df["datetime_utc"].dt.strftime("%Y-%m-%d %H:%M:%S")
-
-            return df
-
-        except (requests.HTTPError, ValueError, KeyError) as e:
-            print("Error fetching index chart:", e)
-            return None
-
-    def stock_chart(self, symbol: str, timeframe: str = "1D"):
-        """
-        Fetches chart data for NSE stocks.
-        timeframe: "1D", "5D", "1M", etc.
-        Returns DataFrame:
-        datetime_utc | price | change | pct_change | flag
-        """
-        self.rotate_user_agent()
-
-        home_url = "https://www.nseindia.com/"
-        api_url = (f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi?functionName=getSymbolChartData&symbol={symbol}EQN&days={timeframe}")
-
-        try:
-            # Step 1: cookies
-            resp0 = self.session.get(home_url, headers=self.headers, timeout=10)
-            resp0.raise_for_status()
-            cookies = resp0.cookies.get_dict()
-            time.sleep(0.5)
-
-            # Step 2: data
-            resp = self.session.get(api_url, headers=self.headers, cookies=cookies, timeout=10)
-            resp.raise_for_status()
-            obj = resp.json()
-
-            if "grapthData" not in obj:
-                raise ValueError("No 'grapthData' in response JSON")
-
-            rows = []
-            for row in obj["grapthData"]:
-                ts, price, flag, chng, pct = row
-                dt_utc = pd.to_datetime(ts, unit="ms", utc=True)
-
-                rows.append({
-                    "datetime_utc": dt_utc.strftime("%Y-%m-%d %H:%M:%S"),
-                    "price": price,
-                    "change": chng,
-                    "pct_change": pct,
-                    "flag": flag
-                })
-
-            df = pd.DataFrame(rows)
-            return df
-
-        except (requests.HTTPError, ValueError, KeyError) as e:
-            print("Error fetching stock chart:", e)
-            return None
-
-    def fno_chart(self, symbol: str, inst_type: str, expiry: str, strike: str = ""):
-        """
-        Fetch intraday chart for Futures & Options (Stock + Index)
-        inst_type: FUTSTK, OPTSTK, FUTIDX, OPTIDX
-        expiry   : DD-MM-YYYY
-        strike   : CE/PE/XX + price (options need CE/PE, futures use XX0.00)
-        Returns DataFrame: datetime_utc, datetime_ist, price, flag
-        """
-        self.rotate_user_agent()
+        df = pd.DataFrame(rows)
 
         # -----------------------------
-        # 🔥 Build Contract Identifier
+        # Clean values
         # -----------------------------
-        # FUTSTKTCS30-12-2025XX0.00
-        # OPTSTKTCS30-12-2025CE3300.00
-
-        if inst_type.startswith("FUT"):
-            strike_part = "XX0"
-        else:
-            strike_part = strike  # example: CE3300
-
-        contract = f"{inst_type}{symbol.upper()}{expiry}{strike_part}.00"
+        df.replace({float("inf"): None, float("-inf"): None}, inplace=True)
+        df.fillna("", inplace=True)
 
         # -----------------------------
-        # 🔥 NSE URLs
+        # Flatten nested values
         # -----------------------------
-        home_url = "https://www.nseindia.com/"
-        api_url = (
-            "https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
-            f"?functionName=getIntradayGraphDerivative&identifier={contract}&type=W&token=1"
-        )
+        def _flatten(v):
+            if isinstance(v, (list, dict)):
+                return json.dumps(v, ensure_ascii=False)
+            return "" if v is None else str(v)
 
-        try:
-            # -----------------------------
-            # Step 1 → Load cookies
-            # -----------------------------
-            r0 = self.session.get(home_url, headers=self.headers, timeout=10)
-            r0.raise_for_status()
-            cookies = r0.cookies.get_dict()
-            time.sleep(0.4)
+        for col in df.columns:
+            df[col] = df[col].map(_flatten)
 
-            # -----------------------------
-            # Step 2 → Fetch graph data
-            # -----------------------------
-            r = self.session.get(api_url, headers=self.headers, cookies=cookies, timeout=10)
-            r.raise_for_status()
-            data = r.json()
+        # -----------------------------
+        # Reorder important columns
+        # -----------------------------
+        preferred_cols = [
+            "vrSymbol",
+            "vrCompanyName",
+            "vrMeetingType",
+            "vrTimestamp",
+            "vrTypeOfSubmission",
+            "vrAttachment",
+            "vrbroadcastDt",
+            "vrRevisedDate",
+            "vrRevisedRemark",
+            "vrResolution",
+            "vrResReq",
+            "vrGrpInterested",
+            "vrTotSharesOnRec",
+            "vrTotSharesProPer",
+            "vrTotSharesPublicPer",
+            "vrTotSharesProVid",
+            "vrTotSharesPublicVid",
+            "vrTotPercFor",
+            "vrTotPercAgainst"
+        ]
 
-            if "grapthData" not in data:
-                raise ValueError("API response missing 'grapthData'")
+        existing_cols = [c for c in preferred_cols if c in df.columns]
+        df = df[existing_cols + [c for c in df.columns if c not in existing_cols]]
 
-            # -----------------------------
-            # Convert into DataFrame
-            # -----------------------------
-            rows = []
-            for row in data["grapthData"]:
-
-                # -------- Universal parser --------
-                ts = row[0]
-                price = row[1]
-
-                chng = row[2] if len(row) >= 3 else None
-                pct   = row[3] if len(row) >= 4 else None
-
-                # Old legacy flag support
-                flag = ""
-                if len(row) == 3 and isinstance(row[2], str):
-                    flag = row[2]
-
-                dt_utc = pd.to_datetime(ts, unit="ms", utc=True)
-                dt_ist = dt_utc.tz_convert("Asia/Kolkata")
-
-                rows.append({
-                    "datetime_utc": dt_utc,
-                    # "datetime_ist": dt_ist,
-                    "price": float(price),
-                    "chng": None if chng is None else float(chng),
-                    "pct": None if pct is None else float(pct),
-                    "flag": flag
-                })
-
-            df = pd.DataFrame(rows)
-            return df
-
-        except Exception as e:
-            print("FnO chart error:", e)
-            return None
-
-
-    def india_vix_chart(self):
-        """
-        Fetches intraday chart data for India VIX.
-        """
-        self.rotate_user_agent()
-
-        home_url = "https://www.nseindia.com/market-data/live-market-indices"
-        api_url = "https://www.nseindia.com/api/chart-databyindex-dynamic?index=INDIA%20VIX&type=index"
-
-        try:
-            # Step 1: Get cookies
-            resp0 = self.session.get(home_url, headers=self.headers, timeout=10)
-            resp0.raise_for_status()
-            cookies = resp0.cookies.get_dict()
-
-            time.sleep(0.5)
-
-            # Step 2: Fetch chart data
-            resp = self.session.get(api_url, headers=self.headers, cookies=cookies, timeout=10)
-            resp.raise_for_status()
-            obj = resp.json()
-
-             # 🔥 Access grapthData directly
-            if "grapthData" not in obj:
-                raise ValueError("No 'grapthData' in response JSON")
-
-            rows = []
-            for ts, price, flag in obj["grapthData"]:
-                dt_utc = pd.to_datetime(ts, unit="ms", utc=True)
-
-                rows.append({
-                    # "timestamp_ms": ts,
-                    "datetime_utc": dt_utc.strftime("%Y-%m-%d %H:%M:%S"),
-                    "price": price,
-                    "flag": flag
-                })
-
-            df = pd.DataFrame(rows)
-            return df
-
-        except (requests.HTTPError, ValueError, KeyError) as e:
-            print("Error fetching India VIX chart:", e)
-            return None
-
-
-    #---------------------------------------------------------- FnO_Live_Data ----------------------------------------------------------------
-
-
-    #----------------------------------------------------------JSON_Data ----------------------------------------------------------------
-    
-    def symbol_full_fno_live_data(self,symbol: str):
-        self.rotate_user_agent()  # Rotating User-Agent
-
-        ref_url = 'https://www.nseindia.com/'
-        api_url = f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi?functionName=getSymbolDerivativesData&symbol={symbol}"
-
-        # --- Fetch & process ---
-
-        try:
-            # Get reference cookies from the main page
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()  # Ensure request was successful
-
-            # Make API call using cookies from the previous request
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()  # Ensure request was successful
-
-            # Convert response to JSON
-            data = response.json()
-
-            return data
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching data: {e}")
-            return None        
-        
-
-    def symbol_specific_most_active_Calls_or_Puts_or_Contracts_by_OI(self, symbol: str, type_mode: str):
-        """
-        Fetch Most Active Calls / Puts / Contracts by Open Interest (OI)
-        using NSE NextAPI.
-
-        type_mode:
-            C / CALL / CALLS / MOST ACTIVE CALLS
-            P / PUT / PUTS  / MOST ACTIVE PUTS
-            O / OI / CONTRACTS / MOST ACTIVE CONTRACTS BY OI
-        """
-
-        self.rotate_user_agent()
-
-        # --- Normalise Type Input ---
-        type_map = {
-            "C": "C", "CALL": "C", "CALLS": "C", "MOST ACTIVE CALLS": "C",
-            "P": "P", "PUT": "P", "PUTS": "P", "MOST ACTIVE PUTS": "P",
-            "O": "O", "OI": "O", "CONTRACTS": "O",
-            "MOST ACTIVE CONTRACTS BY OI": "O",
-        }
-
-        key = type_mode.strip().upper()
-
-        if key not in type_map:
-            raise ValueError("Invalid Type. Use C / P / O")
-
-        callType = type_map[key]
-
-        # --- Base URLs ---
-        ref_url = "https://www.nseindia.com/"
-        api_url = (f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi?functionName=getDerivativesMostActive&symbol={symbol}&callType={callType}")
-
-        try:
-            # Get reference cookies from the main page
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()  # Ensure request was successful
-
-            # Make API call using cookies from the previous request
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()  # Ensure request was successful
-
-            # 3. JSON Parse Safe
+        # -----------------------------
+        # Sort by latest broadcast date
+        # -----------------------------
+        if "vrbroadcastDt" in df.columns:
             try:
-                data = response.json()
-            except ValueError:
-                print("Error: Invalid JSON response")
-                return None
+                df["_sort"] = pd.to_datetime(df["vrbroadcastDt"], errors="coerce")
+                df.sort_values("_sort", ascending=False, inplace=True)
+                df.drop(columns="_sort", inplace=True)
+            except Exception:
+                pass
 
-            return data
+        # -----------------------------
+        # Final cleanup
+        # -----------------------------
+        df.reset_index(drop=True, inplace=True)
 
-        except requests.RequestException as e:
-            print(f"Request Error: {e}")
-            return None
+        return df
 
-
-    def identifier_based_fno_contracts_live_chart_data(self,identifier: str):
-        self.rotate_user_agent()  # Rotating User-Agent
-
-        ref_url = 'https://www.nseindia.com/'
-        api_url = f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi?functionName=getIntradayGraphDerivative&identifier={identifier}&type=W&token=1"
-
-        try:
-            # Get reference cookies from the main page
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()  # Ensure request was successful
-
-            # Make API call using cookies from the previous request
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()  # Ensure request was successful
-
-            # Convert response to JSON
-            data = response.json()
-
-            return data
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching data: {e}")
-            return None   
-
-    #---------------------------------------------------------- futures ---------------------------------------------------------------------
-
-    def fno_live_futures_data(self, symbol):
-
-        index_list = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"]
-        is_index = symbol.upper() in index_list
-
-        # Sanitize
-        symbol = symbol.replace(" ", "%20").replace("&", "%26")
-        self.rotate_user_agent()
-
-        # Step 1 → Initialize cookies
-        ref_url = f"https://www.nseindia.com/get-quotes/derivatives?symbol={symbol}"
-        ref = self.session.get(ref_url, headers=self.headers, timeout=10)
-
-        # Step 2 → Actual Futures API
-        url = (
-            "https://www.nseindia.com/api/NextApi/apiClient/"
-            f"GetQuoteApi?functionName=getSymbolDerivativesData&symbol={symbol}&instrumentType=FUT"
-        )
-
-        try:
-            response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10 )
-            data = response.json()
-
-            items = data.get("data", [])
-
-            if not items:
-                print(f"No futures data found for {symbol}")
-                return None
-
-            df = pd.DataFrame(items)
-            df.set_index("identifier", inplace=True)
-
-            # Convert numeric fields
-            numeric_cols = [
-                "openPrice", "highPrice", "lowPrice", "closePrice", "prevClose",
-                "lastPrice", "change", "totalTradedVolume", "totalTurnover",
-                "openInterest", "changeinOpenInterest", "pchangeinOpenInterest",
-                "underlyingValue", "ticksize", "pchange"
-            ]
-
-            for col in numeric_cols:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-
-            # Strike formatting
-            if "strikePrice" in df.columns:
-                df["strikePrice"] = df["strikePrice"].astype(str).str.strip()
-
-            # -----------------------------------------------------
-            #  FINAL COLUMN ORDER (Clean + Trader Friendly)
-            # -----------------------------------------------------
-            final_order = [
-                "instrumentType", "expiryDate", "optionType", "strikePrice",
-                "openPrice", "highPrice", "lowPrice", "closePrice",
-                "prevClose", "lastPrice", "change", "pchange",
-                "totalTradedVolume", "totalTurnover",
-                "openInterest", "changeinOpenInterest", "pchangeinOpenInterest",
-                "underlyingValue", "volumeFreezeQuantity"
-            ]
-
-            final_cols = [c for c in final_order if c in df.columns]
-            df = df[final_cols]
-
-            return df
-
-        except Exception as e:
-            print(f"Error fetching futures data for {symbol}: {e}")
-            return None
-        
-    def fno_live_top_20_derivatives_contracts(self, category='Stock Options'):
-        """
-        Fetch NSE live most active stock derivative contracts
-
-        category:
-        - 'Stock Options'
-        - 'Stock Futures'
-        """
-        contracts_xref = {"Stock Futures": "stock_fut", "Stock Options": "stock_opt"}
-        if category not in contracts_xref:
-            raise ValueError("Invalid category")
-             
-        self.rotate_user_agent()
-
-        ref_url = 'https://www.nseindia.com/market-data/equity-derivatives-watch'
-        ref = requests.get(ref_url, headers=self.headers)
-
-        url = f"https://www.nseindia.com/api/liveEquity-derivatives?index={contracts_xref[category]}"
-        try:
-            response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
-            response.raise_for_status()
-            data = response.json()
-
-            df = pd.DataFrame(data['data'])
-            if df.empty:
-                return None
-
-            # --- Rename columns to readable short names ---
-            df.rename(columns={
-            'underlying': 'Symbol',
-            'identifier': 'Contract ID',
-            'instrumentType': 'Instr Type',
-            'instrument': 'Segment',
-            'contract': 'Contract',
-            'expiryDate': 'Expiry',
-            'optionType': 'Option',
-            'strikePrice': 'Strike',
-            'lastPrice': 'LTP',
-            'change': 'Chg',
-            'pChange': 'Chg %',
-            'openPrice': 'Open',
-            'highPrice': 'High',
-            'lowPrice': 'Low',
-            'closePrice': 'Close',
-            'volume': 'Volume (Cntr)',
-            'totalTurnover': 'Turnover (₹)',
-            'premiumTurnOver': 'Premium Turnover (₹)',
-            'underlyingValue': 'Underlying LTP',
-            'openInterest': 'OI (Cntr)',
-            'noOfTrades': 'Trades'
-            }, inplace=True)
-
-            # -----------------------------
-            # Convert ₹ to Crores
-            # -----------------------------
-            for col in ['Turnover (₹)', 'Premium Turnover (₹)']:
-                if col in df.columns:
-                    df[col] = (df[col] / 1e7).round(2)   # 1 Crore = 10,000,000
-
-            df.rename(columns={
-                'Turnover (₹)': 'Turnover (₹ Cr)',
-                'Premium Turnover (₹)': 'Premium Turnover (₹ Cr)'
-            }, inplace=True)
-
-            # -----------------------------
-            # Order columns logically
-            # -----------------------------
-            ordered_cols = [
-                'Segment','Symbol', 'Expiry',
-                'Option', 'Strike', 'Close',
-                'LTP', 'Chg', 'Chg %',
-                'Open', 'High', 'Low',
-                'Volume (Cntr)', 'Trades', 'OI (Cntr)',
-                'Premium Turnover (₹ Cr)', 'Turnover (₹ Cr)',
-                'Contract', 'Contract ID', 'Underlying LTP'
-            ]
-
-            df = df[[c for c in ordered_cols if c in df.columns]]
-
-            return df
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print("⚠️ Error fetching most active underlyings:", e)
-            return None
-
-
-
-    def fno_live_most_active_futures_contracts(self, mode="Volume"):
-        """
-        Fetch most active NSE F&O futures contracts.
-
-        Parameters
-        ----------
-        mode : str
-            "Volume" for volume-based data, "Value" for value-based data.
-            Defaults to "Volume".
+    def cm_live_qtly_shareholding_patterns(self) -> pd.DataFrame | None:
+        """Return the latest quarterly shareholding-pattern filings.
 
         Returns
         -------
         pd.DataFrame or None
-            DataFrame of most active futures contracts, or None if failed.
-        """
-        self.rotate_user_agent()
-        ref_url = 'https://www.nseindia.com/market-data/most-active-contracts'
+            Columns: symbol, name, pr_and_prgrp, public_val, employeeTrusts,
+            revisedStatus, date, submissionDate, revisionDate.
 
-        try:
-            # Get reference cookies
-            ref = requests.get(ref_url, headers=self.headers, timeout=10)
-            url = 'https://www.nseindia.com/api/snapshot-derivatives-equity?index=futures'
-            response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
-            data = response.json()
-
-            # Select data based on mode
-            if mode.lower() == "value":
-                df = pd.DataFrame(data['value']['data'])
-            else:  # Default to volume
-                df = pd.DataFrame(data['volume']['data'])
-
-            return df if not df.empty else None
-
-        except (requests.RequestException, ValueError, KeyError):
-            return None
-
-    #---------------------------------------------------------- index ---------------------------------------------------------------------
-
-    def fno_live_most_active(self, mode="Index", opt="Call", sort_by="Volume"):
-        """
-        Fetch most active F&O contracts in a unified function.
-        
-        Parameters:
-        -----------
-        instrument : str
-            "Index" or "Stock"
-        option_type : str
-            "Call" or "Put"
-        sort_by : str
-            "Volume" or "Value"
-        
-        Returns:
+        Examples
         --------
-        pd.DataFrame or None
-            DataFrame of most active contracts, or None if no data/error.
-        
-        Usage:
-        ------
-        fno_live_most_active("Index", "Call", "Value")
-        fno_live_most_active("Stock", "Put", "Volume")
+        >>> nse.cm_live_qtly_shareholding_patterns()
         """
-        # Normalize inputs
-        mode = mode.capitalize()
-        opt = opt.capitalize()
-        sort_by = sort_by.capitalize()
-
-        if mode not in ["Index", "Stock"]:
-            raise ValueError("mode must be 'Index' or 'Stock'")
-        if opt not in ["Call", "Put"]:
-            raise ValueError("opt must be 'Call' or 'Put'")
-        if sort_by not in ["Volume", "Value"]:
-            raise ValueError("sort_by must be 'Volume' or 'Value'")
-
-        # Map sort_by to NSE API suffix
-        sort_map = {"Volume": "vol", "Value": "val"}
-        suffix = sort_map[sort_by]
-
-        # Map parameters to NSE API ?index= string
-        if mode == "Index":
-            api_index = f"{opt.lower()}s-index-{suffix}"
-            key = "OPTIDX"
-        else:  # Stock
-            api_index = f"{opt.lower()}s-stocks-{suffix}"
-            key = "OPTSTK"
-
-        # Rotate user agent and get reference cookies
-        self.rotate_user_agent()
-        ref_url = 'https://www.nseindia.com/market-data/most-active-contracts'
-        ref = requests.get(ref_url, headers=self.headers)
-
-        url = f"https://www.nseindia.com/api/snapshot-derivatives-equity?index={api_index}"
-
-        try:
-            response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
-            data = response.json()
-            df = pd.DataFrame(data[key]['data'])
-            return df if not df.empty else None
-        except (requests.RequestException, ValueError, KeyError):
-            return None
-
-
-    def fno_live_most_active_contracts_by_oi(self):
-        self.rotate_user_agent()
-        ref_url = 'https://www.nseindia.com/market-data/most-active-contracts'
-        ref = requests.get(ref_url, headers=self.headers)
-        url = 'https://www.nseindia.com/api/snapshot-derivatives-equity?index=oi'
-        try:
-            response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
-            data = response.json()
-            df = pd.DataFrame(data['volume']['data'])
-            return df if not df.empty else None
-        except (requests.RequestException, ValueError):
-            return None
-
-    def fno_live_most_active_contracts_by_volume(self):
-        self.rotate_user_agent()
-        ref_url = 'https://www.nseindia.com/market-data/most-active-contracts'
-        ref = requests.get(ref_url, headers=self.headers)
-        url = 'https://www.nseindia.com/api/snapshot-derivatives-equity?index=contracts'
-        try:
-            response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
-            data = response.json()
-            df = pd.DataFrame(data['volume']['data'])
-            return df if not df.empty else None
-        except (requests.RequestException, ValueError):
-            return None
-
-    def fno_live_most_active_options_contracts_by_volume(self):
-        self.rotate_user_agent()
-        ref_url = 'https://www.nseindia.com/market-data/most-active-contracts'
-        ref = requests.get(ref_url, headers=self.headers)
-        url = 'https://www.nseindia.com/api/snapshot-derivatives-equity?index=options&limit=20'
-        try:
-            response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
-            data = response.json()
-            df = pd.DataFrame(data['volume']['data'])
-            return df if not df.empty else None
-        except (requests.RequestException, ValueError):
-            return None
-    
-
-    def fno_live_most_active_underlying(self):
-        """
-        Fetches most active F&O underlyings from NSE.
-        Renames, drops unnecessary columns, and reorders cleanly.
-        """
-        self.rotate_user_agent()
-
-        ref_url = 'https://www.nseindia.com/market-data/most-active-underlying'
-        ref = requests.get(ref_url, headers=self.headers)
-
-        url = 'https://www.nseindia.com/api/live-analysis-most-active-underlying'
-        try:
-            response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
-            response.raise_for_status()
-            data = response.json()
-
-            df = pd.DataFrame(data['data'])
-            if df.empty:
-                return None
-
-            # --- Rename columns to readable short names ---
-            df.rename(columns={
-                'symbol': 'Symbol',
-                'futVolume': 'Fut Vol (Cntr)',
-                'optVolume': 'Opt Vol (Cntr)',
-                'totVolume': 'Total Vol (Cntr)',
-                'futTurnover': 'Fut Val (₹ Lakhs)',
-                'preTurnover': 'Opt Val (₹ Lakhs)(Premium)',
-                'totTurnover': 'Total Val (₹ Lakhs)',
-                'latestOI': 'OI (Cntr)',
-                'underlying': 'Underlying'
-            }, inplace=True)
-
-            # --- Drop unnecessary columns ---
-            df.drop(columns=[c for c in ['optTurnover'] if c in df.columns], inplace=True, errors='ignore')
-
-            # --- Reorder columns logically ---
-            ordered_cols = ['Symbol', 'Fut Vol (Cntr)', 'Opt Vol (Cntr)', 'Total Vol (Cntr)',
-                            'Fut Val (₹ Lakhs)', 'Opt Val (₹ Lakhs)(Premium)', 'Total Val (₹ Lakhs)',
-                            'OI (Cntr)', 'Underlying']
-            df = df[[c for c in ordered_cols if c in df.columns]]
-
-            # # --- Sort by Total Volume descending ---
-            # df.sort_values(by='Total Vol (Cntr)', ascending=False, inplace=True, ignore_index=True)
-
-            return df
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print("⚠️ Error fetching most active underlyings:", e)
-            return None
-        
-    def fno_live_change_in_oi(self):
-
-        self.rotate_user_agent()
-
-        ref_url = 'https://www.nseindia.com/market-data/oi-spurts'
-        ref = requests.get(ref_url, headers=self.headers)
-
-        url = 'https://www.nseindia.com/api/live-analysis-oi-spurts-underlyings'
-        try:
-            response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
-            response.raise_for_status()
-            data = response.json()
-
-            df = pd.DataFrame(data['data'])
-            if df.empty:
-                return None
-
-            # --- Rename columns to readable short names ---
-            df.rename(columns={
-                'symbol'        : 'Symbol',
-                'latestOI'      : 'Latest OI',
-                'prevOI'        : 'Prev OI',
-                'changeInOI'    : 'chng in OI',
-                'avgInOI'       : 'chng in OI %',
-                'volume'        : 'Vol (Cntr)',
-                'futValue'      : 'Fut Val (₹ Lakhs)',
-                'premValue'     : 'Opt Val (₹ Lakhs)(Premium)',
-                'total'         : 'Total Val (₹ Lakhs)',
-                'underlyingValue': 'Price'
-            }, inplace=True)
-
-            # --- Drop unnecessary columns ---
-            df.drop(columns=[c for c in ['optValue'] if c in df.columns], inplace=True, errors='ignore')
-
-            # --- Reorder columns logically ---
-            ordered_cols = ['Symbol','Latest OI','Prev OI','chng in OI','chng in OI %','Vol (Cntr)',
-                            'Fut Val (₹ Lakhs)','Opt Val (₹ Lakhs)(Premium)','Total Val (₹ Lakhs)','Price']
-            df = df[[c for c in ordered_cols if c in df.columns]]
-
-            # # --- Sort by Total Volume descending ---
-            # df.sort_values(by='Total Vol (Cntr)', ascending=False, inplace=True, ignore_index=True)
-
-            return df
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print("⚠️ Error fetching most active underlyings:", e)
-            return None
-
-
-    def fno_live_oi_vs_price(self):
-        self.rotate_user_agent()
-
-        ref_url = 'https://www.nseindia.com/market-data/oi-spurts'
-        ref = requests.get(ref_url, headers=self.headers)
-
-        url = 'https://www.nseindia.com/api/live-analysis-oi-spurts-contracts'
-
-        try:
-            response = self.session.get(
-                url,
-                headers=self.headers,
-                cookies=ref.cookies.get_dict(),
-                timeout=10
-            )
-            response.raise_for_status()
-            json_data = response.json()
-
-            rows = []
-
-            # -------------------------------
-            # FLATTEN NEW JSON STRUCTURE
-            # -------------------------------
-            for block in json_data.get("data", []):
-                for category, contracts in block.items():
-                    for c in contracts:
-                        c["OI_Price_Signal"] = category
-                        rows.append(c)
-
-            if not rows:
-                return None
-
-            df = pd.DataFrame(rows)
-
-            # -------------------------------
-            # RENAME COLUMNS
-            # -------------------------------
-            df.rename(columns={
-                'symbol'           : 'Symbol',
-                'instrument'       : 'Instrument',
-                'expiryDate'       : 'Expiry',
-                'optionType'       : 'Type',
-                'strikePrice'      : 'Strike',
-                'ltp'              : 'LTP',
-                'prevClose'        : 'Prev Close',
-                'pChange'          : '% Price Chg',
-                'latestOI'         : 'Latest OI',
-                'prevOI'           : 'Prev OI',
-                'changeInOI'       : 'Chg in OI',
-                'pChangeInOI'      : '% OI Chg',
-                'volume'           : 'Volume',
-                'turnover'         : 'Turnover ₹L',
-                'premTurnover'     : 'Premium ₹L',
-                'underlyingValue'  : 'Underlying Price'
-            }, inplace=True)
-
-            # -------------------------------
-            # ORDER COLUMNS (TRADING LOGIC)
-            # -------------------------------
-            ordered_cols = [
-                'OI_Price_Signal',
-                'Symbol', 'Instrument', 'Expiry', 'Type', 'Strike',
-                'LTP', '% Price Chg',
-                'Latest OI', 'Prev OI', 'Chg in OI', '% OI Chg',
-                'Volume',
-                'Turnover ₹L', 'Premium ₹L',
-                'Underlying Price'
-            ]
-
-            df = df[[c for c in ordered_cols if c in df.columns]]
-
-            return df
-
-        except Exception as e:
-            print("⚠️ OI Spurts Fetch Error:", e)
-            return None
-        
-    def fno_expiry_dates_raw(self,symbol: str="NIFTY"):
-        self.rotate_user_agent()  # Rotating User-Agent
-
-        ref_url = 'https://www.nseindia.com/option-chain'
-        api_url = f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi?functionName=getOptionChainDropdown&symbol={symbol}"
-
-        # --- Fetch & process ---
-
-        try:
-            # Get reference cookies from the main page
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()  # Ensure request was successful
-
-            # Make API call using cookies from the previous request
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()  # Ensure request was successful
-
-            # Convert response to JSON
-            data = response.json()
-
-            return data
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching data: {e}")
-            return None   
-
-    def fno_expiry_dates(self, symbol="NIFTY", label_filter=None):
-        from datetime import datetime, time
-
-        # Rotate user agent
-        self.rotate_user_agent()
-
-        # Fetch NSE option-chain page (for cookies)
-        ref_url = 'https://www.nseindia.com/option-chain'
-        ref = requests.get(ref_url, headers=self.headers)
-
-        # API URL for expiry info
-        url = f'https://www.nseindia.com/api/option-chain-contract-info?symbol={symbol}'
-
-        try:
-            response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
-            data = response.json()
-            expiry_dates_raw = data.get('expiryDates') or data.get('records', {}).get('expiryDates')
-            if not expiry_dates_raw:
-                print(f"No expiry dates found for symbol: {symbol}")
-                return None
-
-            expiry_dates = pd.to_datetime(expiry_dates_raw, format='%d-%b-%Y')
-            expiry_dates = pd.Series(expiry_dates.sort_values().unique())
-
-        except Exception as e:
-            print("Error fetching expiry dates:", e)
-            return None
-
-        now = datetime.now()
-
-        # 🧩 Remove past expiry dates
-        expiry_dates = expiry_dates[expiry_dates >= pd.Timestamp(now.date())].reset_index(drop=True)
-
-        # Remove today's expiry if after market close
-        if len(expiry_dates) > 0 and expiry_dates.iloc[0].date() == now.date() and now.time() > time(15, 30):
-            expiry_dates = expiry_dates.iloc[1:].reset_index(drop=True)
-
-        if expiry_dates.empty:
-            print("No upcoming expiry dates available.")
-            return None
-
-        # Identify Weekly vs Monthly expiry
-        expiry_info = []
-        for i, date in enumerate(expiry_dates):
-            if i + 1 < len(expiry_dates):
-                next_month = expiry_dates.iloc[i + 1].month
-                expiry_type = "Monthly Expiry" if next_month != date.month else "Weekly Expiry"
-            else:
-                expiry_type = "Monthly Expiry"
-            expiry_info.append(expiry_type)
-
-        df = pd.DataFrame({
-            "Expiry Date": expiry_dates.dt.strftime("%d-%b-%Y"),
-            "Expiry Type": expiry_info
-        })
-
-        # Label Current / Next Week / Month
-        df["Label"] = ""
-        if len(df) > 0:
-            df.loc[0, "Label"] = "Current"
-
-        weekly_idx = df[df["Expiry Type"] == "Weekly Expiry"].index
-        weekly_after_current = [i for i in weekly_idx if i > 0]
-        if weekly_after_current:
-            df.loc[weekly_after_current[0], "Label"] = "Next Week"
-
-        monthly_idx = df[df["Expiry Type"] == "Monthly Expiry"].index
-        monthly_after_current = [i for i in monthly_idx if i > 0]
-        if monthly_after_current:
-            df.loc[monthly_after_current[0], "Label"] = "Month"
-
-        # Days remaining
-        df["Days Remaining"] = (expiry_dates - pd.Timestamp(now.date())).dt.days
-
-        # Contract Zone classification
-        def contract_zone(expiry):
-            if expiry.month == now.month and expiry.year == now.year:
-                return "Current Month"
-            elif expiry.month == ((now.month % 12) + 1) and (expiry.year == now.year or expiry.year == now.year + 1):
-                return "Next Month"
-            elif expiry.month in [3, 6, 9, 12]:
-                return "Quarterly"
-            else:
-                return "Far Month"
-
-        df["Contract Zone"] = expiry_dates.apply(contract_zone)
-        df = df[["Expiry Date", "Expiry Type", "Label", "Days Remaining", "Contract Zone"]]
-
-        # ✅ Return based on label_filter
-        if label_filter is None:
-            return df.reset_index(drop=True)
-        elif label_filter == "All":
-            df_labeled = df[df["Label"].isin(["Current", "Next Week", "Month"])]
-            return df_labeled["Expiry Date"].apply(lambda x: pd.to_datetime(x, format='%d-%b-%Y').strftime("%d-%m-%Y")).tolist()
-        else:
-            df_filtered = df[df["Label"] == label_filter].reset_index(drop=True)
-            if df_filtered.empty:
-                return None
-            return pd.to_datetime(df_filtered.loc[0, "Expiry Date"], format='%d-%b-%Y').strftime("%d-%m-%Y")
-
-    def fno_live_option_chain_raw(self, symbol: str, expiry_date: str = None,):
-        symbol = symbol.upper().replace(' ', '%20').replace('&', '%26')
-        self.rotate_user_agent()  # Rotating User-Agent
-
-        ref_url = 'https://www.nseindia.com/option-chain'
-        api_url = f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi?functionName=getOptionChainData&symbol={symbol}&params=expiryDate={expiry_date}"
-
-        # --- Fetch & process ---
-
-        try:
-            # Get reference cookies from the main page
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()  # Ensure request was successful
-
-            # Make API call using cookies from the previous request
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()  # Ensure request was successful
-
-            # Convert response to JSON
-            data = response.json()
-
-            return data
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching data: {e}")
-            return None  
-
-
-    def fno_live_option_chain(self, symbol: str, expiry_date: str = None, oi_mode: str = "full"):
-        # symbol = symbol.upper().replace(' ', '%20').replace('&', '%26')
-        self.rotate_user_agent()
-
-        # Step 1: Get available expiry dates
-        dropdown_url = "https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
-        params_dropdown = {
-            'functionName': 'getOptionChainDropdown',
-            'symbol': symbol
-        }
-
-        # Define columns upfront
-        if oi_mode == "compact":
-            col_names = [
-                'Fetch_Time', 'Symbol', 'Expiry_Date',
-                'CALLS_OI', 'CALLS_Chng_in_OI', 'CALLS_Volume', 'CALLS_IV', 'CALLS_LTP', 'CALLS_Net_Chng',
-                'Strike_Price',
-                'PUTS_OI', 'PUTS_Chng_in_OI', 'PUTS_Volume', 'PUTS_IV', 'PUTS_LTP', 'PUTS_Net_Chng',
-                'Underlying_Value'
-            ]
-        else:
-            col_names = [
-                'Fetch_Time', 'Symbol', 'Expiry_Date',
-                'CALLS_OI', 'CALLS_Chng_in_OI', 'CALLS_Volume', 'CALLS_IV', 'CALLS_LTP', 'CALLS_Net_Chng',
-                'CALLS_Bid_Qty', 'CALLS_Bid_Price', 'CALLS_Ask_Price', 'CALLS_Ask_Qty',
-                'Strike_Price',
-                'PUTS_Bid_Qty', 'PUTS_Bid_Price', 'PUTS_Ask_Price', 'PUTS_Ask_Qty',
-                'PUTS_Net_Chng', 'PUTS_LTP', 'PUTS_IV', 'PUTS_Volume', 'PUTS_Chng_in_OI', 'PUTS_OI',
-                'Underlying_Value'
-            ]
-
-        dtypes = {c: 'float64' for c in col_names if any(x in c for x in ['Price', 'IV', 'Value', 'OI', 'Volume', 'Chng', 'Qty'])}
-        dtypes.update({'Fetch_Time': 'object', 'Symbol': 'object', 'Expiry_Date': 'object', 'Strike_Price': 'float64'})
-
-        for attempt in range(3):
-            try:
-                # Fetch dropdown to get expiry list (also sets cookies)
-                resp_dropdown = self.session.get(
-                    dropdown_url,
-                    params=params_dropdown,
-                    headers=self.headers,
-                    timeout=10
-                )
-                resp_dropdown.raise_for_status()
-                dropdown_data = resp_dropdown.json()
-
-                if not dropdown_data.get("expiryDates"):
-                    print(f"No expiry dates found for {symbol}")
-                    return pd.DataFrame(columns=col_names).astype(dtypes)
-
-                available_expiries = dropdown_data["expiryDates"]  # e.g. ["30-Dec-2025", "27-Jan-2026", ...]
-
-                # Resolve target expiry
-                if expiry_date:
-                    try:
-                        exp_dt = pd.to_datetime(expiry_date, dayfirst=True)
-                        target_expiry = exp_dt.strftime("%d-%b-%Y")
-                    except:
-                        target_expiry = expiry_date.strip()
-                    if target_expiry not in available_expiries:
-                        print(f"Expiry {target_expiry} not available. Available: {available_expiries}")
-                        target_expiry = available_expiries[0]
-                else:
-                    target_expiry = available_expiries[0]  # nearest expiry by default
-
-                # Step 2: Fetch actual option chain data for selected expiry
-                data_url = "https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
-                params_data = {
-                    'functionName': 'getOptionChainData',
-                    'symbol': symbol,
-                    'params': f'expiryDate={target_expiry}'
-                }
-
-                resp_data = self.session.get(
-                    data_url,
-                    params=params_data,
-                    headers=self.headers,
-                    timeout=15
-                )
-                resp_data.raise_for_status()
-                payload = resp_data.json()
-
-                timestamp = payload.get("timestamp", datetime.now().strftime("%d-%b-%Y %H:%M:%S"))
-                underlying_value = payload.get("underlyingValue", 0)
-                records = payload.get("data", [])
-
-                if not records:
-                    return pd.DataFrame(columns=col_names).astype(dtypes)
-
-                rows = []
-                for item in records:
-                    ce = item.get("CE", {})
-                    pe = item.get("PE", {})
-                    sp = item.get("strikePrice")
-
-                    row = {
-                        'Fetch_Time': timestamp,
-                        'Symbol': symbol.replace('%20', ' ').replace('%26', '&'),
-                        'Expiry_Date': target_expiry,
-                        'Strike_Price': sp,
-                        'CALLS_OI': ce.get("openInterest", 0),
-                        'CALLS_Chng_in_OI': ce.get("changeinOpenInterest", 0),
-                        'CALLS_Volume': ce.get("totalTradedVolume", 0),
-                        'CALLS_IV': ce.get("impliedVolatility", 0),
-                        'CALLS_LTP': ce.get("lastPrice", 0),
-                        'CALLS_Net_Chng': ce.get("change", 0),
-                        'PUTS_OI': pe.get("openInterest", 0),
-                        'PUTS_Chng_in_OI': pe.get("changeinOpenInterest", 0),
-                        'PUTS_Volume': pe.get("totalTradedVolume", 0),
-                        'PUTS_IV': pe.get("impliedVolatility", 0),
-                        'PUTS_LTP': pe.get("lastPrice", 0),
-                        'PUTS_Net_Chng': pe.get("change", 0),
-                        'Underlying_Value': underlying_value
-                    }
-
-                    if oi_mode == "full":
-                        row.update({
-                            'CALLS_Bid_Qty': ce.get("totalBuyQuantity", 0) or ce.get("buyQuantity1", 0),
-                            'CALLS_Bid_Price': ce.get("buyPrice1", 0),
-                            'CALLS_Ask_Price': ce.get("sellPrice1", 0),
-                            'CALLS_Ask_Qty': ce.get("totalSellQuantity", 0) or ce.get("sellQuantity1", 0),
-                            'PUTS_Bid_Qty': pe.get("totalBuyQuantity", 0) or pe.get("buyQuantity1", 0),
-                            'PUTS_Bid_Price': pe.get("buyPrice1", 0),
-                            'PUTS_Ask_Price': pe.get("sellPrice1", 0),
-                            'PUTS_Ask_Qty': pe.get("totalSellQuantity", 0) or pe.get("sellQuantity1", 0),
-                        })
-
-                    rows.append(row)
-
-                df = pd.DataFrame(rows, columns=col_names)
-                return df.astype(dtypes)
-
-            except requests.exceptions.RequestException as e:
-                print(f"Attempt {attempt+1}/3 failed for {symbol}: {e}")
-                time.sleep(2)
-            except Exception as e:
-                print(f"Unexpected error: {e}")
-                break
-
-        print(f"Failed to fetch option chain for {symbol} after 3 attempts.")
-        return pd.DataFrame(columns=col_names).astype(dtypes)
-
-
-    def fno_live_active_contracts(self, symbol: str, expiry_date: str = None):
-        try:
-            self.rotate_user_agent()
-
-            # Step 1: Cookie initialization (MUST DO)
-            ref_url = f"https://www.nseindia.com/get-quotes/derivatives?symbol={symbol}"
-            ref = self.session.get(ref_url, headers=self.headers, timeout=10)
-
-            # Step 2: New NSE NextApi endpoint
-            url = (
-                "https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
-                f"?functionName=getSymbolDerivativesData&symbol={symbol}&instrumentType=OPT"
-            )
-
-            payload = self.session.get(
-                url,
-                headers=self.headers,
-                cookies=ref.cookies.get_dict(),
-                timeout=10
-            ).json()
-
-            contracts = payload.get("data", [])
-
-            # Convert expiry date to NSE format
-            if expiry_date:
-                exp = pd.to_datetime(expiry_date, format="%d-%b-%Y")
-                expiry_date = exp.strftime("%d-%b-%Y")
-
-            # Filter by expiry date if provided
-            if expiry_date:
-                contracts = [c for c in contracts if c.get("expiryDate") == expiry_date]
-
-            table_data = []
-
-            for c in contracts:
-                strike = str(c.get("strikePrice", "")).strip()
-
-                table_data.append({
-                    "Instrument Type": c.get("instrumentType", ""),
-                    "Expiry Date": c.get("expiryDate", ""),
-                    "Option Type": c.get("optionType", ""),
-                    "Strike Price": strike,
-
-                    "Open": c.get("openPrice", 0),
-                    "High": c.get("highPrice", 0),
-                    "Low": c.get("lowPrice", 0),
-                    "closePrice": c.get("closePrice", 0),
-                    "Prev Close": c.get("prevClose", 0),
-                    "Last": c.get("lastPrice", 0),
-                    "Change": c.get("change", 0),
-                    "%Change": c.get("pchange", 0),
-
-                    "Volume (Contracts)": c.get("totalTradedVolume", 0),
-                    "Value (₹ Lakhs)": round(c.get("totalTurnover", 0) / 100000, 2),
-
-                    # These do NOT exist in new API — set to 0
-                    "totalBuyQuantity": 0,
-                    "totalSellQuantity": 0,
-
-                    "OI": c.get("openInterest", 0),
-                    "Chng in OI": c.get("changeinOpenInterest", 0),
-                    "% Chng in OI": c.get("pchangeinOpenInterest", 0),
-
-                    # No VWAP in new API
-                    "VWAP": 0
-                })
-
-            return table_data
-
-        except Exception as e:
-            print(f"Error fetching NSE contracts: {e}")
-            return None
-    
-    #---------------------------------------------------------- CM_Eod_Data ----------------------------------------------------------------
-
-    def cm_eod_fii_dii_activity(self, exchange="All"):
-        """
-        Fetch End-of-Day FII/DII activity from NSE.
-
-        Parameters:
-        -----------
-        exchange : str
-            "Nse" for NSE FII/DII data, "All" for combined/all exchange data.
-
-        Returns:
-        --------
-        pd.DataFrame or None
-            Returns a DataFrame containing FII/DII activity. None if request fails.
-        """
-        self.rotate_user_agent()  
-        ref_url = 'https://www.nseindia.com/reports/fii-dii'
-        ref = requests.get(ref_url, headers=self.headers)
-        
-        # Map exchange to API endpoint
-        endpoints = {
-            "Nse": "https://www.nseindia.com/api/fiidiiTradeNse",
-            "All": "https://www.nseindia.com/api/fiidiiTradeReact"
-        }
-
-        url = endpoints.get(exchange, endpoints["All"])
-        
-        # Rotate user agent if you have this function
-        try:
-            response = self.session.get(url, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            
-            # Convert to DataFrame
-            df = pd.DataFrame(data)
-            return df
-        
-        except (requests.RequestException, ValueError) as e:
-            print(f"Error fetching FII/DII data: {e}")
-            return None
-   
-    def cm_eod_market_activity_report(self, trade_date: str):
-        """
-        Download NSE Market Activity CSV and return raw rows (list of lists).
-        Fast + Safe version.
-        """
-        self.rotate_user_agent()
-        try:
-            # Convert date
-            trade_date = datetime.strptime(trade_date, "%d-%m-%y")
-            url = f"https://nsearchives.nseindia.com/archives/equities/mkt/MA{trade_date.strftime('%d%m%y')}.csv"
-
-            # Fetch CSV
-            nse_resp = requests.get(url, headers=self.headers, timeout=10)
-            nse_resp.raise_for_status()
-
-            # Decode safely (ignore bad chars) and split lines directly (fast)
-            csv_text = nse_resp.content.decode("utf-8", errors="ignore")
-            rows = list(csv.reader(csv_text.splitlines()))
-
-            return rows if rows else None
-
-        except Exception as e:
-            print(f"❌ Error fetching Market Activity Report for {trade_date.strftime('%d-%b-%Y')}: {e}")
-            return None
-    
-    def cm_eod_bhavcopy_with_delivery(self, trade_date: str):
-        self.rotate_user_agent()
-        trade_date = datetime.strptime(trade_date, "%d-%m-%Y")
-        use_date = trade_date.strftime("%d%m%Y")
-        url = f'https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{use_date}.csv'
-        try:
-            request_bhav = requests.get(url, headers=self.headers, timeout=10)
-            request_bhav.raise_for_status()
-            bhav_df = pd.read_csv(BytesIO(request_bhav.content))
-            bhav_df.columns = [name.replace(' ', '') for name in bhav_df.columns]
-            bhav_df['SERIES'] = bhav_df['SERIES'].str.replace(' ', '')
-            bhav_df['DATE1'] = bhav_df['DATE1'].str.replace(' ', '')
-            return bhav_df
-        except requests.RequestException:
-            return None
-
-    def cm_eod_equity_bhavcopy(self, trade_date: str):
-        self.rotate_user_agent()
-        trade_date = datetime.strptime(trade_date, "%d-%m-%Y")
-        url = 'https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_'
-        payload = f"{trade_date.strftime('%Y%m%d')}_F_0000.csv.zip"
-        
-        try:
-            response = requests.get(url + payload, headers=self.headers, timeout=10)
-            response.raise_for_status()
-
-            with zipfile.ZipFile(BytesIO(response.content)) as zip_bhav:
-                # Usually only one CSV per zip, but iterate just in case
-                bhav_df = pd.DataFrame()
-                for file_name in zip_bhav.namelist():
-                    temp_df = pd.read_csv(zip_bhav.open(file_name))
-                    bhav_df = pd.concat([bhav_df, temp_df], ignore_index=True)
-            
-            # Filter only EQ securities
-            bhav_df = bhav_df[bhav_df['SctySrs'] == 'EQ'].reset_index(drop=True)
-            return bhav_df
-
-        except requests.RequestException as e:
-            print(f"Error fetching BhavCopy: {e}")
-            return None
-        
-    def cm_eod_52_week_high_low(self, trade_date: str):
-        """
-        Download NSE 52 Week High Low CSV and return raw rows (list of lists).
-        Fast + Safe version.
-        """
-        self.rotate_user_agent()
-        raw_trade_date = trade_date  # keep original string
-
-        try:
-            # Convert date (expects dd-mm-YYYY)
-            trade_date = datetime.strptime(trade_date, "%d-%m-%Y")
-            url = f"https://nsearchives.nseindia.com/content/CM_52_wk_High_low_{trade_date.strftime('%d%m%Y')}.csv"
-
-            # Fetch CSV
-            nse_resp = requests.get(url, headers=self.headers, timeout=10)
-            nse_resp.raise_for_status()
-
-            # Decode safely (ignore bad chars) and split lines directly (fast)
-            csv_text = nse_resp.content.decode("utf-8", errors="ignore")
-            rows = list(csv.reader(csv_text.splitlines()))
-
-            return rows if rows else None
-
-        except Exception as e:
-            print(f"❌ Error fetching 52 Week High/Low for {raw_trade_date}: {e}")
-            return None
-        
-    def cm_eod_bulk_deal(self):
-        self.rotate_user_agent()
-        url = f"https://nsearchives.nseindia.com/content/equities/bulk.csv"
-        try:
-            nse_resp = requests.get(url, headers=self.headers, timeout=10)
-            nse_resp.raise_for_status()
-            bhav_df = pd.read_csv(BytesIO(nse_resp.content))
-            return bhav_df
-        except (requests.RequestException, ValueError):
-            return None
-        
-    def cm_eod_block_deal(self):
-        self.rotate_user_agent()
-        url = f"https://nsearchives.nseindia.com/content/equities/block.csv"
-        try:
-            nse_resp = requests.get(url, headers=self.headers, timeout=10)
-            nse_resp.raise_for_status()
-            bhav_df = pd.read_csv(BytesIO(nse_resp.content))
-            return bhav_df
-        except (requests.RequestException, ValueError):
-            return None
-        
-    def cm_eod_shortselling(self, trade_date: str):
-        self.rotate_user_agent()
-        trade_date = datetime.strptime(trade_date, "%d-%m-%Y")
-        url = f"https://nsearchives.nseindia.com/archives/equities/shortSelling/shortselling_{str(trade_date.strftime('%d%m%Y').upper())}.csv"
-        try:
-            nse_resp = requests.get(url, headers=self.headers, timeout=10)
-            nse_resp.raise_for_status()
-            bhav_df = pd.read_csv(BytesIO(nse_resp.content))
-            return bhav_df
-        except (requests.RequestException, ValueError):
-            return None
-
-    def cm_eod_surveillance_indicator(self, trade_date: str):
-        self.rotate_user_agent()
-        trade_date = datetime.strptime(trade_date, "%d-%m-%y")
-        url = f"https://nsearchives.nseindia.com/content/cm/REG1_IND{str(trade_date.strftime('%d%m%y').upper())}.csv"
-        
-        try:
-            nse_resp = requests.get(url, headers=self.headers, timeout=10)
-            nse_resp.raise_for_status()
-            bhav_df = pd.read_csv(BytesIO(nse_resp.content))
-
-            # Replace 100 with blank in columns F to R
-            columns_to_replace = bhav_df.loc[:, 'GSM':'Filler31'].columns
-            bhav_df[columns_to_replace] = bhav_df[columns_to_replace].replace(100, '')
-
-            return bhav_df
-        except (requests.RequestException, ValueError) as e:
-            print("Error:", e)
-            return None
-        
-    def cm_eod_series_change(self):
-        self.rotate_user_agent()
-        url = f"https://nsearchives.nseindia.com/content/equities/series_change.csv"
-        try:
-            nse_resp = requests.get(url, headers=self.headers, timeout=10)
-            nse_resp.raise_for_status()
-            bhav_df = pd.read_csv(BytesIO(nse_resp.content))
-            return bhav_df
-        except (requests.RequestException, ValueError):
-            return None
-
-    def cm_eod_eq_band_changes(self, trade_date: str):
-        self.rotate_user_agent()
-        trade_date = datetime.strptime(trade_date, "%d-%m-%Y")
-        url = f"https://nsearchives.nseindia.com/content/equities/eq_band_changes_{str(trade_date.strftime('%d%m%Y').upper())}.csv"
-        try:
-            nse_resp = requests.get(url, headers=self.headers, timeout=10)
-            nse_resp.raise_for_status()
-            bhav_df = pd.read_csv(BytesIO(nse_resp.content))
-            return bhav_df
-        except (requests.RequestException, ValueError):
-            return None
-        
-    def cm_eod_eq_price_band(self, trade_date: str):
-        self.rotate_user_agent()
-        trade_date = datetime.strptime(trade_date, "%d-%m-%Y")
-        url = f"https://nsearchives.nseindia.com/content/equities/sec_list_{str(trade_date.strftime('%d%m%Y').upper())}.csv"
-        try:
-            nse_resp = requests.get(url, headers=self.headers, timeout=10)
-            nse_resp.raise_for_status()
-            bhav_df = pd.read_csv(BytesIO(nse_resp.content))
-            return bhav_df
-        except (requests.RequestException, ValueError):
-            return None
-        
-    def cm_hist_eq_price_band(self, *args, from_date=None, to_date=None, period=None, symbol=None):
-        """
-        Fetch Historical NSE Price Band (CSV Mode)
-        Auto-detects date range, symbol, and period.
-
-        Usage Examples:
-        ----------------
-        get.cm_hist_eq_price_band()                              # Today's data for all symbols
-        get.cm_hist_eq_price_band("1W")                          # 1 week for all symbols
-        get.cm_hist_eq_price_band("01-10-2025")                  # From date, Auto Today date for all symbols
-        get.cm_hist_eq_price_band("01-10-2025", "17-10-2025")    # Custom range for all symbols
-        get.cm_hist_eq_price_band("RELIANCE")                    # Today for symbol
-        get.cm_hist_eq_price_band("RELIANCE", "1M")              # 1 month for symbol
-        get.cm_hist_eq_price_band("RELIANCE", "01-10-2025")      # From date, Auto Today date for symbols
-        get.cm_hist_eq_price_band("RELIANCE", "01-10-2025", "17-10-2025")  # Range for symbol
-        """
-
-        date_pattern = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-        today = datetime.now()
-        today_str = today.strftime("%d-%m-%Y")
-
-        for arg in args:
-            if isinstance(arg, str):
-                if date_pattern.match(arg):
-                    if not from_date:
-                        from_date = arg
-                    elif not to_date:
-                        to_date = arg
-                elif arg.upper() in ["1D", "1W", "1M", "3M", "6M", "1Y"]:
-                    period = arg.upper()
-                else:
-                    symbol = arg.upper()
-
-        # --- Compute date range from period --- #
-        if period:
-            delta_map = {
-                "1D": timedelta(days=1),
-                "1W": timedelta(weeks=1),
-                "1M": timedelta(days=30),
-                "3M": timedelta(days=90),
-                "6M": timedelta(days=180),
-                "1Y": timedelta(days=365),
-            }
-            delta = delta_map.get(period, timedelta(days=365))
-            from_date = (today - delta).strftime("%d-%m-%Y")
-            to_date = to_date or today_str
-
-        from_date = from_date or today_str
-        to_date = to_date or today_str
-
-        # --- Rotate User-Agent --- #
-        self.rotate_user_agent()
-
-        # --- URLs --- #
-        ref_url = "https://www.nseindia.com/reports/price-band-changes"
-        base_url = "https://www.nseindia.com/api/eqsurvactions"
-
-        if symbol:
-            api_url = f"{base_url}?from_date={from_date}&to_date={to_date}&symbol={symbol}&csv=true"
-        else:
-            api_url = f"{base_url}?from_date={from_date}&to_date={to_date}&csv=true"
-
-        # --- Fetch data --- #
-        try:
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()
-
-            # Retry with exponential backoff
-            for attempt in range(3):
-                try:
-                    response = self.session.get(
-                        api_url,
-                        headers=self.headers,
-                        cookies=ref_response.cookies.get_dict(),
-                        timeout=10,
-                    )
-                    response.raise_for_status()
-                    break
-                except requests.RequestException as e:
-                    if attempt < 2:
-                        wait_time = 2 ** attempt
-                        print(f"⚠️ Attempt {attempt + 1} failed ({e}); retrying in {wait_time}s...")
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        raise
-
-            # --- Detect non-CSV (HTML error page) --- #
-            if "text/html" in response.headers.get("Content-Type", ""):
-                print("⚠️ NSE returned HTML instead of CSV. Headers or session may be invalid.")
-                return None
-
-            # --- Read CSV with UTF-8 BOM handling at byte level --- #
-            # Decode response content and strip BOM at byte level
-            content = response.content
-            if content.startswith(b'\xef\xbb\xbf'):  # Check for UTF-8 BOM
-                content = content[3:]  # Remove BOM
-            cleaned_text = content.decode('utf-8')
-            df = pd.read_csv(StringIO(cleaned_text))
-
-            # --- Handle empty or invalid response --- #
-            if df.empty or len(df.columns) < 2:
-                print(f"ℹ️ No Price Band Changes data found for {symbol or 'ALL'} between {from_date} and {to_date}")
-                return None
-
-            # --- 🔹 FIX 1: Clean Headers (Quotes + Spaces) --- #
-            df.columns = [c.strip().replace('"', '') for c in df.columns]
-            df.rename(columns=lambda x: x.strip(), inplace=True)  # Ensure no leading/trailing spaces
-
-            # --- 🔹 FIX 2: Clean numeric columns safely --- #
-            for col in df.columns:
-                if df[col].dtype == object:
-                    df[col] = df[col].astype(str).str.replace(",", "", regex=False).str.strip()
-                    try:
-                        df[col] = pd.to_numeric(df[col])
-                    except Exception:
-                        pass
-
-            # --- Sort and format dates --- #
-            if "Date" in df.columns:
-                df["Date"] = pd.to_datetime(df["Date"], errors="coerce", format="%d-%b-%Y")
-                df = df.sort_values("Date", ascending=False).reset_index(drop=True)
-                df["Date"] = df["Date"].dt.strftime("%d-%b-%Y")
-
-            # --- Final cleanup --- #
-            df = df.fillna("").replace({float("inf"): "", float("-inf"): ""})
-            return df
-
-        except Exception as e:
-            print(f"❌ Error fetching Price Band Change: {e}")
-            return None
-
-    def cm_eod_pe_ratio(self, trade_date: str):
-        self.rotate_user_agent()
-        trade_date = datetime.strptime(trade_date, "%d-%m-%y")
-        url = f"https://nsearchives.nseindia.com/content/equities/peDetail/PE_{str(trade_date.strftime('%d%m%y').upper())}.csv"
-        try:
-            nse_resp = requests.get(url, headers=self.headers, timeout=10)
-            nse_resp.raise_for_status()
-            bhav_df = pd.read_csv(BytesIO(nse_resp.content))
-            return bhav_df
-        except (requests.RequestException, ValueError):
-            return None
-
-    def cm_eod_mcap(self, trade_date: str):
-        self.rotate_user_agent()
-        trade_date = datetime.strptime(trade_date, "%d-%m-%y")
-        url = f"https://nsearchives.nseindia.com/archives/equities/bhavcopy/pr/PR{trade_date.strftime('%d%m%y').upper()}.zip"
-
-        try:
-            request_bhav = requests.get(url, headers=self.headers, timeout=10)
-            request_bhav.raise_for_status()
-            zip_bhav = zipfile.ZipFile(BytesIO(request_bhav.content), 'r')
-            bhav_df = pd.DataFrame()
-
-            for file_name in zip_bhav.namelist():
-                if file_name.lower().startswith("mcap") and file_name.endswith(".csv"):
-                    bhav_df = pd.read_csv(zip_bhav.open(file_name))
-                    break
-
-            if bhav_df.empty:
-                print("No MCAP CSV file found in the ZIP archive.")
-                return None
-
-            return bhav_df
-
-        except requests.RequestException as e:
-            print(f"Error fetching data: {e}")
-            return None
-
-    def cm_eod_eq_name_change(self):
-        self.rotate_user_agent()
-        url = f"https://nsearchives.nseindia.com/content/equities/namechange.csv"
-        try:
-            nse_resp = requests.get(url, headers=self.headers, timeout=10)
-            nse_resp.raise_for_status()
-            bhav_df = pd.read_csv(BytesIO(nse_resp.content))
-
-            # Convert the 4th column (index 3) to date format YYYY-MM-DD using explicit format
-            if bhav_df.shape[1] >= 4:  # Ensure 4 columns exist
-                bhav_df.iloc[:, 3] = pd.to_datetime(
-                    bhav_df.iloc[:, 3], 
-                    format='%d-%b-%Y',  # specify the date format explicitly
-                    errors='coerce'
-                ).dt.strftime('%Y-%m-%d')
-
-                # Sort by the 4th column descending (new to old)
-                bhav_df = bhav_df.sort_values(by=bhav_df.columns[3], ascending=False).reset_index(drop=True)
-
-            return bhav_df
-        except (requests.RequestException, ValueError) as e:
-            print(f"Error fetching or processing data: {e}")
-            return None
-        
-    def cm_eod_eq_symbol_change(self):
-        self.rotate_user_agent()
-        url = f"https://nsearchives.nseindia.com/content/equities/symbolchange.csv"
-        try:
-            nse_resp = requests.get(url, headers=self.headers, timeout=10)
-            nse_resp.raise_for_status()
-            bhav_df = pd.read_csv(BytesIO(nse_resp.content), header=None)  # No header specified
-
-            # Convert the 4th column (index 3) to date format YYYY-MM-DD using explicit format
-            if bhav_df.shape[1] >= 4:  # Ensure 4 columns exist
-                bhav_df.iloc[:, 3] = pd.to_datetime(
-                    bhav_df.iloc[:, 3], 
-                    format='%d-%b-%Y',  # specify the date format explicitly
-                    errors='coerce'
-                ).dt.strftime('%Y-%m-%d')  # Convert to string format for JSON serialization
-
-                # Sort by the 4th column descending (new to old)
-                bhav_df = bhav_df.sort_values(by=bhav_df.columns[3], ascending=False).reset_index(drop=True)
-
-            return bhav_df
-        except (requests.RequestException, ValueError) as e:
-            print(f"Error fetching or processing data: {e}")
-            return None
-
-   
-    def cm_hist_security_wise_data(self, *args, from_date=None, to_date=None, period=None, symbol=None):
-        """
-        Fetch historical price-volume-deliverable data for a given NSE security.
-        Supports:
-            - Date range (from_date, to_date)
-            - Period shortcuts (1D, 1W, 1M, 3M, 6M, 1Y)
-        Automatically splits requests into 3-month chunks to bypass NSE API limits.
-        If to_date is not provided, defaults to today.
-        """
-
-        date_pattern = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-        today = datetime.now()
-        today_str = today.strftime("%d-%m-%Y")
-
-        # --- Auto-detect arguments ---
-        for arg in args:
-            if isinstance(arg, str):
-                if date_pattern.match(arg):
-                    if not from_date:
-                        from_date = arg
-                    elif not to_date:
-                        to_date = arg
-                elif arg.upper() in ["1D", "1W", "1M", "3M", "6M", "1Y"]:
-                    period = arg.upper()
-                else:
-                    symbol = arg.upper()
-
-        # --- Compute date range from period ---
-        if period:
-            delta_map = {
-                "1D": timedelta(days=1),
-                "1W": timedelta(weeks=1),
-                "1M": timedelta(days=30),
-                "3M": timedelta(days=90),
-                "6M": timedelta(days=180),
-                "1Y": timedelta(days=365),
-            }
-            delta = delta_map.get(period, timedelta(days=365))
-            from_date = (today - delta).strftime("%d-%m-%Y")
-            if not to_date:
-                to_date = today_str
-
-        # --- Default dates if not provided ---
-        if not from_date:
-            from_date = (today - timedelta(days=365)).strftime("%d-%m-%Y")
-        if not to_date:
-            to_date = today_str
-
-        # --- Rotate User-Agent ---
-        self.rotate_user_agent()
-
-        ref_url = "https://www.nseindia.com/report-detail/eq_security"
-        base_api = (
-            "https://www.nseindia.com/api/historicalOR/generateSecurityWiseHistoricalData?"
-            "from={}&to={}&symbol={}&type=priceVolumeDeliverable&series=ALL"
+        ref_url = "https://www.nseindia.com/companies-listing/corporate-filings-shareholding-pattern"
+        data    = self._get_json(
+            ref_url,
+            "https://www.nseindia.com/api/corporate-share-holdings-master?index=equities",
         )
-
-        try:
-            # Get NSE cookies
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()
-
-            # Convert dates
-            start_dt = datetime.strptime(from_date, "%d-%m-%Y")
-            end_dt = datetime.strptime(to_date, "%d-%m-%Y")
-
-            # --- Split date range into 3-month chunks (~90 days) ---
-            all_data = []
-            chunk_days = 89
-
-            while start_dt <= end_dt:
-                chunk_start = start_dt
-                chunk_end = min(start_dt + timedelta(days=chunk_days), end_dt)
-
-                api_url = base_api.format(
-                    chunk_start.strftime("%d-%m-%Y"),
-                    chunk_end.strftime("%d-%m-%Y"),
-                    symbol
-                )
-
-                response = self.session.get(
-                    api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=15
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    if "data" in data and isinstance(data["data"], list):
-                        all_data.extend(data["data"])
-
-                start_dt = chunk_end + timedelta(days=1)
-
-            if not all_data:
-                print(f"⚠️ No data returned for {symbol} between {from_date} and {to_date}.")
-                return None
-
-            # --- Combine all chunks into DataFrame ---
-            df = pd.DataFrame(all_data)
-
-            # --- Keep expected columns ---
-            expected_cols = [
-                "CH_SYMBOL", "CH_SERIES", "mTIMESTAMP", "CH_PREVIOUS_CLS_PRICE",
-                "CH_OPENING_PRICE", "CH_TRADE_HIGH_PRICE", "CH_TRADE_LOW_PRICE",
-                "CH_LAST_TRADED_PRICE", "CH_CLOSING_PRICE", "VWAP", "CH_TOT_TRADED_QTY",
-                "CH_TOT_TRADED_VAL", "CH_TOTAL_TRADES", "COP_DELIV_QTY", "COP_DELIV_PERC"
-            ]
-            df = df[[c for c in expected_cols if c in df.columns]]
-
-            rename_map = {
-                "CH_SYMBOL": "Symbol",
-                "CH_SERIES": "Series",
-                "mTIMESTAMP": "Date",
-                "CH_PREVIOUS_CLS_PRICE": "Prev Close",
-                "CH_OPENING_PRICE": "Open Price",
-                "CH_TRADE_HIGH_PRICE": "High Price",
-                "CH_TRADE_LOW_PRICE": "Low Price",
-                "CH_LAST_TRADED_PRICE": "Last Price",
-                "CH_CLOSING_PRICE": "Close Price",
-                "VWAP": "VWAP",
-                "CH_TOT_TRADED_QTY": "Total Traded Quantity",
-                "CH_TOT_TRADED_VAL": "Turnover ₹",
-                "CH_TOTAL_TRADES": "No. of Trades",
-                "COP_DELIV_QTY": "Deliverable Qty",
-                "COP_DELIV_PERC": "% Dly Qt to Traded Qty"
-            }
-            df.rename(columns=rename_map, inplace=True)
-
-            # --- Clean numeric data ---
-            df.replace({float("inf"): 0, float("-inf"): 0}, inplace=True)
-            df.fillna(0, inplace=True)
-
-            # --- Sort by date & remove duplicates ---
-            df["Date"] = pd.to_datetime(df["Date"], format="%d-%b-%Y", errors="coerce")
-            df.sort_values("Date", inplace=True)
-            df.drop_duplicates(subset=["Date"], keep="last", inplace=True)
-
-            # --- Convert datetime columns to string for JSON/Sheets safety ---
-            for col in df.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns:
-                df[col] = df[col].dt.strftime("%d-%b-%Y")
-
-            return df
-
-        except Exception as e:
-            print(f"❌ Error fetching historical data for {symbol}: {e}")
+        if not isinstance(data, list):
             return None
-
-    def cm_hist_bulk_deals(self, *args, from_date=None, to_date=None, period=None, symbol=None):
-        """
-        Fetch Historical NSE Bulk Deals (CSV Mode)
-        Auto-detects date range, symbol, and period.
-
-        Usage Examples:
-        ----------------
-        get.cm_hist_bulk_deals()                              # Today's data for all symbols
-        get.cm_hist_bulk_deals("1W")                          # 1 week for all symbols
-        get.cm_hist_bulk_deals("01-10-2025")                  # From date, Auto Today date for all symbols
-        get.cm_hist_bulk_deals("01-10-2025", "17-10-2025")    # Custom range for all symbols
-        get.cm_hist_bulk_deals("RELIANCE")                    # Today for symbol
-        get.cm_hist_bulk_deals("RELIANCE", "1M")              # 1 month for symbol
-        get.cm_hist_bulk_deals("RELIANCE", "01-10-2025")      # From date, Auto Today date for symbols
-        get.cm_hist_bulk_deals("RELIANCE", "01-10-2025", "17-10-2025")  # Range for symbol
-        """
-
-        date_pattern = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-        today = datetime.now()
-        today_str = today.strftime("%d-%m-%Y")
-
-        for arg in args:
-            if isinstance(arg, str):
-                if date_pattern.match(arg):
-                    if not from_date:
-                        from_date = arg
-                    elif not to_date:
-                        to_date = arg
-                elif arg.upper() in ["1D", "1W", "1M", "3M", "6M", "1Y"]:
-                    period = arg.upper()
-                else:
-                    symbol = arg.upper()
-
-        # --- Compute date range from period --- #
-        if period:
-            delta_map = {
-                "1D": timedelta(days=1),
-                "1W": timedelta(weeks=1),
-                "1M": timedelta(days=30),
-                "3M": timedelta(days=90),
-                "6M": timedelta(days=180),
-                "1Y": timedelta(days=365),
-            }
-            delta = delta_map.get(period, timedelta(days=365))
-            from_date = (today - delta).strftime("%d-%m-%Y")
-            to_date = to_date or today_str
-
-        from_date = from_date or today_str
-        to_date = to_date or today_str
-
-        # --- Rotate User-Agent --- #
-        self.rotate_user_agent()
-
-        # --- URLs --- #
-        ref_url = "https://www.nseindia.com/report-detail/display-bulk-and-block-deals"
-        base_url = "https://www.nseindia.com/api/historicalOR/bulk-block-short-deals"
-
-        if symbol:
-            api_url = f"{base_url}?optionType=bulk_deals&symbol={symbol}&from={from_date}&to={to_date}&csv=true"
-        else:
-            api_url = f"{base_url}?optionType=bulk_deals&from={from_date}&to={to_date}&csv=true"
-
-        # --- Fetch data --- #
-        try:
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()
-
-            # Retry with exponential backoff
-            for attempt in range(3):
-                try:
-                    response = self.session.get(
-                        api_url,
-                        headers=self.headers,
-                        cookies=ref_response.cookies.get_dict(),
-                        timeout=10,
-                    )
-                    response.raise_for_status()
-                    break
-                except requests.RequestException as e:
-                    if attempt < 2:
-                        wait_time = 2 ** attempt
-                        print(f"⚠️ Attempt {attempt + 1} failed ({e}); retrying in {wait_time}s...")
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        raise
-
-            # --- Detect non-CSV (HTML error page) --- #
-            if "text/html" in response.headers.get("Content-Type", ""):
-                print("⚠️ NSE returned HTML instead of CSV. Headers or session may be invalid.")
-                return None
-
-            # --- Read CSV with UTF-8 BOM handling at byte level --- #
-            # Decode response content and strip BOM at byte level
-            content = response.content
-            if content.startswith(b'\xef\xbb\xbf'):  # Check for UTF-8 BOM
-                content = content[3:]  # Remove BOM
-            cleaned_text = content.decode('utf-8')
-            df = pd.read_csv(StringIO(cleaned_text))
-
-            # --- Handle empty or invalid response --- #
-            if df.empty or len(df.columns) < 2:
-                print(f"ℹ️ No bulk deal data found for {symbol or 'ALL'} between {from_date} and {to_date}")
-                return None
-
-            # --- 🔹 FIX 1: Clean Headers (Quotes + Spaces) --- #
-            df.columns = [c.strip().replace('"', '') for c in df.columns]
-            df.rename(columns=lambda x: x.strip(), inplace=True)  # Ensure no leading/trailing spaces
-
-            # --- 🔹 FIX 2: Clean numeric columns safely --- #
-            for col in df.columns:
-                if df[col].dtype == object:
-                    df[col] = df[col].astype(str).str.replace(",", "", regex=False).str.strip()
-                    try:
-                        df[col] = pd.to_numeric(df[col])
-                    except Exception:
-                        pass
-
-            # --- Sort and format dates --- #
-            if "Date" in df.columns:
-                df["Date"] = pd.to_datetime(df["Date"], errors="coerce", format="%d-%b-%Y")
-                df = df.sort_values("Date", ascending=False).reset_index(drop=True)
-                df["Date"] = df["Date"].dt.strftime("%d-%b-%Y")
-
-            # --- Final cleanup --- #
-            df = df.fillna("").replace({float("inf"): "", float("-inf"): ""})
-            return df
-
-        except Exception as e:
-            print(f"❌ Error fetching bulk deals: {e}")
-            return None
-        
-    def cm_hist_block_deals(self, *args, from_date=None, to_date=None, period=None, symbol=None):
-        """
-        Fetch Historical NSE block Deals (CSV Mode)
-        Auto-detects date range, symbol, and period.
-
-        Usage Examples:
-        ----------------
-        get.cm_hist_block_deals()                              # Today's data for all symbols
-        get.cm_hist_block_deals("1W")                          # 1 week for all symbols
-        get.cm_hist_block_deals("01-10-2025")                  # From date, Auto Today date for all symbols
-        get.cm_hist_block_deals("01-10-2025", "17-10-2025")    # Custom range for all symbols
-        get.cm_hist_block_deals("RELIANCE")                    # Today for symbol
-        get.cm_hist_block_deals("RELIANCE", "1M")              # 1 month for symbol
-        get.cm_hist_block_deals("RELIANCE", "01-10-2025")      # From date, Auto Today date for symbols
-        get.cm_hist_block_deals("RELIANCE", "01-10-2025", "17-10-2025")  # Range for symbol
-        """
-
-        date_pattern = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-        today = datetime.now()
-        today_str = today.strftime("%d-%m-%Y")
-
-        for arg in args:
-            if isinstance(arg, str):
-                if date_pattern.match(arg):
-                    if not from_date:
-                        from_date = arg
-                    elif not to_date:
-                        to_date = arg
-                elif arg.upper() in ["1D", "1W", "1M", "3M", "6M", "1Y"]:
-                    period = arg.upper()
-                else:
-                    symbol = arg.upper()
-
-        # --- Compute date range from period --- #
-        if period:
-            delta_map = {
-                "1D": timedelta(days=1),
-                "1W": timedelta(weeks=1),
-                "1M": timedelta(days=30),
-                "3M": timedelta(days=90),
-                "6M": timedelta(days=180),
-                "1Y": timedelta(days=365),
-            }
-            delta = delta_map.get(period, timedelta(days=365))
-            from_date = (today - delta).strftime("%d-%m-%Y")
-            to_date = to_date or today_str
-
-        from_date = from_date or today_str
-        to_date = to_date or today_str
-
-        # --- Rotate User-Agent --- #
-        self.rotate_user_agent()
-
-        # --- URLs --- #
-        ref_url = "https://www.nseindia.com/report-detail/display-bulk-and-block-deals"
-        base_url = "https://www.nseindia.com/api/historicalOR/bulk-block-short-deals"
-
-        if symbol:
-            api_url = f"{base_url}?optionType=block_deals&symbol={symbol}&from={from_date}&to={to_date}&csv=true"
-        else:
-            api_url = f"{base_url}?optionType=block_deals&from={from_date}&to={to_date}&csv=true"
-
-        # --- Fetch data --- #
-        try:
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()
-
-            # Retry with exponential backoff
-            for attempt in range(3):
-                try:
-                    response = self.session.get(
-                        api_url,
-                        headers=self.headers,
-                        cookies=ref_response.cookies.get_dict(),
-                        timeout=10,
-                    )
-                    response.raise_for_status()
-                    break
-                except requests.RequestException as e:
-                    if attempt < 2:
-                        wait_time = 2 ** attempt
-                        print(f"⚠️ Attempt {attempt + 1} failed ({e}); retrying in {wait_time}s...")
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        raise
-
-            # --- Detect non-CSV (HTML error page) --- #
-            if "text/html" in response.headers.get("Content-Type", ""):
-                print("⚠️ NSE returned HTML instead of CSV. Headers or session may be invalid.")
-                return None
-
-            # --- Read CSV with UTF-8 BOM handling at byte level --- #
-            # Decode response content and strip BOM at byte level
-            content = response.content
-            if content.startswith(b'\xef\xbb\xbf'):  # Check for UTF-8 BOM
-                content = content[3:]  # Remove BOM
-            cleaned_text = content.decode('utf-8')
-            df = pd.read_csv(StringIO(cleaned_text))
-
-            # --- Handle empty or invalid response --- #
-            if df.empty or len(df.columns) < 2:
-                print(f"ℹ️ No block deal data found for {symbol or 'ALL'} between {from_date} and {to_date}")
-                return None
-
-            # --- 🔹 FIX 1: Clean Headers (Quotes + Spaces) --- #
-            df.columns = [c.strip().replace('"', '') for c in df.columns]
-            df.rename(columns=lambda x: x.strip(), inplace=True)  # Ensure no leading/trailing spaces
-
-            # --- 🔹 FIX 2: Clean numeric columns safely --- #
-            for col in df.columns:
-                if df[col].dtype == object:
-                    df[col] = df[col].astype(str).str.replace(",", "", regex=False).str.strip()
-                    try:
-                        df[col] = pd.to_numeric(df[col])
-                    except Exception:
-                        pass
-
-            # --- Sort and format dates --- #
-            if "Date" in df.columns:
-                df["Date"] = pd.to_datetime(df["Date"], errors="coerce", format="%d-%b-%Y")
-                df = df.sort_values("Date", ascending=False).reset_index(drop=True)
-                df["Date"] = df["Date"].dt.strftime("%d-%b-%Y")
-
-            # --- Final cleanup --- #
-            df = df.fillna("").replace({float("inf"): "", float("-inf"): ""})
-            return df
-
-        except Exception as e:
-            print(f"❌ Error fetching block deals: {e}")
-            return None    
-
-    def cm_hist_short_selling(self, *args, from_date=None, to_date=None, period=None, symbol=None):
-        """
-        Fetch Historical NSE Short Selling (CSV Mode)
-        Auto-detects date range, symbol, and period.
-
-        Usage Examples:
-        ----------------
-        get.cm_hist_short_selling()                              # Today's data for all symbols
-        get.cm_hist_short_selling("1W")                          # 1 week for all symbols
-        get.cm_hist_short_selling("01-10-2025")                  # From date, Auto Today date for all symbols
-        get.cm_hist_short_selling("01-10-2025", "17-10-2025")    # Custom range for all symbols
-        get.cm_hist_short_selling("RELIANCE")                    # Today for symbol
-        get.cm_hist_short_selling("RELIANCE", "1M")              # 1 month for symbol
-        get.cm_hist_short_selling("RELIANCE", "01-10-2025")      # From date, Auto Today date for symbols
-        get.cm_hist_short_selling("RELIANCE", "01-10-2025", "17-10-2025")  # Range for symbol
-        """
-
-        date_pattern = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-        today = datetime.now()
-        today_str = today.strftime("%d-%m-%Y")
-
-        for arg in args:
-            if isinstance(arg, str):
-                if date_pattern.match(arg):
-                    if not from_date:
-                        from_date = arg
-                    elif not to_date:
-                        to_date = arg
-                elif arg.upper() in ["1D", "1W", "1M", "3M", "6M", "1Y"]:
-                    period = arg.upper()
-                else:
-                    symbol = arg.upper()
-
-        # --- Compute date range from period --- #
-        if period:
-            delta_map = {
-                "1D": timedelta(days=1),
-                "1W": timedelta(weeks=1),
-                "1M": timedelta(days=30),
-                "3M": timedelta(days=90),
-                "6M": timedelta(days=180),
-                "1Y": timedelta(days=365),
-            }
-            delta = delta_map.get(period, timedelta(days=365))
-            from_date = (today - delta).strftime("%d-%m-%Y")
-            to_date = to_date or today_str
-
-        from_date = from_date or today_str
-        to_date = to_date or today_str
-
-        # --- Rotate User-Agent --- #
-        self.rotate_user_agent()
-
-        # --- URLs --- #
-        ref_url = "https://www.nseindia.com/report-detail/display-bulk-and-block-deals"
-        base_url = "https://www.nseindia.com/api/historicalOR/bulk-block-short-deals"
-
-        if symbol:
-            api_url = f"{base_url}?optionType=short_selling&symbol={symbol}&from={from_date}&to={to_date}&csv=true"
-        else:
-            api_url = f"{base_url}?optionType=short_selling&from={from_date}&to={to_date}&csv=true"
-
-        # --- Fetch data --- #
-        try:
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()
-
-            # Retry with exponential backoff
-            for attempt in range(3):
-                try:
-                    response = self.session.get(
-                        api_url,
-                        headers=self.headers,
-                        cookies=ref_response.cookies.get_dict(),
-                        timeout=10,
-                    )
-                    response.raise_for_status()
-                    break
-                except requests.RequestException as e:
-                    if attempt < 2:
-                        wait_time = 2 ** attempt
-                        print(f"⚠️ Attempt {attempt + 1} failed ({e}); retrying in {wait_time}s...")
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        raise
-
-            # --- Detect non-CSV (HTML error page) --- #
-            if "text/html" in response.headers.get("Content-Type", ""):
-                print("⚠️ NSE returned HTML instead of CSV. Headers or session may be invalid.")
-                return None
-
-            # --- Read CSV with UTF-8 BOM handling at byte level --- #
-            # Decode response content and strip BOM at byte level
-            content = response.content
-            if content.startswith(b'\xef\xbb\xbf'):  # Check for UTF-8 BOM
-                content = content[3:]  # Remove BOM
-            cleaned_text = content.decode('utf-8')
-            df = pd.read_csv(StringIO(cleaned_text))
-
-            # --- Handle empty or invalid response --- #
-            if df.empty or len(df.columns) < 2:
-                print(f"ℹ️ No Short Selling data found for {symbol or 'ALL'} between {from_date} and {to_date}")
-                return None
-
-            # --- 🔹 FIX 1: Clean Headers (Quotes + Spaces) --- #
-            df.columns = [c.strip().replace('"', '') for c in df.columns]
-            df.rename(columns=lambda x: x.strip(), inplace=True)  # Ensure no leading/trailing spaces
-
-            # --- 🔹 FIX 2: Clean numeric columns safely --- #
-            for col in df.columns:
-                if df[col].dtype == object:
-                    df[col] = df[col].astype(str).str.replace(",", "", regex=False).str.strip()
-                    try:
-                        df[col] = pd.to_numeric(df[col])
-                    except Exception:
-                        pass
-
-            # --- Sort and format dates --- #
-            if "Date" in df.columns:
-                df["Date"] = pd.to_datetime(df["Date"], errors="coerce", format="%d-%b-%Y")
-                df = df.sort_values("Date", ascending=False).reset_index(drop=True)
-                df["Date"] = df["Date"].dt.strftime("%d-%b-%Y")
-
-            # --- Final cleanup --- #
-            df = df.fillna("").replace({float("inf"): "", float("-inf"): ""})
-            return df
-
-        except Exception as e:
-            print(f"❌ Error fetching Short Selling: {e}")
-            return None
- 
-
-    def cm_dmy_biz_growth(self, *args, mode="monthly", month=None, year=None):
-        """
-        Fetch NSE historical business growth / capital market data:
-        yearly, monthly, or daily, cleaned, renamed, and JSON-serializable.
-
-        Returns
-        -------
-        List of dicts (JSON-ready), missing/null values replaced with "-"
-        """
-
-        now = datetime.now()
-
-        # --- Month mapping ---
-        month_map = {
-            "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
-            "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12
-        }
-        reverse_month_map = {v: k for k, v in month_map.items()}
-
-        # --- Auto-detect arguments ---
-        for arg in args:
-            if isinstance(arg, str):
-                arg_upper = arg.strip().upper()
-                if arg_upper in ["YEARLY", "MONTHLY", "DAILY"]:
-                    mode = arg_upper.lower()
-                elif arg_upper.isdigit() and len(arg_upper) == 4:
-                    year = int(arg_upper)
-                elif arg_upper[:3] in month_map:
-                    month = month_map[arg_upper[:3]]
-            elif isinstance(arg, int):
-                if 1900 <= arg <= 2100:
-                    year = arg
-                elif 1 <= arg <= 12:
-                    month = arg
-
-        # --- Defaults ---
-        if year is None:
-            year = now.year
-        if month is None:
-            month = now.month
-
-        # --- Prepare URLs ---
-        self.rotate_user_agent()
-        ref_url = "https://www.nseindia.com"
-
-        if mode.lower() == "yearly":
-            api_url = "https://www.nseindia.com/api/historicalOR/cm/tbg/yearly"
-        elif mode.lower() == "monthly":
-            from_year = year
-            to_year = year + 1
-            api_url = f"https://www.nseindia.com/api/historicalOR/cm/tbg/monthly?from={from_year}&to={to_year}"
-        elif mode.lower() == "daily":
-            # Convert month to 3-letter title case (Jan, Feb, Mar...)
-            month_str = reverse_month_map.get(month, str(month)).title()  
-            year_str = f"{year % 100:02d}"  # 2025 -> "25"
-            api_url = f"https://www.nseindia.com/api/historicalOR/cm/tbg/daily?month={month_str}&year={year_str}"
-        else:
-            raise ValueError("Invalid mode. Use 'yearly', 'monthly', or 'daily'")
-
-        try:
-            # --- Get cookies ---
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()
-
-            # --- Fetch API data ---
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()
-            raw_data = response.json()
-
-            # --- Extract 'data' depending on mode ---
-            data_list = []
-
-            if mode.lower() in ["yearly", "monthly"]:
-                data_list = [d["data"] for d in raw_data.get("data", []) if "data" in d]
-            elif mode.lower() == "daily":
-                raw_daily = raw_data.get("data", [])
-                for item in raw_daily:
-                    if "data" in item:
-                        data_list.append(item["data"])
-                    else:
-                        data_list.append(item)
-
-            if not data_list:
-                print("⚠️ No valid data found.")
-                return None
-
-            df = pd.DataFrame(data_list)
-
-            # --- Clean numeric columns ---
-            for col in df.columns:
-                if df[col].dtype == object:
-                    df[col] = df[col].astype(str).str.replace(",", "").str.strip()
-                    df[col] = df[col].replace({"None": "-", "nan": "-", "NaN": "-", "": "-", pd.NA: "-"})
-
-                    # Convert numeric strings to int/float where possible
-                    def to_numeric_or_keep(x):
-                        try:
-                            return pd.to_numeric(x)
-                        except:
-                            return x
-                    df[col] = df[col].apply(to_numeric_or_keep)
-
-            # --- Rename columns ---
-            if mode.lower() == "yearly":
-                df.rename(columns={
-                    "GLY_MONTH_YEAR": "FY",
-                    "GLY_NO_OF_CO_LISTED": "No_of_Cos_Listed",
-                    "GLY_NO_OF_CO_PERMITTED": "No_of_Cos_Permitted",
-                    "GLY_NO_OF_CO_AVAILABLE": "No_of_Cos_Available",
-                    "GTY_NO_OF_TRADING_DAYS": "Trading_Days",
-                    "GTY_NO_OF_SECURITIES_TRADED": "Securities_Traded",
-                    "GTY_NO_OF_TRADES": "No_of_Trades",
-                    "GTY_TRADED_QTY": "Traded_Qty",
-                    "GTY_TURNOVER": "Turnover",
-                    "GTY_AVG_DLY_TURNOVER": "Avg_Daily_Turnover",
-                    "GTY_AVG_TRD_SIZE": "Avg_Trade_Size",
-                    "GTY_DEMAT_SECURITIES_TRADED": "Demat_Securities_Traded",
-                    "GTY_DEMAT_TURNOVER": "Demat_Turnover",
-                    "GTY_MKT_CAP": "Market_Cap"
-                }, inplace=True)
-            elif mode.lower() == "monthly":
-                df.rename(columns={
-                    "GLM_MONTH_YEAR": "Month",
-                    "GLM_NO_OF_CO_LISTED": "No_of_Cos_Listed",
-                    "GLM_NO_OF_CO_PERMITTED": "No_of_Cos_Permitted",
-                    "GLM_NO_OF_CO_AVAILABLE": "No_of_Cos_Available",
-                    "GTM_NO_OF_TRADING_DAYS": "Trading_Days",
-                    "GTM_NO_OF_SECURITIES_TRADED": "Securities_Traded",
-                    "GTM_NO_OF_TRADES": "No_of_Trades",
-                    "GTM_TRADED_QTY": "Traded_Qty",
-                    "GTM_TURNOVER": "Turnover",
-                    "GTM_AVG_DLY_TURNOVER": "Avg_Daily_Turnover",
-                    "GTM_AVG_TRD_SIZE": "Avg_Trade_Size",
-                    "GTM_DEMAT_SECURITIES_TRADED": "Demat_Securities_Traded",
-                    "GTM_DEMAT_TURNOVER": "Demat_Turnover",
-                    "GTM_MKT_CAP": "Market_Cap"
-                }, inplace=True)
-            elif mode.lower() == "daily":
-                df.rename(columns={
-                    "F_TIMESTAMP": "Date",
-                    "CDT_NOS_OF_SECURITY_TRADES": "No_of_Security_Trades",
-                    "CDT_NOS_OF_TRADES": "No_of_Trades",
-                    "CDT_TRADES_QTY": "Traded_Qty",
-                    "CDT_TRADES_VALUES": "Turnover"
-                }, inplace=True)
-
-            # --- Make JSON-serializable ---
-            df_json_ready = df.astype(object)  # convert int64/float64 to native Python types
-            return df_json_ready.to_dict(orient='records')
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"❌ Error fetching capital market data: {e}")
-            return None
-
-
-    def cm_monthly_settlement_report(self, *args, from_year=None, to_year=None, period=None):
-        """
-        Fetch NSE Monthly Settlement Statistics (Cash Market) for multiple financial years (Apr–Mar),
-        including past financial years and current FY up to the latest available month.
+        df   = pd.DataFrame(data)
+        cols = [
+            "symbol", "name", "pr_and_prgrp", "public_val", "employeeTrusts",
+            "revisedStatus", "date", "submissionDate", "revisionDate",
+            "xbrl", "broadcastDate", "systemDate", "timeDifference",
+        ]
+        return _keep_cols(df, cols) if not df.empty else None
+
+    def cm_live_hist_br_sr(
+        self,
+        *args,
+        from_date: str | None = None,
+        to_date:   str | None = None,
+        symbol:    str | None = None,
+    ) -> pd.DataFrame | None:
+        """Return Business Responsibility and Sustainability Report (BR/SR) filings.
 
         Parameters
         ----------
         *args : str
-            Can contain specific years or period like "1Y", "2Y", "3Y", "5Y".
-        from_year : int, optional
-            Start financial year (YYYY).
-        to_year : int, optional
-            End financial year (YYYY).
+            Positional shorthand — symbol, date range, or both.
+        from_date : str, optional
+            Start date in ``DD-MM-YYYY``.
+        to_date : str, optional
+            End date in ``DD-MM-YYYY``.
+        symbol : str, optional
+            NSE equity symbol.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Columns: symbol, companyName, fyFrom, fyTo,
+            submissionDate, revisionDate.
+
+        Examples
+        --------
+        >>> nse.cm_live_hist_br_sr()
+        >>> nse.cm_live_hist_br_sr("RELIANCE")
+        >>> nse.cm_live_hist_br_sr("01-01-2025", "15-10-2025")
+        >>> nse.cm_live_hist_br_sr("RELIANCE", "01-01-2025", "15-10-2025")
+        """
+        cols = ["symbol", "companyName", "fyFrom", "fyTo", "submissionDate", "revisionDate"]
+        return self._corp_filing(
+            "https://www.nseindia.com/companies-listing/"
+            "corporate-filings-bussiness-sustainabilitiy-reports",
+            "https://www.nseindia.com/api/corporate-bussiness-sustainabilitiy",
+            *args,
+            from_date=from_date, to_date=to_date, symbol=symbol,
+            keep_cols=cols,
+        )
+
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ── CM — EOD ────────────────────────────────────────────────────────────
+
+    def cm_eod_fii_dii_activity(self, exchange: str = "All") -> pd.DataFrame | None:
+        """
+        Return the latest FII and DII activity data.
+
+        Parameters
+        ----------
+        exchange : str, optional
+            ``"Nse"`` for NSE-only data, or ``"All"`` (default) for combined.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.cm_eod_fii_dii_activity()
+        >>> nse.cm_eod_fii_dii_activity("Nse")
+        """
+        self.rotate_user_agent()
+        ep = {
+            "Nse": "https://www.nseindia.com/api/fiidiiTradeNse",
+            "All": "https://www.nseindia.com/api/fiidiiTradeReact",
+        }
+        try:
+            resp = self._warm_and_fetch(
+                "https://www.nseindia.com/reports/fii-dii",
+                ep.get(exchange, ep["All"]),
+                timeout=10
+            )
+            return pd.DataFrame(resp.json())
+        except Exception as exc:
+            self._log_error("cm_eod_fii_dii_activity", exc)
+            return None
+
+    def cm_eod_market_activity_report(self, trade_date: str) -> list | None:
+        """
+        Return the raw market activity report (CSV rows) for a trade date.
+
+        Parameters
+        ----------
+        trade_date : str
+            Date in ``DD-MM-YY`` (two-digit year) format, e.g.
+            ``"17-10-25"``.
+
+        Returns
+        -------
+        list or None
+            List of CSV rows; each row is a list of strings.
+
+        Examples
+        --------
+        >>> nse.cm_eod_market_activity_report("17-10-25")
+        """
+        self.rotate_user_agent()
+        try:
+            raw = self._get_archive(
+                f"https://nsearchives.nseindia.com/archives/equities/mkt/"
+                f"MA{_fmt_trade_date(trade_date, '%d%m%y')}.csv"
+            )
+            return list(csv.reader(raw.decode("utf-8", "ignore").splitlines())) if raw else None
+        except Exception as exc:
+            self._log_error("cm_eod_market_activity_report", exc)
+            return None
+
+    def cm_eod_bhavcopy_with_delivery(self, trade_date: str) -> pd.DataFrame | None:
+        """
+        Download the full CM bhavcopy with delivery data for a trade date.
+
+        Parameters
+        ----------
+        trade_date : str
+            Date in ``DD-MM-YYYY`` format.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Full bhavcopy with delivery percentage column.
+
+        Examples
+        --------
+        >>> nse.cm_eod_bhavcopy_with_delivery("17-10-2025")
+        """
+        dt  = _fmt_trade_date(trade_date)
+        raw = self._get_archive(
+            f"https://nsearchives.nseindia.com/products/content/"
+            f"sec_bhavdata_full_{dt}.csv"
+        )
+        if not raw:
+            return None
+        df = pd.read_csv(BytesIO(raw))
+        df.columns        = [c.replace(" ", "") for c in df.columns]
+        df["SERIES"]      = df["SERIES"].str.replace(" ", "")
+        df["DATE1"]       = df["DATE1"].str.replace(" ", "")
+        return df
+
+    def cm_eod_equity_bhavcopy(self, trade_date: str) -> pd.DataFrame | None:
+        """
+        Download the NSE CM equity bhavcopy (EQ series only) for a trade date.
+
+        Parameters
+        ----------
+        trade_date : str
+            Date in ``DD-MM-YYYY`` format.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            EQ-series rows only from the bhavcopy archive.
+
+        Examples
+        --------
+        >>> nse.cm_eod_equity_bhavcopy("17-10-2025")
+        """
+        dt  = _fmt_trade_date(trade_date, "%Y%m%d")
+        raw = self._get_archive(
+            f"https://nsearchives.nseindia.com/content/cm/"
+            f"BhavCopy_NSE_CM_0_0_0_{dt}_F_0000.csv.zip"
+        )
+        if not raw:
+            return None
+        df = self._zip_csv(raw)
+        return df[df["SctySrs"] == "EQ"].reset_index(drop=True) if not df.empty else None
+
+    def cm_eod_52_week_high_low(self, trade_date: str) -> list | None:
+        """
+        Return 52-week high/low CSV rows for a trade date.
+
+        Parameters
+        ----------
+        trade_date : str
+            Date in ``DD-MM-YYYY`` format.
+
+        Returns
+        -------
+        list or None
+            List of CSV rows (each row is a list of strings).
+
+        Examples
+        --------
+        >>> nse.cm_eod_52_week_high_low("17-10-2025")
+        """
+        try:
+            dt  = _fmt_trade_date(trade_date)
+            raw = self._get_archive(
+                f"https://nsearchives.nseindia.com/content/"
+                f"CM_52_wk_High_low_{dt}.csv"
+            )
+            return list(csv.reader(raw.decode("utf-8", "ignore").splitlines())) if raw else None
+        except Exception as exc:
+            self._log_error("cm_eod_52_week_high_low", exc)
+            return None
+
+    def cm_eod_bulk_deal(self)  -> pd.DataFrame | None:
+        """Return the latest bulk deals CSV from NSE archives.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.cm_eod_bulk_deal()
+        """
+        return self._get_csv_archive(
+            "https://nsearchives.nseindia.com/content/equities/bulk.csv"
+        )
+
+    def cm_eod_block_deal(self) -> pd.DataFrame | None:
+        """Return the latest block deals CSV from NSE archives.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.cm_eod_block_deal()
+        """
+        return self._get_csv_archive(
+            "https://nsearchives.nseindia.com/content/equities/block.csv"
+        )
+
+    def cm_eod_series_change(self) -> pd.DataFrame | None:
+        """Return the latest series-change CSV from NSE archives.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.cm_eod_series_change()
+        """
+        return self._get_csv_archive(
+            "https://nsearchives.nseindia.com/content/equities/series_change.csv"
+        )
+
+    def cm_eod_shortselling(self, trade_date: str) -> pd.DataFrame | None:
+        """Return the short-selling data for a trade date.
+
+        Parameters
+        ----------
+        trade_date : str
+            Date in ``DD-MM-YYYY`` format.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.cm_eod_shortselling("17-10-2025")
+        """
+        return self._get_csv_archive(
+            f"https://nsearchives.nseindia.com/archives/equities/shortSelling/"
+            f"shortselling_{_fmt_trade_date(trade_date).upper()}.csv"
+        )
+
+    def cm_eod_surveillance_indicator(self, trade_date: str) -> pd.DataFrame | None:
+        """
+        Return the GSM/ASM surveillance indicator file for a trade date.
+
+        Parameters
+        ----------
+        trade_date : str
+            Date in ``DD-MM-YY`` (two-digit year) format, e.g.
+            ``"17-10-25"``.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.cm_eod_surveillance_indicator("17-10-25")
+        """
+        dt  = datetime.strptime(trade_date, "%d-%m-%y")
+        raw = self._get_archive(
+            f"https://nsearchives.nseindia.com/content/cm/"
+            f"REG1_IND{dt.strftime('%d%m%y').upper()}.csv"
+        )
+        if not raw:
+            return None
+        df = pd.read_csv(BytesIO(raw))
+        cols = df.loc[:, "GSM":"Filler31"].columns
+        df[cols] = df[cols].astype("object").replace(100, "")
+
+        return df
+
+    def cm_eod_eq_band_changes(self, trade_date: str) -> pd.DataFrame | None:
+        """Return price-band changes for a trade date.
+
+        Parameters
+        ----------
+        trade_date : str
+            Date in ``DD-MM-YYYY`` format.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.cm_eod_eq_band_changes("17-10-2025")
+        """
+        return self._get_csv_archive(
+            f"https://nsearchives.nseindia.com/content/equities/"
+            f"eq_band_changes_{_fmt_trade_date(trade_date).upper()}.csv"
+        )
+
+    def cm_eod_eq_price_band(self, trade_date: str) -> pd.DataFrame | None:
+        """Return the full price-band list for a trade date.
+
+        Parameters
+        ----------
+        trade_date : str
+            Date in ``DD-MM-YYYY`` format.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.cm_eod_eq_price_band("17-10-2025")
+        """
+        return self._get_csv_archive(
+            f"https://nsearchives.nseindia.com/content/equities/"
+            f"sec_list_{_fmt_trade_date(trade_date).upper()}.csv"
+        )
+
+    def cm_eod_pe_ratio(self, trade_date: str) -> pd.DataFrame | None:
+        """Return the P/E ratio file for a trade date.
+
+        Parameters
+        ----------
+        trade_date : str
+            Date in ``DD-MM-YY`` (two-digit year) format.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.cm_eod_pe_ratio("17-10-25")
+        """
+        return self._get_csv_archive(
+            f"https://nsearchives.nseindia.com/content/equities/peDetail/"
+            f"PE_{_fmt_trade_date(trade_date, '%d%m%y').upper()}.csv"
+        )
+
+    def cm_eod_mcap(self, trade_date: str) -> pd.DataFrame | None:
+        """
+        Return the market-capitalisation file for a trade date.
+
+        Extracted from the bhavcopy ZIP archive (``mcap*.csv`` member).
+
+        Parameters
+        ----------
+        trade_date : str
+            Date in ``DD-MM-YY`` (two-digit year) format.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.cm_eod_mcap("17-10-25")
+        """
+        raw = self._get_archive(
+            f"https://nsearchives.nseindia.com/archives/equities/bhavcopy/pr/"
+            f"PR{_fmt_trade_date(trade_date, '%d%m%y').upper()}.zip"
+        )
+        if not raw:
+            return None
+        with zipfile.ZipFile(BytesIO(raw), "r") as zf:
+            for name in zf.namelist():
+                if name.lower().startswith("mcap") and name.endswith(".csv"):
+                    return pd.read_csv(zf.open(name))
+        return None
+
+    def cm_eod_eq_name_change(self) -> pd.DataFrame | None:
+        """Return the full historical equity name-change register.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Sorted descending by effective date.
+
+        Examples
+        --------
+        >>> nse.cm_eod_eq_name_change()
+        """
+        return self._name_change_csv(
+            "https://nsearchives.nseindia.com/content/equities/namechange.csv",
+            has_header=True,
+        )
+
+    def cm_eod_eq_symbol_change(self) -> pd.DataFrame | None:
+        """Return the full historical equity symbol-change register.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Sorted descending by effective date.
+
+        Examples
+        --------
+        >>> nse.cm_eod_eq_symbol_change()
+        """
+        return self._name_change_csv(
+            "https://nsearchives.nseindia.com/content/equities/symbolchange.csv",
+            has_header=False,
+        )
+
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ── CM — Historical ─────────────────────────────────────────────────────
+
+    def cm_hist_eq_price_band(
+        self,
+        *args,
+        from_date: str | None = None,
+        to_date:   str | None = None,
+        period:    str | None = None,
+        symbol:    str | None = None,
+    ) -> pd.DataFrame | None:
+        """
+        Return historical price-band changes for equities.
+
+        Parameters
+        ----------
+        *args : str
+            Positional shorthand — symbol, date range, or period.
+        from_date : str, optional
+            Start date in ``DD-MM-YYYY``.
+        to_date : str, optional
+            End date in ``DD-MM-YYYY``.
         period : str, optional
-            Number of past financial years, e.g., "2Y".
+            Shorthand: ``"1D"``, ``"1W"``, ``"1M"``, ``"3M"``, ``"6M"``,
+            ``"1Y"``.
+        symbol : str, optional
+            NSE equity symbol.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.cm_hist_eq_price_band()
+        >>> nse.cm_hist_eq_price_band("1W")
+        >>> nse.cm_hist_eq_price_band("01-10-2025")
+        >>> nse.cm_hist_eq_price_band("15-10-2025", "17-10-2025")
+        >>> nse.cm_hist_eq_price_band("WEWIN")
+        >>> nse.cm_hist_eq_price_band("WEWIN", "1Y")
+        >>> nse.cm_hist_eq_price_band("DSSL", "01-10-2025", "17-10-2025")
+        """
+        from_date, to_date, period, symbol = _unpack_args(
+            args, from_date, to_date, period, symbol, short=True
+        )
+
+        today              = datetime.now().strftime("%d-%m-%Y")
+        from_date, to_date = _resolve_dates(from_date, to_date, period)
+        from_date          = from_date or today
+        to_date            = to_date   or today
+
+        ref_url = "https://www.nseindia.com/reports/price-band-changes"
+        api_url = (
+            f"https://www.nseindia.com/api/eqsurvactions"
+            f"?from_date={from_date}&to_date={to_date}&symbol={symbol}&csv=true"
+            if symbol
+            else
+            f"https://www.nseindia.com/api/eqsurvactions"
+            f"?from_date={from_date}&to_date={to_date}&csv=true"
+        )
+        return self._get_csv_session(ref_url, api_url)
+
+    def cm_hist_security_wise_data(
+        self,
+        *args,
+        from_date: str | None = None,
+        to_date:   str | None = None,
+        period:    str | None = None,
+        symbol:    str | None = None,
+    ) -> pd.DataFrame | None:
+        """
+        Return historical price, volume, and delivery data for a symbol.
+
+        Parameters
+        ----------
+        *args : str
+            Positional shorthand — symbol, date range, or period.
+        from_date : str, optional
+            Start date in ``DD-MM-YYYY``.
+        to_date : str, optional
+            End date in ``DD-MM-YYYY``.
+        period : str, optional
+            Shorthand: ``"1D"`` – ``"1Y"``.
+        symbol : str, optional
+            NSE equity symbol. Required if not passed positionally.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Columns: Symbol, Series, Date, Prev Close, Open Price,
+            High Price, Low Price, Last Price, Close Price, VWAP,
+            Total Traded Quantity, Turnover ₹, No. of Trades,
+            Deliverable Qty, % Dly Qt to Traded Qty.
+
+        Examples
+        --------
+        >>> nse.cm_hist_security_wise_data("RELIANCE")
+        >>> nse.cm_hist_security_wise_data("RELIANCE", "1Y")
+        >>> nse.cm_hist_security_wise_data("RELIANCE", "01-10-2025", "17-10-2025")
+        """
+        from_date, to_date, period, symbol = _unpack_args(
+            args, from_date, to_date, period, symbol, short=True
+        )
+        from_date, to_date = _resolve_dates(from_date, to_date, period)
+
+        ref_url = "https://www.nseindia.com/report-detail/eq_security"
+        api_tpl = (
+            f"https://www.nseindia.com/api/historicalOR/"
+            f"generateSecurityWiseHistoricalData"
+            f"?from={{}}&to={{}}&symbol={symbol}&type=priceVolumeDeliverable&series=ALL"
+        )
+        records = self._get_chunked(ref_url, api_tpl, from_date, to_date)
+        if not records:
+            return None
+
+        col_map = {
+            "CH_SYMBOL":            "Symbol",
+            "CH_SERIES":            "Series",
+            "mTIMESTAMP":           "Date",
+            "CH_PREVIOUS_CLS_PRICE":"Prev Close",
+            "CH_OPENING_PRICE":     "Open Price",
+            "CH_TRADE_HIGH_PRICE":  "High Price",
+            "CH_TRADE_LOW_PRICE":   "Low Price",
+            "CH_LAST_TRADED_PRICE": "Last Price",
+            "CH_CLOSING_PRICE":     "Close Price",
+            "VWAP":                 "VWAP",
+            "CH_TOT_TRADED_QTY":    "Total Traded Quantity",
+            "CH_TOT_TRADED_VAL":    "Turnover ₹",
+            "CH_TOTAL_TRADES":      "No. of Trades",
+            "COP_DELIV_QTY":        "Deliverable Qty",
+            "COP_DELIV_PERC":       "% Dly Qt to Traded Qty",
+        }
+        df = pd.DataFrame(records)
+        df = _keep_cols(df, col_map).rename(columns=col_map)
+        df.replace({float("inf"): 0, float("-inf"): 0}, inplace=True)
+        df.fillna(0, inplace=True)
+        df = _sort_dedup_dates(df, "Date", fmt="%d-%b-%Y", ascending=True)
+        return df
+
+    def cm_hist_bulk_deals(self,  *args, **kw) -> pd.DataFrame | None:
+        """Return historical bulk-deal records.
+
+        Parameters
+        ----------
+        *args : str
+            Positional shorthand — symbol, date range, or period
+            (``"1D"``, ``"1W"``, ``"1M"``, ``"3M"``, ``"6M"``, ``"1Y"``).
+        **kw
+            Keyword overrides: ``symbol``, ``from_date``, ``to_date``,
+            ``period``.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.cm_hist_bulk_deals()
+        >>> nse.cm_hist_bulk_deals("1W")
+        >>> nse.cm_hist_bulk_deals("01-10-2025")
+        >>> nse.cm_hist_bulk_deals("RELIANCE")
+        >>> nse.cm_hist_bulk_deals("DSSL", "1Y")
+        >>> nse.cm_hist_bulk_deals("DSSL", "01-10-2025", "17-10-2025")
+        """
+        return self._hist_deal_csv("bulk_deals",   *args, **kw)
+
+    def cm_hist_block_deals(self, *args, **kw) -> pd.DataFrame | None:
+        """Return historical block-deal records.
+
+        Parameters
+        ----------
+        *args : str
+            Positional shorthand — symbol, date range, or period.
+        **kw
+            Keyword overrides: ``symbol``, ``from_date``, ``to_date``,
+            ``period``.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.cm_hist_block_deals()
+        >>> nse.cm_hist_block_deals("1W")
+        >>> nse.cm_hist_block_deals("RELIANCE")
+        >>> nse.cm_hist_block_deals("DSSL", "01-10-2025", "17-10-2025")
+        """
+        return self._hist_deal_csv("block_deals",  *args, **kw)
+
+    def cm_hist_short_selling(self, *args, **kw) -> pd.DataFrame | None:
+        """Return historical short-selling records.
+
+        Parameters
+        ----------
+        *args : str
+            Positional shorthand — symbol, date range, or period.
+        **kw
+            Keyword overrides: ``symbol``, ``from_date``, ``to_date``,
+            ``period``.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.cm_hist_short_selling()
+        >>> nse.cm_hist_short_selling("1W")
+        >>> nse.cm_hist_short_selling("RELIANCE")
+        >>> nse.cm_hist_short_selling("DSSL", "01-10-2025", "17-10-2025")
+        """
+        return self._hist_deal_csv("short_selling", *args, **kw)
+
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ── CM — Periodic Reports ───────────────────────────────────────────────
+
+    def cm_dmy_biz_growth(
+        self,
+        *args,
+        mode:  str          = "daily",
+        month: int  | None  = None,
+        year:  int  | None  = None,
+    ) -> list[dict] | None:
+        """
+        Return Capital Market business-growth data (daily / monthly / yearly).
+
+        Parameters
+        ----------
+        *args : str or int
+            Positional shorthand — mode string, month name/number, or
+            4-digit year.
+        mode : str, optional
+            ``"daily"``, ``"monthly"`` (default), or ``"yearly"``.
+        month : int, optional
+            Month number 1–12 (only used for ``"daily"`` mode).
+        year : int, optional
+            4-digit year. Defaults to the current year.
+
+        Returns
+        -------
+        list of dict or None
+
+        Examples
+        --------
+        >>> nse.cm_dmy_biz_growth()
+        >>> nse.cm_dmy_biz_growth("monthly")
+        >>> nse.cm_dmy_biz_growth("yearly")
+        >>> nse.cm_dmy_biz_growth("daily", "OCT", 2025)
+        >>> nse.cm_dmy_biz_growth("monthly", 2025)
+        """
+        mode, month, year = _parse_biz_growth_args(args, month, year, mode)
+        return self._biz_growth_fetch("cm", mode, month, year)
+
+    def cm_monthly_settlement_report(
+        self,
+        *args,
+        from_year: int | None = None,
+        to_year:   int | None = None,
+        period:    str | None = None,
+    ) -> pd.DataFrame | None:
+        """
+        Return Capital Market monthly settlement statistics.
+
+        Parameters
+        ----------
+        *args : str or int
+            Positional shorthand — 4-digit year strings or period codes
+            such as ``"1Y"``, ``"2Y"``, ``"3Y"``.
+        from_year : int, optional
+            Start financial year, e.g. ``2024`` (for FY 2024-25).
+        to_year : int, optional
+            End financial year.
+        period : str, optional
+            Shorthand period: ``"1Y"``, ``"2Y"``, ``"3Y"``.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.cm_monthly_settlement_report()
+        >>> nse.cm_monthly_settlement_report("1Y")
+        >>> nse.cm_monthly_settlement_report("2024", 2026)
+        >>> nse.cm_monthly_settlement_report("3Y")
+        """
+        from_year, to_year, period = _parse_settlement_args(args, from_year, to_year, period)
+        return self._monthly_settlement(
+            from_year, to_year, period,
+            "https://www.nseindia.com/api/historicalOR/monthly-sett-stats-data?finYear={}-{}",
+            {
+                "ST_DATE":                   "Month",
+                "ST_SETTLEMENT_NO":          "Settlement No",
+                "ST_NO_OF_TRADES_LACS":      "No of Trades (lakhs)",
+                "ST_TRADED_QTY_LACS":        "Traded Qty (lakhs)",
+                "ST_DELIVERED_QTY_LACS":     "Delivered Qty (lakhs)",
+                "ST_PERC_DLVRD_TO_TRADED_QTY": "% Delivered to Traded Qty",
+                "ST_TURNOVER_CRORES":        "Turnover (₹ Cr)",
+                "ST_DELIVERED_VALUE_CRORES": "Delivered Value (₹ Cr)",
+                "ST_FUNDS_PAYIN_CRORES":     "Funds Payin (₹ Cr)",
+            },
+        )
+
+    def cm_monthly_most_active_equity(self) -> pd.DataFrame | None:
+        """Return the monthly most-active equities by turnover.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Columns: Security, No. of Trades, Traded Quantity (Lakh Shares),
+            Turnover (₹ Cr.), Avg Daily Turnover (₹ Cr.),
+            Share in Total Turnover (%), Month.
+
+        Examples
+        --------
+        >>> nse.cm_monthly_most_active_equity()
+        """
+        data = self._get_json(
+            "https://www.nseindia.com/historical/most-active-securities",
+            "https://www.nseindia.com/api/historicalOR/most-active-securities-monthly",
+        )
+        if not data or "data" not in data:
+            return None
+        _cols = [
+            "ASM_SECURITY", "ASM_NO_OF_TRADES", "ASM_TRADED_QUANTITY",
+            "ASM_TURNOVER", "ASM_AVG_DLY_TURNOVER",
+            "ASM_SHARE_IN_TOTAL_TURNOVER", "ASM_DATE",
+        ]
+        df = _keep_cols(pd.DataFrame(data["data"]), _cols).rename(columns={
+            "ASM_SECURITY":               "Security",
+            "ASM_NO_OF_TRADES":           "No. of Trades",
+            "ASM_TRADED_QUANTITY":        "Traded Quantity (Lakh Shares)",
+            "ASM_TURNOVER":               "Turnover (₹ Cr.)",
+            "ASM_AVG_DLY_TURNOVER":       "Avg Daily Turnover (₹ Cr.)",
+            "ASM_SHARE_IN_TOTAL_TURNOVER":"Share in Total Turnover (%)",
+            "ASM_DATE":                   "Month",
+        })
+        return _clean(df.fillna(0))
+
+    def historical_advances_decline(
+        self,
+        *args,
+        mode:  str       = "Month_wise",
+        month: int | None = None,
+        year:  int | None = None,
+    ) -> pd.DataFrame | None:
+        """
+        Return historical advances/declines data.
+
+        Parameters
+        ----------
+        *args : str or int
+            Positional shorthand — mode string, year, or month name/number.
+        mode : str, optional
+            ``"Month_wise"`` (default) or ``"Day_wise"``.
+        month : int, optional
+            Target month number (used for Day_wise mode).
+        year : int, optional
+            4-digit year. Defaults to current year.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Columns: Month (or Day), Advances, Declines, Adv_Decline_Ratio.
+
+        Examples
+        --------
+        >>> nse.historical_advances_decline()
+        >>> nse.historical_advances_decline("2025")
+        >>> nse.historical_advances_decline("Day_wise", "OCT", 2025)
+        >>> nse.historical_advances_decline("Month_wise", 2024)
+        """
+        now = datetime.now()
+        
+        # Bug 2 fix: normalise mode to uppercase before passing to parser
+        mode, month, year = _parse_year_month_args(
+            args, month, year, mode.upper(), ("MONTH_WISE", "DAY_WISE")
+        )
+        
+        if not year:
+            year = now.year
+        
+        # Bug 1 fix: decrement year BEFORE computing previous month
+        if not month:
+            if now.month == 1:
+                year -= 1
+            month = now.month - 1 or 12
+
+        ref = "https://www.nseindia.com/option-chain"
+        if mode.lower() == "month_wise":
+            api = f"https://www.nseindia.com/api/historicalOR/advances-decline-monthly?year={year}"
+        else:
+            mon_s = _NUM_MONTH.get(int(month), str(month)).upper()
+            api = (
+                f"https://www.nseindia.com/api/historicalOR/advances-decline-monthly"
+                f"?year={mon_s}-{year}"
+            )
+
+        df = self._json_data_df(ref, api)
+        if df is None:
+            return None
+
+        if mode.lower() == "month_wise":
+            cmap = {
+                "ADM_MONTH": "Month",
+                "ADM_ADVANCES": "Advances",
+                "ADM_DECLINES": "Declines",
+                "ADM_ADV_DCLN_RATIO": "Adv_Decline_Ratio",
+            }
+        else:
+            cmap = {
+                "ADD_DAY_STRING": "Day",
+                "ADD_ADVANCES": "Advances",
+                "ADD_DECLINES": "Declines",
+                "ADD_ADV_DCLN_RATIO": "Adv_Decline_Ratio",
+            }
+
+        # rename first
+        df = df.rename(columns=cmap)
+
+        # enforce column order safely
+        df = df.reindex(columns=cmap.values())
+
+        # convert numeric columns only
+        for col in ["Advances", "Declines", "Adv_Decline_Ratio"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        return _clean(df)
+
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ── FnO — Live ──────────────────────────────────────────────────────────
+
+    def symbol_full_fno_live_data(self, symbol: str) -> dict | None:
+        """Return all live F&O data (options + futures) for a symbol.
+
+        Parameters
+        ----------
+        symbol : str
+            NSE equity or index ticker, e.g. ``"TCS"``.
+
+        Returns
+        -------
+        dict or None
+            Raw JSON with all live derivative quotes.
+
+        Examples
+        --------
+        >>> nse.symbol_full_fno_live_data("TCS")
+        """
+        return self._get_json(
+            "https://www.nseindia.com/option-chain",
+            f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
+            f"?functionName=getSymbolDerivativesData&symbol={symbol}",
+        )
+
+    def symbol_specific_most_active_Calls_or_Puts_or_Contracts_by_OI(
+        self,
+        symbol:    str,
+        type_mode: str,
+    ) -> dict | None:
+        """
+        Return the most-active calls, puts, or contracts by OI for a symbol.
+
+        Parameters
+        ----------
+        symbol : str
+            NSE equity or index ticker.
+        type_mode : str
+            ``"C"`` / ``"CALL"`` / ``"CALLS"`` for most-active calls,
+            ``"P"`` / ``"PUT"`` / ``"PUTS"`` for puts, or
+            ``"O"`` / ``"OI"`` / ``"CONTRACTS"`` for contracts by OI.
+
+        Returns
+        -------
+        dict or None
+
+        Examples
+        --------
+        >>> nse.symbol_specific_most_active_Calls_or_Puts_or_Contracts_by_OI("TCS", "C")
+        >>> nse.symbol_specific_most_active_Calls_or_Puts_or_Contracts_by_OI("TCS", "P")
+        """
+        tmap = {
+            "C": "C", "CALL": "C", "CALLS": "C", "MOST ACTIVE CALLS": "C",
+            "P": "P", "PUT":  "P", "PUTS":  "P", "MOST ACTIVE PUTS":  "P",
+            "O": "O", "OI":   "O", "CONTRACTS": "O", "MOST ACTIVE CONTRACTS BY OI": "O",
+        }
+        key = type_mode.strip().upper()
+        if key not in tmap:
+            raise ValueError("Use C / P / O (or CALL/PUT/CONTRACTS)")
+        return self._get_json(
+            "https://www.nseindia.com/option-chain",
+            f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
+            f"?functionName=getDerivativesMostActive&symbol={symbol}&callType={tmap[key]}",
+        )
+
+    def identifier_based_fno_contracts_live_chart_data(self, identifier: str) -> dict | None:
+        """Return live intraday chart data for a contract by its full identifier.
+
+        Parameters
+        ----------
+        identifier : str
+            Full NSE contract identifier string, e.g.
+            ``"OPTSTKTCS30-12-2025CE3300.00"``.
+
+        Returns
+        -------
+        dict or None
+
+        Examples
+        --------
+        >>> nse.identifier_based_fno_contracts_live_chart_data("OPTSTKTCS30-12-2025CE3300.00")
+        """
+        return self._get_json(
+            "https://www.nseindia.com/option-chain",
+            f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
+            f"?functionName=getIntradayGraphDerivative"
+            f"&identifier={identifier}&type=W&token=1",
+        )
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    # VII. Derivatives (F&O)
+    # ══════════════════════════════════════════════════════════════════════════════
+
+    def fno_live_futures_data(self, symbol: str) -> pd.DataFrame | None:
+        """
+        Return live futures data for all expiries of a symbol.
+
+        Parameters
+        ----------
+        symbol : str
+            NSE equity or index ticker, e.g. ``"RELIANCE"``, ``"NIFTY"``.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Indexed by ``identifier``; columns include instrumentType,
+            expiryDate, OHLC, openInterest, changeinOpenInterest.
+
+        Examples
+        --------
+        >>> nse.fno_live_futures_data("RELIANCE")
+        >>> nse.fno_live_futures_data("NIFTY")
+        """
+        symbol = symbol.replace(" ", "%20").replace("&", "%26")
+        self.rotate_user_agent()
+
+        def _call():
+            resp = self._warm_and_fetch(
+                f"https://www.nseindia.com/get-quotes/derivatives?symbol={symbol}",
+                f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
+                f"?functionName=getSymbolDerivativesData&symbol={symbol}&instrumentType=FUT",
+                timeout=10
+            )
+            items = resp.json().get("data", [])
+            if not items:
+                raise ValueError("Empty response")
+            return items
+
+        try:
+            items = self._retry(_call)
+        except Exception as exc:
+            self._log_error("fno_live_futures_data", exc)
+            return None
+
+        df = pd.DataFrame(items).set_index("identifier")
+        num_cols = [
+            "openPrice", "highPrice", "lowPrice", "closePrice", "prevClose",
+            "lastPrice", "change", "totalTradedVolume", "totalTurnover",
+            "openInterest", "changeinOpenInterest", "pchangeinOpenInterest",
+            "underlyingValue", "ticksize", "pchange",
+        ]
+        for col in num_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        order = [
+            "instrumentType", "expiryDate", "optionType", "strikePrice",
+            "openPrice", "highPrice", "lowPrice", "closePrice", "prevClose",
+            "lastPrice", "change", "pchange", "totalTradedVolume", "totalTurnover",
+            "openInterest", "changeinOpenInterest", "pchangeinOpenInterest",
+            "underlyingValue", "volumeFreezeQuantity",
+        ]
+        return _keep_cols(df, order)
+
+    def fno_live_top_20_derivatives_contracts(
+        self,
+        category: str = "Stock Options",
+    ) -> pd.DataFrame | None:
+        """
+        Return the top-20 live derivative contracts for a category.
+
+        Parameters
+        ----------
+        category : str, optional
+            ``"Stock Futures"`` or ``"Stock Options"`` (default).
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Turnover columns are converted to ₹ Crore.
+
+        Examples
+        --------
+        >>> nse.fno_live_top_20_derivatives_contracts("Stock Futures")
+        >>> nse.fno_live_top_20_derivatives_contracts("Stock Options")
+        """
+        xref = {"Stock Futures": "stock_fut", "Stock Options": "stock_opt"}
+        if category not in xref:
+            raise ValueError("category must be 'Stock Futures' or 'Stock Options'")
+
+        resp = self._live_ref_fetch(
+            "https://www.nseindia.com/market-data/equity-derivatives-watch",
+            f"https://www.nseindia.com/api/liveEquity-derivatives?index={xref[category]}",
+        )
+        try:
+            df = pd.DataFrame(resp.json()["data"])
+            if df.empty:
+                return None
+
+            df.rename(columns={
+                "underlying":     "Symbol",
+                "identifier":     "Contract ID",
+                "instrumentType": "Instr Type",
+                "instrument":     "Segment",
+                "contract":       "Contract",
+                "expiryDate":     "Expiry",
+                "optionType":     "Option",
+                "strikePrice":    "Strike",
+                "lastPrice":      "LTP",
+                "change":         "Chg",
+                "pChange":        "Chg %",
+                "openPrice":      "Open",
+                "highPrice":      "High",
+                "lowPrice":       "Low",
+                "closePrice":     "Close",
+                "volume":         "Volume (Cntr)",
+                "totalTurnover":  "Turnover (₹)",
+                "premiumTurnOver":"Premium Turnover (₹)",
+                "underlyingValue":"Underlying LTP",
+                "openInterest":   "OI (Cntr)",
+                "noOfTrades":     "Trades",
+            }, inplace=True)
+
+            for col in ("Turnover (₹)", "Premium Turnover (₹)"):
+                if col in df.columns:
+                    df[col] = (df[col] / 1e7).round(2)
+            df.rename(columns={
+                "Turnover (₹)":         "Turnover (₹ Cr)",
+                "Premium Turnover (₹)": "Premium Turnover (₹ Cr)",
+            }, inplace=True)
+
+            order = [
+                "Segment", "Symbol", "Expiry", "Option", "Strike", "Close",
+                "LTP", "Chg", "Chg %", "Open", "High", "Low",
+                "Volume (Cntr)", "Trades", "OI (Cntr)",
+                "Premium Turnover (₹ Cr)", "Turnover (₹ Cr)",
+                "Contract", "Contract ID", "Underlying LTP",
+            ]
+            return _keep_cols(df, order)
+
+        except Exception as exc:
+            self._log_error("fno_live_top_20_derivatives_contracts", exc)
+            return None
+
+    def fno_live_most_active_futures_contracts(
+        self,
+        mode: str = "Volume",
+    ) -> pd.DataFrame | None:
+        """
+        Return the most active futures contracts ranked by volume or value.
+
+        Parameters
+        ----------
+        mode : str, optional
+            ``"Volume"`` (default) or ``"Value"``.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.fno_live_most_active_futures_contracts("Volume")
+        >>> nse.fno_live_most_active_futures_contracts("Value")
+        """
+        key  = "value" if mode.lower() == "value" else "volume"
+        resp = self._live_ref_fetch(
+            "https://www.nseindia.com/market-data/most-active-contracts",
+            "https://www.nseindia.com/api/snapshot-derivatives-equity?index=futures",
+        )
+        try:
+            df = pd.DataFrame(resp.json()[key]["data"])
+            return df if not df.empty else None
+        except Exception as exc:
+            self._log_error("fno_live_most_active_futures_contracts", exc)
+            return None
+
+    def fno_live_most_active(
+        self,
+        mode:    str = "Index",
+        opt:     str = "Call",
+        sort_by: str = "Volume",
+    ) -> pd.DataFrame | None:
+        """
+        Return the most active options (calls or puts) by volume or value.
+
+        Parameters
+        ----------
+        mode : str, optional
+            ``"Index"`` (default) or ``"Stock"``.
+        opt : str, optional
+            ``"Call"`` (default) or ``"Put"``.
+        sort_by : str, optional
+            ``"Volume"`` (default) or ``"Value"``.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.fno_live_most_active("Index", "Call", "Volume")
+        >>> nse.fno_live_most_active("Stock", "Put", "Value")
+        """
+        mode    = mode.capitalize()
+        opt     = opt.capitalize()
+        sort_by = sort_by.capitalize()
+        sfx     = {"Volume": "vol", "Value": "val"}[sort_by]
+        api_idx = f"{opt.lower()}s-{'index' if mode == 'Index' else 'stocks'}-{sfx}"
+        key     = "OPTIDX" if mode == "Index" else "OPTSTK"
+
+        resp = self._live_ref_fetch(
+            "https://www.nseindia.com/market-data/most-active-contracts",
+            f"https://www.nseindia.com/api/snapshot-derivatives-equity?index={api_idx}",
+        )
+        try:
+            df = pd.DataFrame(resp.json()[key]["data"])
+            return df if not df.empty else None
+        except Exception as exc:
+            self._log_error("fno_live_most_active", exc)
+            return None
+
+    def fno_live_most_active_contracts_by_oi(self) -> pd.DataFrame | None:
+        """Return the most active derivative contracts ranked by open interest.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.fno_live_most_active_contracts_by_oi()
+        """
+        return self._snapshot_contracts("oi")
+
+    def fno_live_most_active_contracts_by_volume(self) -> pd.DataFrame | None:
+        """Return the most active derivative contracts ranked by trading volume.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.fno_live_most_active_contracts_by_volume()
+        """
+        return self._snapshot_contracts("contracts")
+
+    def fno_live_most_active_options_contracts_by_volume(self) -> pd.DataFrame | None:
+        """Return the top-20 most active options contracts by trading volume.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.fno_live_most_active_options_contracts_by_volume()
+        """
+        return self._snapshot_contracts("options&limit=20")
+
+    def fno_live_most_active_underlying(self) -> pd.DataFrame | None:
+        """
+        Return the most active F&O underlying symbols by total volume.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Columns: Symbol, Fut Vol, Opt Vol, Total Vol, Fut Val, Opt Val,
+            Total Val, OI.
+
+        Examples
+        --------
+        >>> nse.fno_live_most_active_underlying()
+        """
+        resp = self._live_ref_fetch(
+            "https://www.nseindia.com/market-data/most-active-underlying",
+            "https://www.nseindia.com/api/live-analysis-most-active-underlying",
+        )
+        try:
+            df = pd.DataFrame(resp.json()["data"])
+            if df.empty:
+                return None
+            df.rename(columns={
+                "symbol":       "Symbol",
+                "futVolume":    "Fut Vol (Cntr)",
+                "optVolume":    "Opt Vol (Cntr)",
+                "totVolume":    "Total Vol (Cntr)",
+                "futTurnover":  "Fut Val (₹ Lakhs)",
+                "preTurnover":  "Opt Val (₹ Lakhs)(Premium)",
+                "totTurnover":  "Total Val (₹ Lakhs)",
+                "latestOI":     "OI (Cntr)",
+                "underlying":   "Underlying",
+            }, inplace=True)
+            df.drop(columns=["optTurnover"], errors="ignore", inplace=True)
+            order = [
+                "Symbol", "Fut Vol (Cntr)", "Opt Vol (Cntr)", "Total Vol (Cntr)",
+                "Fut Val (₹ Lakhs)", "Opt Val (₹ Lakhs)(Premium)", "Total Val (₹ Lakhs)",
+                "OI (Cntr)", "Underlying",
+            ]
+            return _keep_cols(df, order)
+        except Exception as exc:
+            self._log_error("fno_live_most_active_underlying", exc)
+            return None
+
+    def fno_live_change_in_oi(self) -> pd.DataFrame | None:
+        """
+        Return OI spurts — underlyings with the largest OI change today.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Columns: Symbol, Latest OI, Prev OI, chng in OI, chng in OI %,
+            Vol, Fut Val, Opt Val, Total Val, Price.
+
+        Examples
+        --------
+        >>> nse.fno_live_change_in_oi()
+        """
+        resp = self._live_ref_fetch(
+            "https://www.nseindia.com/market-data/oi-spurts",
+            "https://www.nseindia.com/api/live-analysis-oi-spurts-underlyings",
+        )
+        try:
+            df = pd.DataFrame(resp.json()["data"])
+            if df.empty:
+                return None
+            df.rename(columns={
+                "symbol":     "Symbol",
+                "latestOI":   "Latest OI",
+                "prevOI":     "Prev OI",
+                "changeInOI": "chng in OI",
+                "avgInOI":    "chng in OI %",
+                "volume":     "Vol (Cntr)",
+                "futValue":   "Fut Val (₹ Lakhs)",
+                "premValue":  "Opt Val (₹ Lakhs)(Premium)",
+                "total":      "Total Val (₹ Lakhs)",
+                "underlyingValue": "Price",
+            }, inplace=True)
+            df.drop(columns=["optValue"], errors="ignore", inplace=True)
+            order = [
+                "Symbol", "Latest OI", "Prev OI", "chng in OI", "chng in OI %",
+                "Vol (Cntr)", "Fut Val (₹ Lakhs)", "Opt Val (₹ Lakhs)(Premium)",
+                "Total Val (₹ Lakhs)", "Price",
+            ]
+            return _keep_cols(df, order)
+        except Exception as exc:
+            self._log_error("fno_live_change_in_oi", exc)
+            return None
+
+    def fno_live_oi_vs_price(self) -> pd.DataFrame | None:
+        """
+        Return OI-vs-price signals for all F&O contracts.
+
+        Contracts are classified into: long build-up, short build-up,
+        long unwinding, and short covering.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Columns include OI_Price_Signal, Symbol, Expiry, Strike,
+            LTP, % Price Chg, Latest OI, Chg in OI, % OI Chg.
+
+        Examples
+        --------
+        >>> nse.fno_live_oi_vs_price()
+        """
+        resp = self._live_ref_fetch(
+            "https://www.nseindia.com/market-data/oi-spurts",
+            "https://www.nseindia.com/api/live-analysis-oi-spurts-contracts",
+        )
+        try:
+            rows = []
+            for block in resp.json().get("data", []):
+                for cat, contracts in block.items():
+                    for c in contracts:
+                        c["OI_Price_Signal"] = cat
+                        rows.append(c)
+            if not rows:
+                return None
+            df = pd.DataFrame(rows).rename(columns={
+                "symbol":         "Symbol",
+                "instrument":     "Instrument",
+                "expiryDate":     "Expiry",
+                "optionType":     "Type",
+                "strikePrice":    "Strike",
+                "ltp":            "LTP",
+                "prevClose":      "Prev Close",
+                "pChange":        "% Price Chg",
+                "latestOI":       "Latest OI",
+                "prevOI":         "Prev OI",
+                "changeInOI":     "Chg in OI",
+                "pChangeInOI":    "% OI Chg",
+                "volume":         "Volume",
+                "turnover":       "Turnover ₹L",
+                "premTurnover":   "Premium ₹L",
+                "underlyingValue":"Underlying Price",
+            })
+            order = [
+                "OI_Price_Signal", "Symbol", "Instrument", "Expiry", "Type",
+                "Strike", "LTP", "% Price Chg", "Latest OI", "Prev OI",
+                "Chg in OI", "% OI Chg", "Volume", "Turnover ₹L",
+                "Premium ₹L", "Underlying Price",
+            ]
+            return _keep_cols(df, order)
+        except Exception as exc:
+            self._log_error("fno_live_oi_vs_price", exc)
+            return None
+
+    def fno_expiry_dates_raw(self, symbol: str = "NIFTY") -> dict | None:
+        """Return the raw option-chain dropdown JSON for a symbol.
+
+        Parameters
+        ----------
+        symbol : str, optional
+            NSE ticker. Default is ``"NIFTY"``.
+
+        Returns
+        -------
+        dict or None
+            Raw JSON containing ``expiryDates`` and other dropdown metadata.
+
+        Examples
+        --------
+        >>> nse.fno_expiry_dates_raw()
+        >>> nse.fno_expiry_dates_raw("TCS")
+        """
+        return self._get_json(
+            "https://www.nseindia.com/option-chain",
+            f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
+            f"?functionName=getOptionChainDropdown&symbol={symbol}",
+        )
+
+    def fno_expiry_dates(
+        self,
+        symbol:       str = "NIFTY",
+        label_filter: str | None = None,
+    ) -> pd.DataFrame | str | list | None:
+        """
+        Return a structured expiry-date table for a symbol.
+
+        Parameters
+        ----------
+        symbol : str, optional
+            NSE ticker. Default is ``"NIFTY"``.
+        label_filter : str or None, optional
+            Controls the return format:
+
+            - ``None`` (default) — full ``DataFrame``
+            - ``"All"`` — list of three main expiry date strings
+            - ``"Current"`` / ``"Next Week"`` / ``"Month"`` — single
+              date string in ``DD-MM-YYYY``
+
+        Returns
+        -------
+        pd.DataFrame or str or list or None
+            Columns (when returning DataFrame): Expiry Date, Expiry Type,
+            Label, Days Remaining, Contract Zone.
+
+        Examples
+        --------
+        >>> nse.fno_expiry_dates()
+        >>> nse.fno_expiry_dates("TCS")
+        >>> nse.fno_expiry_dates("NIFTY", "Current")
+        >>> nse.fno_expiry_dates("NIFTY", "Next Week")
+        >>> nse.fno_expiry_dates("NIFTY", "Month")
+        >>> nse.fno_expiry_dates("NIFTY", "All")
+        """
+        from datetime import time as dtime
+
+        self.rotate_user_agent()
+
+        try:
+            resp = self._warm_and_fetch(
+                "https://www.nseindia.com/option-chain",
+                f"https://www.nseindia.com/api/option-chain-contract-info?symbol={symbol}",
+                timeout=10
+            )
+            data = resp.json()
+            raw  = data.get("expiryDates") or data.get("records", {}).get("expiryDates")
+            if not raw:
+                return None
+            expiry = pd.Series(
+                pd.to_datetime(raw, format="%d-%b-%Y").sort_values().unique()
+            )
+        except Exception as exc:
+            self._log_error("fno_expiry_dates", exc)
+            return None
+
+        now    = datetime.now()
+        expiry = expiry[expiry >= pd.Timestamp(now.date())].reset_index(drop=True)
+        if expiry.empty:
+            return None
+
+        if (len(expiry) > 0
+                and expiry.iloc[0].date() == now.date()
+                and now.time() > dtime(15, 30)):
+            expiry = expiry.iloc[1:].reset_index(drop=True)
+
+        def _etype(i, d):
+            return (
+                "Monthly Expiry"
+                if i + 1 >= len(expiry) or expiry.iloc[i + 1].month != d.month
+                else "Weekly Expiry"
+            )
+
+        etype = [_etype(i, d) for i, d in enumerate(expiry)]
+        df    = pd.DataFrame({
+            "Expiry Date":  expiry.dt.strftime("%d-%b-%Y"),
+            "Expiry Type":  etype,
+            "Label":        "",
+        })
+
+        if len(df) > 0:
+            df.loc[0, "Label"] = "Current"
+        wi = [i for i in df[df["Expiry Type"] == "Weekly Expiry"].index if i > 0]
+        if wi:
+            df.loc[wi[0], "Label"] = "Next Week"
+        mi = [i for i in df[df["Expiry Type"] == "Monthly Expiry"].index if i > 0]
+        if mi:
+            df.loc[mi[0], "Label"] = "Month"
+
+        df["Days Remaining"] = (expiry - pd.Timestamp(now.date())).dt.days
+
+        def _zone(e):
+            if e.month == now.month and e.year == now.year:
+                return "Current Month"
+            nm = (now.month % 12) + 1
+            if e.month == nm and e.year in (now.year, now.year + 1):
+                return "Next Month"
+            if e.month in (3, 6, 9, 12):
+                return "Quarterly"
+            return "Far Month"
+
+        df["Contract Zone"] = expiry.apply(_zone)
+        df = df[["Expiry Date", "Expiry Type", "Label", "Days Remaining", "Contract Zone"]]
+
+        if label_filter is None:
+            return df.reset_index(drop=True)
+        if label_filter == "All":
+            sub = df[df["Label"].isin(["Current", "Next Week", "Month"])]
+            return sub["Expiry Date"].apply(
+                lambda x: pd.to_datetime(x, format="%d-%b-%Y").strftime("%d-%m-%Y")
+            ).tolist()
+
+        sub = df[df["Label"] == label_filter].reset_index(drop=True)
+        if sub.empty:
+            return None
+        return pd.to_datetime(sub.loc[0, "Expiry Date"], format="%d-%b-%Y").strftime("%d-%m-%Y")
+
+    def fno_live_option_chain_raw(
+        self,
+        symbol:      str,
+        expiry_date: str | None = None,
+    ) -> dict | None:
+        """Return the raw option-chain JSON payload for a symbol.
+
+        Parameters
+        ----------
+        symbol : str
+            NSE equity or index ticker.
+        expiry_date : str, optional
+            Target expiry in any pandas-parseable format.
+
+        Returns
+        -------
+        dict or None
+
+        Examples
+        --------
+        >>> nse.fno_live_option_chain_raw("M&M", expiry_date="27-Jan-2026")
+        """
+        symbol = symbol.upper().replace(" ", "%20").replace("&", "%26")
+        return self._get_json(
+            "https://www.nseindia.com/option-chain",
+            f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
+            f"?functionName=getOptionChainData&symbol={symbol}"
+            f"&params=expiryDate={expiry_date}",
+        )
+
+    def fno_live_option_chain(
+        self,
+        symbol:      str,
+        expiry_date: str | None = None,
+        oi_mode:     str        = "full",
+    ) -> pd.DataFrame:
+        """
+        Return a structured option chain table for a symbol.
+
+        Parameters
+        ----------
+        symbol : str
+            Underlying ticker, e.g. ``"NIFTY"``, ``"RELIANCE"``.
+        expiry_date : str, optional
+            Target expiry in any pandas-parseable format. Defaults to
+            the nearest available expiry.
+        oi_mode : str, optional
+            ``"full"`` (default) includes bid/ask columns.
+            ``"compact"`` returns only the core OI/volume/LTP columns.
 
         Returns
         -------
         pd.DataFrame
-            Monthly settlement statistics across requested years.
+            Columns: Fetch_Time, Symbol, Expiry_Date, CALLS_OI, CALLS_Volume,
+            CALLS_LTP, Strike_Price, PUTS_OI, PUTS_Volume, PUTS_LTP,
+            Underlying_Value (and bid/ask columns in full mode).
+
+        Examples
+        --------
+        >>> nse.fno_live_option_chain("RELIANCE")
+        >>> nse.fno_live_option_chain("NIFTY")
+        >>> nse.fno_live_option_chain("RELIANCE", expiry_date="27-Jan-2026")
+        >>> nse.fno_live_option_chain("RELIANCE", oi_mode="compact")
         """
-
-        # --- Auto-detect arguments ---
-        for arg in args:
-            if isinstance(arg, str):
-                if re.match(r"^\d{4}$", arg):  # year
-                    if not from_year:
-                        from_year = int(arg)
-                    elif not to_year:
-                        to_year = int(arg)
-                elif arg.upper() in ["1Y", "2Y", "3Y", "5Y"]:
-                    period = arg.upper()
-
-        # --- Determine financial years ---
-        today = datetime.now()
-        current_month = today.month
-
-        # Current FY start year
-        if current_month >= 4:  # Apr–Dec
-            current_fy_start = today.year
-        else:  # Jan–Mar
-            current_fy_start = today.year - 1
-
-        if period and not from_year:
-            years_back = int(period.replace("Y", ""))
-            from_year = current_fy_start - years_back
-            to_year = current_fy_start + 1  # include current FY
-        elif not from_year:
-            from_year = current_fy_start
-            to_year = current_fy_start + 1
-        elif not to_year:
-            to_year = from_year + 1
-
-        # --- Rotate user-agent & base URLs ---
         self.rotate_user_agent()
-        ref_url = "https://www.nseindia.com/report-detail/monthly-settlement-statistics"
-        base_api = "https://www.nseindia.com/api/historicalOR/monthly-sett-stats-data?finYear={}-{}"
+        base_url = "https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
+
+        full_cols = [
+            "Fetch_Time", "Symbol", "Expiry_Date",
+            "CALLS_OI", "CALLS_Chng_in_OI", "CALLS_Volume", "CALLS_IV",
+            "CALLS_LTP", "CALLS_Net_Chng",
+            "CALLS_Bid_Qty", "CALLS_Bid_Price", "CALLS_Ask_Price", "CALLS_Ask_Qty",
+            "Strike_Price",
+            "PUTS_Bid_Qty", "PUTS_Bid_Price", "PUTS_Ask_Price", "PUTS_Ask_Qty",
+            "PUTS_Net_Chng", "PUTS_LTP", "PUTS_IV",
+            "PUTS_Volume", "PUTS_Chng_in_OI", "PUTS_OI",
+            "Underlying_Value"
+        ]
+
+        compact_cols = [
+            "Fetch_Time", "Symbol", "Expiry_Date",
+            "CALLS_OI", "CALLS_Chng_in_OI", "CALLS_Volume", "CALLS_IV",
+            "CALLS_LTP", "CALLS_Net_Chng",
+            "Strike_Price",
+            "PUTS_Net_Chng", "PUTS_LTP", "PUTS_IV",
+            "PUTS_Volume", "PUTS_Chng_in_OI", "PUTS_OI",
+            "Underlying_Value"
+        ]
+
+        col_names = compact_cols if oi_mode == "compact" else full_cols
+
+        dtypes = {
+            c: "float64"
+            for c in col_names
+            if any(x in c for x in ("Price", "IV", "Value", "OI", "Volume", "Chng", "Qty"))
+        }
+        dtypes.update({"Fetch_Time": "object", "Symbol": "object",
+                       "Expiry_Date": "object", "Strike_Price": "float64"})
+
+        def _call():
+            r = self._warm_and_fetch(
+                "https://www.nseindia.com/option-chain",
+                base_url,
+                params={"functionName": "getOptionChainDropdown", "symbol": symbol},
+                timeout=10
+            )
+            dd    = r.json()
+            avail = dd.get("expiryDates", [])
+            if not avail:
+                raise ValueError("No expiry dates found")
+
+            if expiry_date:
+                try:
+                    t = pd.to_datetime(expiry_date, dayfirst=True).strftime("%d-%b-%Y")
+                except Exception:
+                    t = expiry_date.strip()
+                target = t if t in avail else avail[0]
+            else:
+                target = avail[0]
+
+            r2 = self._warm_and_fetch(
+                "https://www.nseindia.com/option-chain",
+                base_url,
+                params={
+                    "functionName": "getOptionChainData",
+                    "symbol": symbol,
+                    "params": f"expiryDate={target}",
+                },
+                timeout=15
+            )
+            return r2.json(), target
 
         try:
-            # --- Get NSE cookies ---
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()
-            cookies = ref_response.cookies.get_dict()
+            res = self._retry(_call)
+            payload, target = res
+        except Exception as exc:
+            self._log_error("fno_live_option_chain", exc)
+            return pd.DataFrame(columns=col_names).astype(dtypes)
 
-            all_data = []
-            for fy_start in range(from_year, to_year):
-                fy_end = fy_start + 1
-                fin_year = f"{fy_start}-{fy_end}"
-                api_url = base_api.format(fy_start, fy_end)
+        ts      = payload.get("timestamp", datetime.now().strftime("%d-%b-%Y %H:%M:%S"))
+        uv      = payload.get("underlyingValue", 0)
+        records = payload.get("data", [])
 
-                # --- Fetch with retry ---
-                for attempt in range(3):
-                    try:
-                        response = self.session.get(api_url, headers=self.headers, cookies=cookies, timeout=15)
-                        if response.status_code == 200:
-                            js = response.json()
-                            if "data" in js and isinstance(js["data"], list):
-                                for rec in js["data"]:
-                                    rec["FinancialYear"] = fin_year
-                                all_data.extend(js["data"])
-                                # print(f"✅ {fin_year} data fetched ({len(js['data'])} records).")
-                            else:
-                                print(f"⚠️ No data in API for {fin_year}.")
-                            break
-                        else:
-                            print(f"⚠️ Failed for {fin_year} | HTTP {response.status_code}")
-                    except Exception as e:
-                        print(f"⚠️ Attempt {attempt+1} failed for {fin_year}: {e}")
-                        time.sleep(1)
-                time.sleep(0.8)  # polite delay
+        if not records:
+            return pd.DataFrame(columns=col_names).astype(dtypes)
 
-            if not all_data:
-                print(f"⚠️ No settlement data found from FY {from_year} to current.")
-                return None
-
-            # --- Create DataFrame ---
-            df = pd.DataFrame(all_data)
-
-            # --- Rename columns ---
-            rename_map = {
-                "ST_DATE": "Month",
-                "ST_SETTLEMENT_NO": "Settlement No",
-                "ST_NO_OF_TRADES_LACS": "No of Trades (lakhs)",
-                "ST_TRADED_QTY_LACS": "Traded Qty (lakhs)",
-                "ST_DELIVERED_QTY_LACS": "Delivered Qty (lakhs)",
-                "ST_PERC_DLVRD_TO_TRADED_QTY": "% Delivered to Traded Qty",
-                "ST_TURNOVER_CRORES": "Turnover (₹ Cr)",
-                "ST_DELIVERED_VALUE_CRORES": "Delivered Value (₹ Cr)",
-                "ST_PERC_DLVRD_VAL_TO_TURNOVER": "% Delivered Value to Turnover",
-                "ST_SHORT_DLVRY_AUC_QTY_LACS": "Short Delivery Qty (Lacs)",
-                "ST_PERC_SHORT_DLVRY_TO_DLVRY": "% Short Delivery to Delivery",
-                "ST_SHORT_DLVRY_VALUE": "Short Delivery Value (₹ Cr)",
-                "ST_PERC_SHORT_DLVRY_VAL_DLVRY": "% Short Delivery Value to Delivery",
-                "ST_FUNDS_PAYIN_CRORES": "Funds Payin (₹ Cr)"
+        rows = []
+        for item in records:
+            ce  = item.get("CE", {})
+            pe  = item.get("PE", {})
+            row = {
+                "Fetch_Time":       ts,
+                "Symbol":           symbol,
+                "Expiry_Date":      target,
+                "Strike_Price":     item.get("strikePrice"),
+                "CALLS_OI":         ce.get("openInterest",          0),
+                "CALLS_Chng_in_OI": ce.get("changeinOpenInterest",  0),
+                "CALLS_Volume":     ce.get("totalTradedVolume",      0),
+                "CALLS_IV":         ce.get("impliedVolatility",      0),
+                "CALLS_LTP":        ce.get("lastPrice",              0),
+                "CALLS_Net_Chng":   ce.get("change",                 0),
+                "PUTS_OI":          pe.get("openInterest",           0),
+                "PUTS_Chng_in_OI":  pe.get("changeinOpenInterest",   0),
+                "PUTS_Volume":      pe.get("totalTradedVolume",       0),
+                "PUTS_IV":          pe.get("impliedVolatility",       0),
+                "PUTS_LTP":         pe.get("lastPrice",               0),
+                "PUTS_Net_Chng":    pe.get("change",                  0),
+                "Underlying_Value": uv,
             }
-            df.rename(columns=rename_map, inplace=True)
+            if oi_mode == "full":
+                row.update({
+                    "CALLS_Bid_Qty":   ce.get("totalBuyQuantity",  0) or ce.get("buyQuantity1",  0),
+                    "CALLS_Bid_Price": ce.get("buyPrice1",          0),
+                    "CALLS_Ask_Price": ce.get("sellPrice1",         0),
+                    "CALLS_Ask_Qty":   ce.get("totalSellQuantity",  0) or ce.get("sellQuantity1", 0),
+                    "PUTS_Bid_Qty":    pe.get("totalBuyQuantity",   0) or pe.get("buyQuantity1",  0),
+                    "PUTS_Bid_Price":  pe.get("buyPrice1",           0),
+                    "PUTS_Ask_Price":  pe.get("sellPrice1",          0),
+                    "PUTS_Ask_Qty":    pe.get("totalSellQuantity",   0) or pe.get("sellQuantity1", 0),
+                })
+            rows.append(row)
 
-            # --- Parse Month ---
-            df["Month"] = pd.to_datetime(df["Month"], format="%b-%Y", errors="coerce")
-            df["Month"] = df["Month"].dt.strftime('%b-%Y')
+        return pd.DataFrame(rows, columns=col_names).astype(dtypes)
 
-            # # --- Clean numeric columns ---
-            # numeric_cols = [c for c in df.columns if c not in ["Month", "Settlement No", "FinancialYear"]]
-            # for c in numeric_cols:
-            #     df[c] = df[c].astype(str).str.replace(",", "").str.strip()
-            #     df[c] = pd.to_numeric(df[c], errors="coerce")
-
-            # # --- Sort and reset index ---
-            # df.sort_values(["FinancialYear", "Month"], inplace=True)
-            # df.reset_index(drop=True, inplace=True)
-
-            return df
-
-        except Exception as e:
-            print(f"❌ Error fetching Monthly Settlement data: {e}")
-            return None
-
-    def cm_monthly_most_active_equity(self):
-        self.rotate_user_agent()  # Rotating User-Agent
-
-        ref_url = 'https://www.nseindia.com/historical/most-active-securities'
-        api_url = 'https://www.nseindia.com/api/historicalOR/most-active-securities-monthly'
-
-        try:
-            # Step 1: Get reference cookies
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()
-
-            # Step 2: Fetch API data with cookies
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()  # Ensure request was successful
-
-            # Step 3: Parse JSON
-            data = response.json()
-
-            if 'data' in data and isinstance(data['data'], list):
-                df = pd.DataFrame(data['data'])
-
-                # Step 4: Select and order columns
-                columns = ['ASM_SECURITY', 'ASM_NO_OF_TRADES', 'ASM_TRADED_QUANTITY', 'ASM_TURNOVER', 'ASM_AVG_DLY_TURNOVER', 'ASM_SHARE_IN_TOTAL_TURNOVER', 'ASM_DATE']
-                df = df[columns]
-
-                # Step 5: Rename columns
-                rename_map = {
-                    'ASM_SECURITY': 'Security',
-                    'ASM_NO_OF_TRADES': 'No. of Trades',
-                    'ASM_TRADED_QUANTITY': 'Traded Quantity (Lakh Shares)',
-                    'ASM_TURNOVER': 'Turnover (₹ Cr.)',
-                    'ASM_AVG_DLY_TURNOVER': 'Avg Daily Turnover (₹ Cr.)',
-                    'ASM_SHARE_IN_TOTAL_TURNOVER': 'Share in Total Turnover (%)',
-                    'ASM_DATE': 'Month'
-                }
-                df.rename(columns=rename_map, inplace=True)
-
-                # Step 6: Clean NaN and infinite values
-                df = df.fillna(0).replace({float('inf'): 0, float('-inf'): 0})
-
-                # Step 7: Return DataFrame
-                return df if not df.empty else None
-
-            return None
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching most active securities (monthly): {e}")
-            return None
-
-    def historical_advances_decline(self, *args, mode="Month_wise", month=None, year=None):
+    def fno_live_active_contracts(
+        self,
+        symbol:      str,
+        expiry_date: str | None = None,
+    ) -> list | None:
         """
-        Fetch NSE historical advances-declines data either Month-wise or Day-wise.
+        Return all live active option contracts for a symbol.
 
         Parameters
         ----------
-        *args : optional positional arguments to auto-detect mode/month/year
-            Examples:
-            - historical_advances_decline() → current month/year (Month_wise)
-            - historical_advances_decline("2023") → 2023 Month_wise
-            - historical_advances_decline("SEP", "2025") → Sep 2025 Day_wise
-            - historical_advances_decline("Day_wise", "SEP", "2025") → explicit mode
-        mode : str
-            "Month_wise" or "Day_wise" (auto-detected if passed in *args)
-        year : int or str, optional
-            Year to fetch. Defaults to current year.
-        month : str or int, optional
-            Month to fetch (used for Day_wise). Defaults to current month.
+        symbol : str
+            NSE equity or index ticker, e.g. ``"NIFTY"``, ``"RELIANCE"``.
+        expiry_date : str, optional
+            Target expiry in ``DD-MMM-YYYY`` format (e.g. ``"27-Jan-2026"``).
+            Defaults to the nearest available expiry.
+
+        Returns
+        -------
+        list of dict or None
+            Each dict has keys: Instrument Type, Expiry Date, Option Type,
+            Strike Price, Open, High, Low, Last, Change, Volume, OI, etc.
+
+        Examples
+        --------
+        >>> nse.fno_live_active_contracts("NIFTY")
+        >>> nse.fno_live_active_contracts("NIFTY", expiry_date="27-Jan-2026")
+        >>> nse.fno_live_active_contracts("RELIANCE")
+        >>> nse.fno_live_active_contracts("RELIANCE", expiry_date="27-Jan-2026")
         """
-
-        now = datetime.now()
-
-        # --- Month lookup maps ---
-        month_map = {
-            "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
-            "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12
-        }
-        reverse_month_map = {v: k for k, v in month_map.items()}
-
-        # --- Auto-detect arguments ---
-        for arg in args:
-            if isinstance(arg, str):
-                arg_upper = arg.strip().upper()
-
-                # Detect mode keyword
-                if arg_upper in ["MONTH_WISE", "DAY_WISE"]:
-                    mode = arg_upper
-
-                # Detect year (numeric string)
-                elif arg_upper.isdigit() and len(arg_upper) == 4:
-                    year = int(arg_upper)
-
-                # Detect month name
-                elif arg_upper[:3] in month_map:
-                    month = month_map[arg_upper[:3]]
-
-                # Detect MM-YYYY or MON-YYYY
-                elif "-" in arg_upper:
-                    parts = arg_upper.split("-")
-                    if len(parts) == 2:
-                        m_part, y_part = parts
-                        if m_part[:3] in month_map:
-                            month = month_map[m_part[:3]]
-                        elif m_part.isdigit():
-                            month = int(m_part)
-                        if y_part.isdigit():
-                            year = int(y_part)
-
-            elif isinstance(arg, int):
-                if 1900 <= arg <= 2100:
-                    year = arg
-                elif 1 <= arg <= 12:
-                    month = arg
-
-        # --- Defaults (Previous Month Logic) ---
-        if year is None:
-            year = now.year
-        if month is None:
-            # Move to previous month
-            prev_month = now.month - 1 or 12
-            if now.month == 1:
-                year -= 1  # roll back to previous year
-            month = prev_month
-
         self.rotate_user_agent()
-        ref_url = "https://www.nseindia.com"
 
-        # --- Determine API URL ---
-        if mode.lower() == "month_wise":
-            api_url = f"https://www.nseindia.com/api/historicalOR/advances-decline-monthly?year={year}"
-        elif mode.lower() == "day_wise":
-            # NSE expects month as 3-letter code (e.g. SEP)
-            month_code = reverse_month_map.get(int(month), now.strftime("%b").upper())
-            api_url = f"https://www.nseindia.com/api/historicalOR/advances-decline-monthly?year={month_code}-{year}"
-        else:
-            raise ValueError("Invalid mode. Use 'Month_wise' or 'Day_wise'.")
+        def _call():
+            resp = self._warm_and_fetch(
+                f"https://www.nseindia.com/get-quotes/derivatives?symbol={symbol}",
+                f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
+                f"?functionName=getSymbolDerivativesData&symbol={symbol}&instrumentType=OPT",
+                timeout=10
+            )
+            return resp.json().get("data", [])
 
         try:
-            # --- Get cookies ---
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()
-
-            # --- API call ---
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()
-
-            data = response.json()
-            if "data" not in data or not isinstance(data["data"], list):
-                print("⚠️ No valid data received from NSE API.")
-                return None
-
-            df = pd.DataFrame(data["data"])
-
-            # --- Field mapping ---
-            if mode.lower() == "month_wise":
-                column_map = {
-                    "ADM_MONTH": "Month",
-                    "ADM_ADVANCES": "Advances",
-                    "ADM_DECLINES": "Declines",
-                    "ADM_ADV_DCLN_RATIO": "Adv_Decline_Ratio",
-                }
-                cols = ["Month", "Advances", "Declines", "Adv_Decline_Ratio"]
-            else:
-                column_map = {
-                    "ADD_DAY_STRING": "Day",
-                    "ADD_ADVANCES": "Advances",
-                    "ADD_DECLINES": "Declines",
-                    "ADD_ADV_DCLN_RATIO": "Adv_Decline_Ratio",
-                }
-                cols = ["Day", "Advances", "Declines", "Adv_Decline_Ratio"]
-
-            df = df.rename(columns=column_map)
-            df = df[[c for c in cols if c in df.columns]]
-            df = df.fillna(0).replace({float("inf"): 0, float("-inf"): 0})
-
-            return df if not df.empty else None
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"❌ Error fetching advances-decline data: {e}")
+            contracts = self._retry(_call)
+        except Exception as exc:
+            self._log_error("fno_live_active_contracts", exc)
             return None
 
-    #---------------------------------------------------------- FnO_Eod_Data ----------------------------------------------------------------
+        if expiry_date:
+            exp       = pd.to_datetime(expiry_date, format="%d-%b-%Y").strftime("%d-%b-%Y")
+            contracts = [c for c in contracts if c.get("expiryDate") == exp]
 
-    def fno_eod_bhav_copy(self, trade_date: str = ""):
-        self.rotate_user_agent()
-        bhav_df = pd.DataFrame()
-        trade_date = datetime.strptime(trade_date, "%d-%m-%Y")
-        url = 'https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_'
-        payload = f"{str(trade_date.strftime('%Y%m%d'))}_F_0000.csv.zip"
+        return [{
+            "Instrument Type":   c.get("instrumentType", ""),
+            "Expiry Date":       c.get("expiryDate",     ""),
+            "Option Type":       c.get("optionType",     ""),
+            "Strike Price":      str(c.get("strikePrice", "")).strip(),
+            "Open":              c.get("openPrice",  0),
+            "High":              c.get("highPrice",  0),
+            "Low":               c.get("lowPrice",   0),
+            "closePrice":        c.get("closePrice", 0),
+            "Prev Close":        c.get("prevClose",  0),
+            "Last":              c.get("lastPrice",  0),
+            "Change":            c.get("change",     0),
+            "%Change":           c.get("pchange",    0),
+            "Volume (Contracts)":c.get("totalTradedVolume", 0),
+            "Value (₹ Lakhs)":   round(c.get("totalTurnover", 0) / 100_000, 2),
+            "totalBuyQuantity":  0,
+            "totalSellQuantity": 0,
+            "OI":                c.get("openInterest",        0),
+            "Chng in OI":        c.get("changeinOpenInterest", 0),
+            "% Chng in OI":      c.get("pchangeinOpenInterest",0),
+            "VWAP":              0,
+        } for c in contracts]
 
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ── FnO — Charts ────────────────────────────────────────────────────────
+
+    def fno_chart(
+        self,
+        symbol:    str,
+        inst_type: str,
+        expiry:    str,
+        strike:    str = "",
+    ) -> pd.DataFrame | None:
+        """
+        Return intraday chart data for an F&O contract.
+
+        Parameters
+        ----------
+        symbol : str
+            Underlying symbol, e.g. ``"TCS"``.
+        inst_type : str
+            Instrument type prefix, e.g. ``"FUTSTK"``, ``"OPTIDX"``.
+        expiry : str
+            Expiry string used to build the contract identifier,
+            e.g. ``"30-12-2025"``.
+        strike : str, optional
+            Strike price string for options; leave blank for futures.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Columns: datetime_utc, price, chng, pct.
+
+        Examples
+        --------
+        >>> nse.fno_chart("TCS", "FUTSTK", "30-12-2025")
+        >>> nse.fno_chart("NIFTY", "OPTIDX", "20-01-2026", "PE25700")
+        """
+        strike_part = "XX0" if inst_type.startswith("FUT") else strike
+        contract    = f"{inst_type}{symbol.upper()}{expiry}{strike_part}.00"
+        data        = self._chart_fetch(
+            f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
+            f"?functionName=getIntradayGraphDerivative"
+            f"&identifier={contract}&type=W&token=1"
+        )
+        if not data or "grapthData" not in data:
+            return None
+        rows = []
+        for r in data["grapthData"]:
+            dt = pd.to_datetime(r[0], unit="ms", utc=True)
+            rows.append({
+                "datetime_utc": dt,
+                "price":  float(r[1]),
+                "chng":   float(r[2]) if len(r) > 2 and not isinstance(r[2], str) else None,
+                "pct":    float(r[3]) if len(r) > 3 else None,
+            })
+        return pd.DataFrame(rows)
+
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ── FnO — EOD ───────────────────────────────────────────────────────────
+
+    # def fno_eod_bhav_copy(self, trade_date: str = "") -> pd.DataFrame | None:
+    #     """
+    #     Download the F&O bhavcopy for a trade date.
+
+    #     Tries the direct archive URL first; falls back to the NSE reports
+    #     API if it returns non-200. Rows with all-zero price/volume columns
+    #     are filtered out automatically.
+
+    #     Parameters
+    #     ----------
+    #     trade_date : str
+    #         Date in ``DD-MM-YYYY`` format.
+
+    #     Returns
+    #     -------
+    #     pd.DataFrame or None
+
+    #     Examples
+    #     --------
+    #     >>> nse.fno_eod_bhav_copy("17-10-2025")
+    #     """
+    #     self.rotate_user_agent()
+    #     url = (
+    #         f"https://nsearchives.nseindia.com/content/fo/"
+    #         f"BhavCopy_NSE_FO_0_0_0_{_fmt_trade_date(trade_date, '%Y%m%d')}_F_0000.csv.zip"
+    #     )
+    #     dt_label = datetime.strptime(trade_date, "%d-%m-%Y").strftime("%d-%b-%Y")
+    #     dt_label = dt_label[:3] + dt_label[3:].capitalize()
+    #     try:
+    #         resp = self._warm_and_fetch(
+    #             "https://www.nseindia.com/reports-archives",
+    #             url,
+    #             timeout=15
+    #         )
+    #         if resp.status_code == 200:
+    #             df = self._zip_csv(resp.content)
+    #         else:
+    #             url2 = (
+    #                 f"https://www.nseindia.com/api/reports?archives="
+    #                 f"%5B%7B%22name%22%3A%22F%26O%20-%20Bhavcopy(csv)%22%2C"
+    #                 f"%22type%22%3A%22archives%22%2C%22category%22%3A"
+    #                 f"%22derivatives%22%2C%22section%22%3A%22equity%22%7D%5D"
+    #                 f"&date={dt_label}&type=equity&mode=single"
+    #             )
+    #             resp2 = self._warm_and_fetch(
+    #                 "https://www.nseindia.com/reports-archives",
+    #                 url2,
+    #                 timeout=10
+    #             )
+    #             df = self._zip_csv(resp2.content)
+
+    #         if not df.empty:
+    #             try:
+    #                 df = df[~(
+    #                     (df.iloc[:, 22] == 0) & (df.iloc[:, 23] == 0) &
+    #                     (df.iloc[:, 24] == 0) & (df.iloc[:, 25] == 0)
+    #                 )]
+    #                 df = df.sort_values(by=df.columns[24], ascending=False)
+    #             except IndexError:
+    #                 pass
+    #         return df
+
+    #     except Exception as exc:
+    #         self._log_error("fno_eod_bhav_copy", exc)
+    #         return None
+
+
+    def fno_eod_bhav_copy(self, trade_date: str = "") -> pd.DataFrame | None:
+        """
+        Download the F&O bhavcopy for a trade date.
+
+        Tries the direct archive URL first; falls back to the NSE reports
+        API if it returns non-200. Rows with all-zero price/volume columns
+        are filtered out automatically.
+
+        Parameters
+        ----------
+        trade_date : str
+            Date in ``DD-MM-YYYY`` format.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.fno_eod_bhav_copy("17-10-2025")
+        """
         try:
-            request_bhav = self.session.get(url + payload, headers=self.headers, timeout=10)
-            if request_bhav.status_code == 200:
-                bhav_df = self._extract_csv_from_zip(request_bhav.content)
-            else:
-                url2 = "https://www.nseindia.com/api/reports?archives=" \
-                       "%5B%7B%22name%22%3A%22F%26O%20-%20Bhavcopy(csv)%22%2C%22type%22%3A%22archives%22%2C%22category%22" \
-                       f"%3A%22derivatives%22%2C%22section%22%3A%22equity%22%7D%5D&date={str(trade_date.strftime('%d-%b-%Y'))}" \
-                       "&type=equity&mode=single"
-                ref = requests.get('https://www.nseindia.com/reports-archives', headers=self.headers)
-                request_bhav = self.session.get(url2, headers=self.headers, cookies=ref.cookies.get_dict(), timeout=10)
-                request_bhav.raise_for_status()
-                bhav_df = self._extract_csv_from_zip(request_bhav.content)
+            self.rotate_user_agent()
+            archive_url = (
+                "https://nsearchives.nseindia.com/content/fo/"
+                f"BhavCopy_NSE_FO_0_0_0_{_fmt_trade_date(trade_date, '%Y%m%d')}_F_0000.csv.zip"
+            )
 
-            if not bhav_df.empty:
-                # Filtering rows where all four columns (22, 23, 24, 25) are zero
+            # ---- 1. DIRECT ARCHIVE CALL (no warmup) ----
+            resp = self.session.get(archive_url, headers=self.headers, timeout=15)
+
+            if resp.status_code == 200:
+                df = self._zip_csv(resp.content)
+
+            else:
+                # ---- 2. FALLBACK WITH COOKIE ----
+                warm_url = "https://www.nseindia.com/market-data/live-equity-market"
+                self.session.get(warm_url, headers=self.headers, timeout=5)
+
+                dt_label = datetime.strptime(
+                    trade_date, "%d-%m-%Y"
+                ).strftime("%d-%b-%Y")
+
+                url2 = (
+                    "https://www.nseindia.com/api/reports?archives="
+                    "%5B%7B%22name%22%3A%22F%26O%20-%20Bhavcopy(csv)%22%2C"
+                    "%22type%22%3A%22archives%22%2C"
+                    "%22category%22%3A%22derivatives%22%2C"
+                    "%22section%22%3A%22equity%22%7D%5D"
+                    f"&date={dt_label}&type=equity&mode=single"
+                )
+
+                resp2 = self.session.get(url2, headers=self.headers, timeout=15)
+
+                resp2.raise_for_status()
+                df = self._zip_csv(resp2.content)
+
+            # ---- 3. FILTER ----
+            if not df.empty:
                 try:
-                    bhav_df = bhav_df[~((bhav_df.iloc[:, 22] == 0) & 
-                                         (bhav_df.iloc[:, 23] == 0) & 
-                                         (bhav_df.iloc[:, 24] == 0) & 
-                                         (bhav_df.iloc[:, 25] == 0))]
-                    bhav_df = bhav_df.sort_values(by=bhav_df.columns[24], ascending=False)
+                    df = df[~(
+                        (df.iloc[:, 22] == 0) &
+                        (df.iloc[:, 23] == 0) &
+                        (df.iloc[:, 24] == 0) &
+                        (df.iloc[:, 25] == 0)
+                    )]
+                    df = df.sort_values(by=df.columns[24], ascending=False)
                 except IndexError:
-                    print("Warning: The specified columns do not exist in the CSV.")
+                    pass
+            return df
 
-            return bhav_df
-
-        except (requests.RequestException, FileNotFoundError):
-            return None
-        
-    # Helper function 
-    def _extract_csv_from_zip(self, zip_content):
-        with zipfile.ZipFile(BytesIO(zip_content), 'r') as zip_bhav:
-            for file_name in zip_bhav.namelist():
-                if file_name.endswith('.csv'):
-                    return pd.read_csv(zip_bhav.open(file_name))
-        return pd.DataFrame()
-
-    def fno_eod_fii_stats(self, trade_date: str):
-        self.rotate_user_agent()
-        trade_date = datetime.strptime(trade_date, "%d-%m-%Y")
-        formatted_date = trade_date.strftime("%d-%b-%Y")
-        formatted_date = formatted_date[:3] + formatted_date[3:].capitalize()
-        url = f"https://nsearchives.nseindia.com/content/fo/fii_stats_{formatted_date}.xls"
-        
-        try:
-            nse_resp = requests.get(url, headers=self.headers, timeout=10)
-            nse_resp.raise_for_status()
-
-            file_content = BytesIO(nse_resp.content)
-            file_format = self.detect_excel_format(file_content)
-
-            print(f"Detected File Format: {file_format}")
-
-            if file_format == 'xls':
-                bhav_df = pd.read_excel(file_content, engine='xlrd', dtype=str)
-            elif file_format == 'xlsx':
-                bhav_df = pd.read_excel(file_content, engine='openpyxl', dtype=str)
-            elif file_format == 'xlsb':
-                bhav_df = pd.read_excel(file_content, engine='pyxlsb', dtype=str)
-            else:
-                print("Unknown file format or corrupted file.")
-                return None
-
-            return bhav_df
-        
-        except requests.RequestException as e:
-            print(f"Request Error: {e}")
-        except ValueError as e:
-            print(f"Value Error: {e}")
-        except Exception as e:
-            print(f"Unexpected Error: {e}")
-        
-        return None
-
-    def fno_eod_top10_fut(self, trade_date: str):
-        self.rotate_user_agent()
-        raw_trade_date = trade_date  # keep original string
-
-        try:
-            # Convert date (expects dd-mm-YYYY)
-            trade_date = datetime.strptime(trade_date, "%d-%m-%Y")
-            url = f"https://nsearchives.nseindia.com/archives/fo/mkt/fo{trade_date.strftime('%d%m%Y').upper()}.zip"
-
-            # Fetch ZIP
-            request_bhav = requests.get(url, headers=self.headers, timeout=10)
-            request_bhav.raise_for_status()
-            zip_bhav = zipfile.ZipFile(BytesIO(request_bhav.content), 'r')
-
-            rows = []
-            for file_name in zip_bhav.namelist():
-                if file_name.lower().startswith("ttfut") and file_name.endswith(".csv"):
-                    # Decode safely
-                    csv_text = zip_bhav.open(file_name).read().decode("utf-8", errors="ignore")
-                    rows = list(csv.reader(csv_text.splitlines()))
-                    break
-
-            return rows if rows else None
-
-        except Exception as e:
-            print(f"❌ Error fetching Top 10 Futures for {raw_trade_date}: {e}")
-            return None
-        
-    def fno_eod_top20_opt(self, trade_date: str):
-        self.rotate_user_agent()
-        raw_trade_date = trade_date  # keep original string
-
-        try:
-            # Convert date (expects dd-mm-YYYY)
-            trade_date = datetime.strptime(trade_date, "%d-%m-%Y")
-            url = f"https://nsearchives.nseindia.com/archives/fo/mkt/fo{trade_date.strftime('%d%m%Y')}.zip"
-
-            # Fetch ZIP
-            request_bhav = requests.get(url, headers=self.headers, timeout=10)
-            request_bhav.raise_for_status()
-            zip_bhav = zipfile.ZipFile(BytesIO(request_bhav.content), 'r')
-
-            rows = []
-            for file_name in zip_bhav.namelist():
-                if file_name.lower().startswith("ttopt") and file_name.endswith(".csv"):
-                    # Decode safely
-                    csv_text = zip_bhav.open(file_name).read().decode("utf-8", errors="ignore")
-                    rows = list(csv.reader(csv_text.splitlines()))
-                    break
-
-            return rows if rows else None
-
-        except Exception as e:
-            print(f"❌ Error fetching Top 20 Option for {raw_trade_date}: {e}")
+        except Exception as exc:
+            self._log_error("fno_eod_bhav_copy", exc)
             return None
 
+    def fno_eod_fii_stats(self, trade_date: str) -> pd.DataFrame | None:
+        """Return the FII stats Excel file for a trade date.
 
-    def fno_eod_sec_ban(self, trade_date: str):
-        self.rotate_user_agent()
-        trade_date = datetime.strptime(trade_date, "%d-%m-%Y")
-        url = f"https://nsearchives.nseindia.com/archives/fo/sec_ban/fo_secban_{str(trade_date.strftime('%d%m%Y').upper())}.csv"
-        try:
-            nse_resp = requests.get(url, headers=self.headers, timeout=10)
-            nse_resp.raise_for_status()
-            bhav_df = pd.read_csv(BytesIO(nse_resp.content))
-            return bhav_df
-        except (requests.RequestException, ValueError):
+        Parameters
+        ----------
+        trade_date : str
+            Date in ``DD-MM-YYYY`` format.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.fno_eod_fii_stats("17-10-2025")
+        """
+        fmt = _fmt_trade_date(trade_date, "%d-%b-%Y")
+        fmt = fmt[:3] + fmt[3:].capitalize()
+        raw = self._get_archive(
+            f"https://nsearchives.nseindia.com/content/fo/fii_stats_{fmt}.xls"
+        )
+        return self._read_excel(raw) if raw else None
+
+    def fno_eod_top10_fut(self, trade_date: str) -> list | None:
+        """Return the top-10 futures contracts for a trade date.
+
+        Parameters
+        ----------
+        trade_date : str
+            Date in ``DD-MM-YYYY`` format.
+
+        Returns
+        -------
+        list or None
+            List of CSV rows (each row is a list of strings).
+
+        Examples
+        --------
+        >>> nse.fno_eod_top10_fut("17-10-2025")
+        """
+        return self._zip_rows(
+            f"https://nsearchives.nseindia.com/archives/fo/mkt/"
+            f"fo{_fmt_trade_date(trade_date).upper()}.zip",
+            "ttfut",
+        )
+
+    def fno_eod_top20_opt(self, trade_date: str) -> list | None:
+        """Return the top-20 options contracts for a trade date.
+
+        Parameters
+        ----------
+        trade_date : str
+            Date in ``DD-MM-YYYY`` format.
+
+        Returns
+        -------
+        list or None
+
+        Examples
+        --------
+        >>> nse.fno_eod_top20_opt("31-12-2025")
+        """
+        return self._zip_rows(
+            f"https://nsearchives.nseindia.com/archives/fo/mkt/"
+            f"fo{_fmt_trade_date(trade_date)}.zip",
+            "ttopt",
+        )
+
+    def fno_eod_sec_ban(self, trade_date: str) -> pd.DataFrame | None:
+        """Return the F&O securities in the ban period for a trade date.
+
+        Parameters
+        ----------
+        trade_date : str
+            Date in ``DD-MM-YYYY`` format.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.fno_eod_sec_ban("17-10-2025")
+        """
+        return self._get_csv_archive(
+            f"https://nsearchives.nseindia.com/archives/fo/sec_ban/"
+            f"fo_secban_{_fmt_trade_date(trade_date).upper()}.csv"
+        )
+
+    def fno_eod_mwpl_3(self, trade_date: str) -> pd.DataFrame | None:
+        """
+        Return the MWPL (Market Wide Position Limit) client-wise Excel file.
+
+        Parameters
+        ----------
+        trade_date : str
+            Date in ``DD-MM-YYYY`` format.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Reshaped Excel data with client-wise columns.
+
+        Examples
+        --------
+        >>> nse.fno_eod_mwpl_3("17-10-2025")
+        """
+        raw = self._get_archive(
+            f"https://nsearchives.nseindia.com/content/nsccl/"
+            f"mwpl_cli_{_fmt_trade_date(trade_date).upper()}.xls"
+        )
+        if not raw:
             return None
 
-    def fno_eod_mwpl_3(self, trade_date: str):
-        self.rotate_user_agent()
-        trade_date = datetime.strptime(trade_date, "%d-%m-%Y")
-        url = f"https://nsearchives.nseindia.com/content/nsccl/mwpl_cli_{trade_date.strftime('%d%m%Y').upper()}.xls"
-        
-        try:
-            nse_resp = requests.get(url, headers=self.headers, timeout=10)
-            nse_resp.raise_for_status()
+        df = self._read_excel(raw)
+        if df is None:
+            return None
 
-            file_content = BytesIO(nse_resp.content)
-            file_format = self.detect_excel_format(file_content)
+        df.dropna(how="all", inplace=True)
+        df.columns = df.iloc[0]
+        df         = df[1:].reset_index(drop=True)
 
-            print(f"Detected File Format: {file_format}")
-
-            if file_format == 'xls':
-                bhav_df = pd.read_excel(file_content, engine='xlrd', dtype=str)
-            elif file_format == 'xlsx':
-                bhav_df = pd.read_excel(file_content, engine='openpyxl', dtype=str)
-            elif file_format == 'xlsb':
-                bhav_df = pd.read_excel(file_content, engine='pyxlsb', dtype=str)
-            else:
-                print("Unknown file format or corrupted file.")
-                return None
-
-            # Cleaning the DataFrame
-            bhav_df = self.clean_mwpl_data(bhav_df)
-            return bhav_df
-        
-        except requests.RequestException as e:
-            print(f"Request Error: {e}")
-        except ValueError as e:
-            print(f"Value Error: {e}")
-        except Exception as e:
-            print(f"Unexpected Error: {e}")
-        
-        return None
-    
-    # Helper function
-    def detect_excel_format(self, file_content):
-        """
-        Detects the format of the Excel file using the first few bytes.
-        Returns: 'xls', 'xlsx', 'xlsb', or 'unknown'.
-        """
-        signature = file_content.read(8)
-        file_content.seek(0)  # Reset buffer pointer for reading
-
-        print(f"File Signature: {signature}")
-
-        if signature.startswith(b'\xD0\xCF\x11\xE0'):  # XLS (OLE2 Compound File)
-            return 'xls'
-        elif signature.startswith(b'\x50\x4B\x03\x04'):  # XLSX (ZIP)
-            return 'xlsx'
-        elif signature.startswith(b'\x09\x08\x10\x00'):  # XLSB (Binary Excel)
-            return 'xlsb'
-        else:
-            return 'unknown'
-
-    # Helper function
-    def clean_mwpl_data(self, df):
-        """
-        Cleans the MWPL DataFrame by avoiding 'Unnamed' columns and filling them automatically.
-        """
-        # Dropping any rows without valid data (optional, for extra cleaning)
-        df.dropna(how='all', inplace=True)
-
-        # Resetting the header (first row becomes the actual header)
-        df.columns = df.iloc[0]  # Set the first row as header
-        df = df[1:].reset_index(drop=True)  # Remove the header row
-
-        # Automatically filling 'Unnamed' columns with "Client X" format
-        new_columns = []
-        client_counter = 1
-
+        new_cols = []
+        n        = 1
         for col in df.columns:
             if "Unnamed" in str(col) or pd.isna(col):
-                new_columns.append(f"Client {client_counter}")
-                client_counter += 1
+                new_cols.append(f"Client {n}")
+                n += 1
             else:
-                new_columns.append(str(col).strip())
-
-        df.columns = new_columns
+                new_cols.append(str(col).strip())
+        df.columns = new_cols
         return df
 
-    def fno_eod_combine_oi(self, trade_date: str):
-        self.rotate_user_agent()
-        trade_date = datetime.strptime(trade_date, "%d-%m-%Y")
-        url = f"https://nsearchives.nseindia.com/archives/nsccl/mwpl/combineoi_{trade_date.strftime('%d%m%Y').upper()}.zip"
+    def fno_eod_combine_oi(self, trade_date: str) -> pd.DataFrame | None:
+        """Return the combined open-interest file for a trade date.
 
+        Parameters
+        ----------
+        trade_date : str
+            Date in ``DD-MM-YYYY`` format.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.fno_eod_combine_oi("17-10-2025")
+        """
+        raw = self._get_archive(
+            f"https://nsearchives.nseindia.com/archives/nsccl/mwpl/"
+            f"combineoi_{_fmt_trade_date(trade_date).upper()}.zip"
+        )
+        if not raw:
+            return None
+        with zipfile.ZipFile(BytesIO(raw), "r") as zf:
+            for name in zf.namelist():
+                if name.lower().startswith("combineoi") and name.endswith(".csv"):
+                    return pd.read_csv(zf.open(name))
+        return None
+
+    def fno_eod_participant_wise_oi(self, trade_date: str) -> pd.DataFrame | None:
+        """Return participant-wise open interest for a trade date.
+
+        Parameters
+        ----------
+        trade_date : str
+            Date in ``DD-MM-YYYY`` format.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.fno_eod_participant_wise_oi("17-10-2025")
+        """
+        return self._fao_participant_csv(trade_date, "oi")
+
+    def fno_eod_participant_wise_vol(self, trade_date: str) -> pd.DataFrame | None:
+        """Return participant-wise trading volume for a trade date.
+
+        Parameters
+        ----------
+        trade_date : str
+            Date in ``DD-MM-YYYY`` format.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.fno_eod_participant_wise_vol("17-10-2025")
+        """
+        return self._fao_participant_csv(trade_date, "vol")
+
+    def fno_eom_lot_size(self, symbol: str | None = None) -> pd.DataFrame | None:
+        """
+        Return the current F&O lot-size table.
+
+        Parameters
+        ----------
+        symbol : str, optional
+            If provided, filters to that underlying only.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.fno_eom_lot_size()
+        >>> nse.fno_eom_lot_size("TCS")
+        """
         try:
-            request_bhav = requests.get(url, headers=self.headers, timeout=10)
-            request_bhav.raise_for_status()
-            zip_bhav = zipfile.ZipFile(BytesIO(request_bhav.content), 'r')
-            bhav_df = pd.DataFrame()
-
-            for file_name in zip_bhav.namelist():
-                if file_name.lower().startswith("combineoi") and file_name.endswith(".csv"):
-                    bhav_df = pd.read_csv(zip_bhav.open(file_name))
-                    break
-
-            if bhav_df.empty:
-                print("No combineoi CSV file found in the ZIP archive.")
+            raw = self._get_archive(
+                "https://nsearchives.nseindia.com/content/fo/fo_mktlots.csv"
+            )
+            if not raw:
                 return None
 
-            return bhav_df
+            rows  = list(csv.reader(raw.decode("utf-8", "ignore").splitlines()))
+            if not rows:
+                return None
 
-        except requests.RequestException as e:
-            print(f"Error fetching data: {e}")
+            hdrs      = rows[0]
+            nbi       = [i for i, h in enumerate(hdrs) if h.strip()]
+            flat_hdr  = [hdrs[i] for i in nbi]
+            flat_rows = []
+            target_symbol = symbol.strip().upper() if symbol else None
+            
+            for row in rows[1:]:
+                if len(row) <= 1:
+                    continue
+                
+                row_symbol = str(row[1]).strip().upper()
+                if target_symbol is None or row_symbol == target_symbol:
+                    # Pad row if shorter than headers
+                    padding = [""] * (len(hdrs) - len(row))
+                    full_row = list(row) + padding
+                    flat_rows.append([full_row[i] for i in nbi])
+                    
+            return pd.DataFrame(flat_rows, columns=flat_hdr) if flat_rows else None
+
+        except Exception as exc:
+            self._log_error("fno_eom_lot_size", exc)
             return None
-        
-    def fno_eod_participant_wise_oi(self, trade_date: str):
-        self.rotate_user_agent()
-        trade_date = datetime.strptime(trade_date, "%d-%m-%Y")
-        url = f"https://nsearchives.nseindia.com/content/nsccl/fao_participant_oi_{str(trade_date.strftime('%d%m%Y').upper())}.csv"
-        try:
-            nse_resp = requests.get(url, headers=self.headers, timeout=10)
-            nse_resp.raise_for_status()
-            bhav_df = pd.read_csv(BytesIO(nse_resp.content))
-            return bhav_df
-        except (requests.RequestException, ValueError):
-            return None
-    
-    def fno_eod_participant_wise_vol(self, trade_date: str):
-        self.rotate_user_agent()
-        trade_date = datetime.strptime(trade_date, "%d-%m-%Y")
-        url = f"https://nsearchives.nseindia.com/content/nsccl/fao_participant_vol_{str(trade_date.strftime('%d%m%Y').upper())}.csv"
-        try:
-            nse_resp = requests.get(url, headers=self.headers, timeout=10)
-            nse_resp.raise_for_status()
-            bhav_df = pd.read_csv(BytesIO(nse_resp.content))
-            return bhav_df
-        except (requests.RequestException, ValueError):
-            return None
+
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ── FnO — Historical ────────────────────────────────────────────────────
 
     def future_price_volume_data(self, *args, **kwargs) -> pd.DataFrame:
         """
-        Fetch NSE Futures Price & Volume Data with flexible arguments.
+        Return historical futures price/volume data for a symbol.
 
-        Usage Examples:
-        ----------------
-        get.future_price_volume_data("NIFTY", "Index Futures", "OCT-25", "01-10-2025", "17-10-2025")
-        get.future_price_volume_data("NIFTY", "Index Futures", "NOV-24")  # past expiry → auto 90-day history
-        get.future_price_volume_data("BANKNIFTY", "Index Futures", "3M")  # rolling 3 months
-        get.future_price_volume_data("ITC", "Stock Futures", "OCT-25", "04-10-2025")
+        Positional *args* (in order): ``symbol``, ``instrument``, then
+        optionally a period code (``"1M"``, ``"3M"``, etc.), an expiry
+        string (``"MAR-25"``), and/or date strings.  All may also be
+        passed as keyword arguments.
+
+        Parameters
+        ----------
+        *args : str
+            Required: ``symbol`` (e.g. ``"NIFTY"``), then ``instrument``
+            (``"Index Futures"`` or ``"Stock Futures"``).
+            Optional positional: period code (``"1M"``, ``"3M"``),
+            expiry string (``"OCT-25"``), and/or date strings.
+        instrument : str
+            ``"Index Futures"`` / ``"index"`` or ``"Stock Futures"`` /
+            ``"stock"`` (case-insensitive).
+        expiry : str, optional
+            Month-year string, e.g. ``"OCT-25"`` or ``"NOV-24"``. When
+            provided, the API auto-resolves the exact expiry date.
+        from_date : str, optional
+            Start date in ``DD-MM-YYYY``.
+        to_date : str, optional
+            End date in ``DD-MM-YYYY``.
+        period : str, optional
+            Shorthand: ``"1M"``, ``"3M"``, ``"6M"``.
+
+        Returns
+        -------
+        pd.DataFrame
+
+        Examples
+        --------
+        >>> nse.future_price_volume_data("NIFTY", "Index", "OCT-25", "01-10-2025", "17-10-2025")
+        >>> nse.future_price_volume_data("ITC", "Stock Futures", "OCT-25", "04-10-2025")
+        >>> nse.future_price_volume_data("BANKNIFTY", "Index Futures", "3M")
+        >>> nse.future_price_volume_data("NIFTY", "Index Futures", "NOV-24")
         """
-
-        # ---------------- Reference URL ----------------
-        ref_url = "https://www.nseindia.com/report-detail/fo_eq_security"
-        base_url = "https://www.nseindia.com/api/historicalOR/foCPV"
+        REF  = "https://www.nseindia.com/report-detail/fo_eq_security"
+        BASE = "https://www.nseindia.com/api/historicalOR/foCPV"
         today = datetime.now()
-        dd_mm_yyyy = "%d-%m-%Y"
+        dd    = "%d-%m-%Y"
 
-        # ---------------- Argument Parsing ----------------
         if len(args) < 2:
-            raise ValueError("At least symbol and instrument must be provided.")
+            raise ValueError("Provide at least symbol and instrument as positional arguments.")
 
-        symbol = args[0].strip().upper()
+        symbol     = args[0].strip().upper()
         instrument = args[1].strip().lower()
         expiry = from_date = to_date = period = None
 
         for arg in args[2:]:
             arg = str(arg).strip().upper()
-            if arg in ["1D", "1W", "1M", "3M", "6M"]:
+            if arg in ("1D", "1W", "1M", "3M", "6M"):
                 period = arg
-            elif any(m in arg for m in [
-                "JAN","FEB","MAR","APR","MAY","JUN",
-                "JUL","AUG","SEP","OCT","NOV","DEC"
-            ]):
+            elif any(m in arg for m in _MONTH_NUM):
                 expiry = arg
             elif "-" in arg and len(arg.split("-")) == 3 and all(p.isdigit() for p in arg.split("-")):
                 if not from_date:
                     from_date = arg
                 else:
                     to_date = arg
-            else:
-                print(f"⚠️ Unrecognized argument ignored: {arg}")
 
-        expiry = expiry or kwargs.get("expiry")
+        expiry    = expiry    or kwargs.get("expiry")
         from_date = from_date or kwargs.get("from_date")
-        to_date = to_date or kwargs.get("to_date")
-        period = period or kwargs.get("period")
+        to_date   = to_date   or kwargs.get("to_date")
+        period    = period    or kwargs.get("period")
 
-        # ---------------- Instrument Mapping ----------------
-        if instrument in ["futidx", "index futures", "index future", "index"]:
+        if instrument in ("futidx", "index futures", "index future", "index"):
             instrument = "FUTIDX"
-        elif instrument in ["futstk", "stock futures", "stock future", "stock"]:
+        elif instrument in ("futstk", "stock futures", "stock future", "stock"):
             instrument = "FUTSTK"
         else:
-            raise ValueError("Instrument must be 'Index Futures' or 'Stock Futures'")
+            raise ValueError("instrument must be 'Index Futures' or 'Stock Futures'")
 
-        # ---------------- Expiry Handling ----------------
         expiry_date = None
         if expiry:
             try:
-                expiry_parts = expiry.split("-")
-                expiry_month = expiry_parts[0].upper()
-                expiry_year = int(expiry_parts[1])
-                full_year = 2000 + expiry_year
-
-                # Fetch NSE expiry list for that year
-                self.session.get(ref_url, headers=self.headers, timeout=15)
-                meta_url = f"https://www.nseindia.com/api/historicalOR/meta/foCPV/expireDts?instrument={instrument}&symbol={symbol}&year={full_year}"
-                meta_resp = self.session.get(meta_url, headers=self.headers, timeout=15)
-                exp_list = meta_resp.json().get("expiresDts", [])
-                exp_list = [x.upper() for x in exp_list]
-
-                matched = [x for x in exp_list if expiry_month in x.upper()]
+                ep  = expiry.split("-")
+                em  = ep[0].upper()
+                ey  = 2000 + int(ep[1])
+                meta_url = (
+                    f"https://www.nseindia.com/api/historicalOR/meta/foCPV/expireDts"
+                    f"?instrument={instrument}&symbol={symbol}&year={ey}"
+                )
+                meta_resp = self._warm_and_fetch(REF, meta_url, timeout=15)
+                meta      = meta_resp.json().get("expiresDts", [])
+                matched = [x for x in meta if em in x.upper()]
                 if not matched:
-                    print(f"⚠️ Expiry {expiry} not found for {symbol} in {full_year}")
                     return pd.DataFrame()
                 expiry_date = matched[0]
-
-                # Auto 90-day history if expiry is in the past
-                expiry_dt_obj = datetime.strptime(expiry_date, "%d-%b-%Y")
-                if expiry_dt_obj < today and not from_date:
-                    from_date = expiry_dt_obj - timedelta(days=90)
-                    to_date = expiry_dt_obj
-            except Exception as e:
-                print(f"⚠️ Error fetching expiry list: {e}")
+                exp_dt      = datetime.strptime(expiry_date, "%d-%b-%Y")
+                if exp_dt < today and not from_date:
+                    from_date = exp_dt - timedelta(days=90)
+                    to_date   = exp_dt
+            except Exception as exc:
+                self._log_error("future_price_volume_data expiry", exc)
                 return pd.DataFrame()
 
-        # ---------------- Period / from-to Handling ----------------
-        if not expiry:
-            if period:
-                delta = {"1D": 1, "1W": 7, "1M": 30, "3M": 90, "6M": 180}[period.upper()]
-                from_date = today - timedelta(days=delta)
-                to_date = today
+        if not expiry and period:
+            d         = {"1D": 1, "1W": 7, "1M": 30, "3M": 90, "6M": 180}[period.upper()]
+            from_date = today - timedelta(days=d)
+            to_date   = today
 
-        # ---------------- Ensure from_date/to_date are datetime ----------------
-        if from_date:
-            if isinstance(from_date, str):
-                from_date = datetime.strptime(from_date, dd_mm_yyyy)
-        else:
-            from_date = today - timedelta(days=180)
+        from_date = (
+            datetime.strptime(from_date, dd) if isinstance(from_date, str)
+            else from_date or today - timedelta(days=180)
+        )
+        to_date = (
+            datetime.strptime(to_date, dd) if isinstance(to_date, str)
+            else to_date or (datetime.strptime(expiry_date, "%d-%b-%Y") if expiry_date else today)
+        )
 
-        if to_date:
-            if isinstance(to_date, str):
-                to_date = datetime.strptime(to_date, dd_mm_yyyy)
-        else:
-            # If expiry_date exists, use it, otherwise today
-            to_date = expiry_date and datetime.strptime(expiry_date, "%d-%b-%Y") or today
-
-        # ---------------- Fetch Data ----------------
         params = {
-            "from": from_date.strftime(dd_mm_yyyy),
-            "to": to_date.strftime(dd_mm_yyyy),
-            "instrumentType": instrument,
-            "symbol": symbol,
-            "year": today.year
+            "from": from_date.strftime(dd), "to": to_date.strftime(dd),
+            "instrumentType": instrument, "symbol": symbol, "year": today.year,
         }
         if expiry_date:
             params["expiryDate"] = expiry_date
-
+        
+        def _call():
+            resp = self._warm_and_fetch(REF, BASE, params=params, timeout=15)
+            return resp.json().get("data", [])
+        
         try:
-            response = self.session.get(
-                base_url,
-                params=params,
-                headers=self.headers,
-                cookies=self.session.cookies.get_dict(),
-                timeout=15
-            )
-            response.raise_for_status()
-            data = response.json().get("data", [])
-        except Exception as e:
-            print(f"⚠️ Error fetching data: {e}")
+            data = self._retry(_call)
+        except Exception as exc:
+            self._log_error("future_price_volume_data", exc)
             return pd.DataFrame()
-    
+
         df = pd.DataFrame(data)
         if df.empty:
-            print(f"⚠️ No data available for {symbol} ({expiry_date or 'All Expiries'})")
             return df
 
-        # ---------------- Post-processing ----------------
         df.columns = [c.upper().replace(" ", "_") for c in df.columns]
-
-        # Convert FH_TIMESTAMP to datetime first
         if "FH_TIMESTAMP" in df.columns:
             df["FH_TIMESTAMP"] = pd.to_datetime(df["FH_TIMESTAMP"], errors="coerce")
-
-        # Filter by expiry if specified
-        if expiry_date:
+        if expiry_date and "FH_EXPIRY_DT" in df.columns:
             df = df[df["FH_EXPIRY_DT"].str.upper() == expiry_date.upper()]
+        for col in df.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns:
+            df[col] = df[col].dt.strftime("%d-%b-%Y")
 
-        # ---------------- Convert timestamps to string for JSON/worksheet export ----------------
-        for col in df.columns:
-            if pd.api.types.is_datetime64_any_dtype(df[col]):
-                df[col] = df[col].dt.strftime("%d-%b-%Y")
-
-        # Sort and reset index
-        return df.sort_values(["FH_TIMESTAMP", "FH_EXPIRY_DT"]).reset_index(drop=True)
+        return df.sort_values(
+            [c for c in ("FH_TIMESTAMP", "FH_EXPIRY_DT") if c in df.columns]
+        ).reset_index(drop=True)
 
     def option_price_volume_data(self, *args, **kwargs) -> pd.DataFrame:
         """
-        Fetch NSE Futures / Options Price & Volume Data.
-        Supports full expiry date (DD-MM-YYYY) or month-year (MON-YY) formats.
-        """
-        dd_mm_yyyy = "%d-%m-%Y"
-        today = datetime.now()
-
-        # ---------------- Argument Parsing ----------------
-        if len(args) < 2:
-            raise ValueError("At least symbol and instrument must be provided.")
-
-        symbol = args[0].strip().upper()
-        instrument = args[1].strip().lower()
-
-        option_type = strike_price = expiry = from_date = to_date = period = None
-
-        for arg in args[2:]:
-            arg_str = str(arg).strip().upper()
-            if arg_str in ["CE", "PE"]:
-                option_type = arg_str
-            elif arg_str.replace('.', '', 1).isdigit():
-                strike_price = float(arg_str)
-            elif arg_str in ["1D","1W","1M","3M","6M"]:
-                period = arg_str
-            elif any(m in arg_str for m in ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]):
-                expiry = arg_str
-            elif "-" in arg_str and len(arg_str.split("-")) == 3 and all(p.isdigit() for p in arg_str.split("-")):
-                if not from_date:
-                    from_date = arg_str
-                else:
-                    to_date = arg_str
-
-        # Override with kwargs
-        expiry = expiry or kwargs.get("expiry")
-        from_date = from_date or kwargs.get("from_date")
-        to_date = to_date or kwargs.get("to_date")
-        period = period or kwargs.get("period")
-        option_type = option_type or kwargs.get("option_type")
-        strike_price = strike_price or kwargs.get("strike_price")
-
-        # ---------------- Instrument Mapping ----------------
-        if instrument in ["optidx","index options","index option","index"]:
-            instrument = "OPTIDX"
-        elif instrument in ["optstk","stock options","stock option","stock"]:
-            instrument = "OPTSTK"
-        else:
-            raise ValueError("Instrument must be 'Index Options' or 'Stock Options'")
-
-        # ---------------- Expiry Handling ----------------
-        expiry_date = None
-        if expiry:
-            try:
-                expiry = str(expiry).upper()
-                month_names = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
-
-                # Case 1: Full date (DD-MM-YYYY)
-                if "-" in expiry and len(expiry.split("-")) == 3 and all(p.isdigit() for p in expiry.split("-")):
-                    expiry_date = datetime.strptime(expiry, "%d-%m-%Y").strftime("%d-%b-%Y")
-
-                # Case 2: Month-Year (MON-YY)
-                elif any(m in expiry for m in month_names):
-                    month, year_suffix = expiry.split("-")
-                    expiry_year = 2000 + int(year_suffix)
-
-                    # Ensure get_expiries exists
-                    if hasattr(self, "get_expiries"):
-                        exp_list = self.get_expiries(instrument, symbol, expiry_year)
-                        matched = [x for x in exp_list if month in x.upper()]
-                        if not matched:
-                            print(f"⚠️ No expiry found for {symbol} in {expiry}")
-                            return pd.DataFrame()
-                        # pick last expiry of the month
-                        expiry_date = max(matched, key=lambda d: datetime.strptime(d, "%d-%b-%Y"))
-                    else:
-                        print(f"⚠️ get_expiries method not found, cannot pick last expiry for {expiry}")
-                        return pd.DataFrame()
-                else:
-                    print(f"⚠️ Unknown expiry format: {expiry}")
-                    return pd.DataFrame()
-
-            except Exception as e:
-                print(f"⚠️ Error processing expiry: {e}")
-                return pd.DataFrame()
-
-        # ---------------- Period / From-To Handling ----------------
-        if not expiry:
-            if period:
-                delta_days = {"1D":1,"1W":7,"1M":30,"3M":90,"6M":180}.get(period.upper(),30)
-                from_date = today - timedelta(days=delta_days)
-                to_date = today
-
-        # Convert from_date/to_date to datetime
-        if from_date:
-            if isinstance(from_date, str):
-                from_date = datetime.strptime(from_date, dd_mm_yyyy)
-        else:
-            from_date = today - timedelta(days=180)
-
-        if to_date:
-            if isinstance(to_date, str):
-                to_date = datetime.strptime(to_date, dd_mm_yyyy)
-        else:
-            to_date = expiry_date and datetime.strptime(expiry_date, "%d-%b-%Y") or today
-
-        # ---------------- Fetch Data ----------------
-        base_url = "https://www.nseindia.com/api/historicalOR/foCPV"
-        params = {
-            "from": from_date.strftime(dd_mm_yyyy),
-            "to": to_date.strftime(dd_mm_yyyy),
-            "instrumentType": instrument,
-            "symbol": symbol,
-            "year": today.year,
-            "csv": "true"
-        }
-        if expiry_date:
-            params["expiryDate"] = expiry_date
-        if option_type:
-            params["optionType"] = option_type
-        if strike_price:
-            params["strikePrice"] = strike_price
-
-        for _ in range(3):
-            try:
-                resp = self.session.get(
-                    base_url,
-                    params=params,
-                    headers=self.headers,
-                    cookies=self.session.cookies.get_dict(),
-                    timeout=15
-                )
-                resp.raise_for_status()
-                data = resp.json().get("data", [])
-                break
-            except Exception as e:
-                time.sleep(2)
-        else:
-            print(f"⚠️ Failed to fetch data after retries.")
-            return pd.DataFrame()
-
-        df = pd.DataFrame(data)
-        if df.empty:
-            print(f"⚠️ No data available for {symbol} ({expiry_date or 'All Expiries'})")
-            return df
-
-        # ---------------- Post-processing ----------------
-        df.columns = [c.upper().replace(" ", "_") for c in df.columns]
-
-        numeric_cols = ["FH_OPENING_PRICE","FH_TRADE_HIGH_PRICE","FH_TRADE_LOW_PRICE",
-                        "FH_CLOSING_PRICE","FH_LAST_TRADED_PRICE","FH_PREV_CLS",
-                        "FH_SETTLE_PRICE","FH_TOT_TRADED_QTY","FH_TOT_TRADED_VAL",
-                        "FH_OPEN_INT","FH_CHANGE_IN_OI","CALCULATED_PREMIUM_VAL"]
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        df = df[df["FH_TOT_TRADED_QTY"] > 0]
-
-        sort_cols = ["FH_TIMESTAMP"]
-        if "FH_EXPIRY_DT" in df.columns:
-            sort_cols.append("FH_EXPIRY_DT")
-        # ---------------- Format specific timestamp columns ----------------
-        date_columns = {
-            "FH_TIMESTAMP": "%d-%b-%Y",
-            "FH_EXPIRY_DT": "%d-%b-%Y",
-            "FH_TIMESTAMP_ORDER": "%d-%b-%Y %H:%M:%S"
-        }
-
-        for col, fmt in date_columns.items():
-            if col in df.columns:
-                def safe_format(x):
-                    if pd.isna(x):
-                        return ""
-                    elif isinstance(x, (pd.Timestamp, datetime)):
-                        return x.strftime(fmt)
-                    else:
-                        try:
-                            dt = pd.to_datetime(x, errors="coerce")
-                            if pd.notna(dt):
-                                return dt.strftime(fmt)
-                            else:
-                                return str(x)
-                        except:
-                            return str(x)
-                df[col] = df[col].apply(safe_format)
-
-
-        return df.sort_values(sort_cols).reset_index(drop=True)
-
-    def fno_eom_lot_size(self, symbol=None):
-
-        try:
-            url = "https://nsearchives.nseindia.com/content/fo/fo_mktlots.csv"
-            resp = requests.get(url, headers=self.headers, timeout=10)
-            resp.raise_for_status()
-
-            csv_text = resp.content.decode("utf-8", errors="ignore")
-            rows = list(csv.reader(csv_text.splitlines()))
-
-            if not rows:
-                return None
-
-            headers_full = rows[0]
-            non_blank_idx = [i for i, h in enumerate(headers_full) if h.strip()]
-            filtered_headers = [headers_full[i] for i in non_blank_idx]
-
-            filtered_rows = []
-            for row in rows[1:]:
-                if len(row) > 1 and (symbol is None or row[1].strip().upper() == symbol.upper()):
-                    row_padded = (row + [""] * len(headers_full))[:len(headers_full)]
-                    filtered_row = [row_padded[i] for i in non_blank_idx]
-                    filtered_rows.append(filtered_row)
-
-            if not filtered_rows:
-                return None
-
-            return pd.DataFrame(filtered_rows, columns=filtered_headers)
-
-        except Exception as e:
-            print(f"❌ Error fetching F&O Lot Size: {e}")
-            return None
-
-    
-    def fno_dmy_biz_growth(self, *args, mode="monthly", month=None, year=None):
-
-        now = datetime.now()
-
-        # --- Month mapping ---
-        month_map = {
-            "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
-            "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12
-        }
-        reverse_month_map = {v: k for k, v in month_map.items()}
-
-        # --- Auto-detect arguments ---
-        for arg in args:
-            if isinstance(arg, str):
-                arg_upper = arg.strip().upper()
-                if arg_upper in ["YEARLY", "MONTHLY", "DAILY"]:
-                    mode = arg_upper.lower()
-                elif arg_upper.isdigit() and len(arg_upper) == 4:
-                    year = int(arg_upper)
-                elif arg_upper[:3] in month_map:
-                    month = month_map[arg_upper[:3]]
-            elif isinstance(arg, int):
-                if 1900 <= arg <= 2100:
-                    year = arg
-                elif 1 <= arg <= 12:
-                    month = arg
-
-        # --- Defaults ---
-        if year is None:
-            year = now.year
-        if month is None:
-            month = now.month
-
-        # --- Prepare URLs ---
-        self.rotate_user_agent()
-        ref_url = "https://www.nseindia.com"
-
-        if mode.lower() == "yearly":
-            api_url = "https://www.nseindia.com/api/historicalOR/fo/tbg/yearly"
-        elif mode.lower() == "monthly":
-            from_year = year
-            to_year = year + 1
-            api_url = f"https://www.nseindia.com/api/historicalOR/fo/tbg/monthly?from={from_year}&to={to_year}"
-        elif mode.lower() == "daily":
-            month_str = reverse_month_map.get(month, str(month)).title()
-            api_url = f"https://www.nseindia.com/api/historicalOR/fo/tbg/daily?month={month_str}&year={year}"
-        else:
-            raise ValueError("Invalid mode. Use 'yearly', 'monthly', or 'daily'")
-
-        try:
-            # --- Get cookies ---
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()
-
-            # --- Fetch API data ---
-            response = self.session.get(api_url, headers=self.headers,
-                                        cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()
-            raw_data = response.json()
-
-            # --- Extract 'data' ---
-            data_list = []
-            if mode.lower() == "yearly":
-                for item in raw_data.get("data", []):
-                    if "data" in item:
-                        data_list.append(item["data"])
-            elif mode.lower() == "monthly":
-                for item in raw_data.get("data", []):
-                    if "data" in item:
-                        data_list.append(item["data"])
-            elif mode.lower() == "daily":
-                for item in raw_data.get("data", []):
-                    if "data" in item:
-                        data_list.append(item["data"])
-
-            if not data_list:
-                print("⚠️ No valid data found.")
-                return None
-
-            df = pd.DataFrame(data_list)
-
-            # --- Clean numeric columns ---
-            for col in df.columns:
-                if df[col].dtype == object:
-                    df[col] = df[col].astype(str).str.replace(",", "").str.strip()
-                    df[col] = df[col].replace({"None": "-", "nan": "-", "NaN": "-", "": "-", pd.NA: "-"})
-                    def to_numeric_or_keep(x):
-                        try:
-                            return pd.to_numeric(x)
-                        except:
-                            return x
-                    df[col] = df[col].apply(to_numeric_or_keep)
-
-            # --- Rename columns ---
-            if mode.lower() == "yearly":
-                # F&O-specific column renaming
-                rename_map = {
-                    "date": "FY",
-                    "Index_Futures_QTY": "Index_Futures_Qty",
-                    "Index_Futures_VAL": "Index_Futures_Val",
-                    "Stock_Futures_QTY": "Stock_Futures_Qty",
-                    "Stock_Futures_VAL": "Stock_Futures_Val",
-                    "Index_Options_QTY": "Index_Options_Qty",
-                    "Index_Options_VAL": "Index_Options_Val",
-                    "Index_Options_PREM_VAL": "Index_Options_Prem_Val",
-                    "Stock_Options_QTY": "Stock_Options_Qty",
-                    "Stock_Options_VAL": "Stock_Options_Val",
-                    "Stock_Options_PREM_VAL": "Stock_Options_Prem_Val",
-                    "F&O_Total_QTY": "FO_Total_Qty",
-                    "F&O_Total_VAL": "FO_Total_Val",
-                    "TOTAL_TRADED_PREM_VAL": "Total_Traded_Prem_Val",
-                    "F&O_AVG_DAILYTURNOVER": "FO_Avg_Daily_Turnover"
-                }
-                df.rename(columns=rename_map, inplace=True)
-
-            elif mode.lower() == "monthly":
-                rename_map = {
-                    "date": "Month",
-                    "Index_Futures_QTY": "Index_Futures_Qty",
-                    "Index_Futures_VAL": "Index_Futures_Val",
-                    "Stock_Futures_QTY": "Stock_Futures_Qty",
-                    "Stock_Futures_VAL": "Stock_Futures_Val",
-                    "Index_Options_QTY": "Index_Options_Qty",
-                    "Index_Options_VAL": "Index_Options_Val",
-                    "Index_Options_PREM_VAL": "Index_Options_Prem_Val",
-                    "Stock_Options_QTY": "Stock_Options_Qty",
-                    "Stock_Options_VAL": "Stock_Options_Val",
-                    "Stock_Options_PREM_VAL": "Stock_Options_Prem_Val",
-                    "F&O_Total_QTY": "FO_Total_Qty",
-                    "F&O_Total_VAL": "FO_Total_Val",
-                    "TOTAL_TRADED_PREM_VAL": "Total_Traded_Prem_Val",
-                    "F&O_AVG_DAILYTURNOVER": "FO_Avg_Daily_Turnover"
-                }
-                df.rename(columns=rename_map, inplace=True)
-
-            elif mode.lower() == "daily":
-                rename_map = {
-                    "date": "Date",
-                    "Index_Futures_QTY": "Index_Futures_Qty",
-                    "Index_Futures_VAL": "Index_Futures_Val",
-                    "Stock_Futures_QTY": "Stock_Futures_Qty",
-                    "Stock_Futures_VAL": "Stock_Futures_Val",
-                    "Index_Options_QTY": "Index_Options_Qty",
-                    "Index_Options_VAL": "Index_Options_Val",
-                    "Index_Options_PREM_VAL": "Index_Options_Prem_Val",
-                    "Index_Options_PUT_CALL_RATIO": "Index_Options_PCR",
-                    "Stock_Options_QTY": "Stock_Options_Qty",
-                    "Stock_Options_VAL": "Stock_Options_Val",
-                    "Stock_Options_PREM_VAL": "Stock_Options_Prem_Val",
-                    "Stock_Options_PUT_CALL_RATIO": "Stock_Options_PCR",
-                    "F&O_Total_QTY": "FO_Total_Qty",
-                    "F&O_Total_VAL": "FO_Total_Val",
-                    "TOTAL_TRADED_PREM_VAL": "Total_Traded_Prem_Val",
-                    "F&O_Total_PUT_CALL_RATIO": "FO_Total_PCR"
-                }
-                df.rename(columns=rename_map, inplace=True)
-
-            # --- Make JSON-serializable ---
-            return df.astype(object).to_dict(orient='records')
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"❌ Error fetching F&O data: {e}")
-            return None
-
-
-    def fno_monthly_settlement_report(self, *args, from_year=None, to_year=None, period=None):
-        """
-        Fetch NSE Monthly Settlement Statistics (F&O) for given financial years or period.
+        Return historical options price/volume data for a symbol.
 
         Parameters
         ----------
         *args : str
-            Can include years (e.g., "2023") or periods ("1Y", "2Y").
-        from_year : int, optional
-            Financial year start (FY start year).
-        to_year : int, optional
-            Financial year end (FY start year + 1).
+            Required: ``symbol``, ``instrument``.
+            Optional positional: option type (``"CE"`` / ``"PE"``),
+            strike price string, period code, expiry string, dates.
+        instrument : str
+            ``"Index Options"`` / ``"index"`` or ``"Stock Options"`` /
+            ``"stock"`` (case-insensitive).
+        expiry : str, optional
+            Target expiry date in ``DD-MM-YYYY`` (passed as ``kwargs``).
+        option_type : str, optional
+            ``"CE"`` or ``"PE"``; if omitted both sides are returned.
+        strike_price : str or int, optional
+            Strike price filter, e.g. ``"47000"``.
+        from_date : str, optional
+            Start date in ``DD-MM-YYYY``.
+        to_date : str, optional
+            End date in ``DD-MM-YYYY``.
         period : str, optional
-            Predefined period: "1Y", "2Y", "3Y", "5Y".
+            Shorthand: ``"1M"``, ``"3M"``.
 
         Returns
         -------
         pd.DataFrame
-            Monthly F&O settlement statistics with cleaned numeric columns.
+
+        Examples
+        --------
+        >>> nse.option_price_volume_data("NIFTY", "Index", "01-10-2025", "17-10-2025", expiry="20-10-2025")
+        >>> nse.option_price_volume_data("ITC", "Stock Options", "CE", "01-10-2025", "17-10-2025", expiry="28-10-2025")
+        >>> nse.option_price_volume_data("BANKNIFTY", "Index Options", "47000", "01-10-2025", "17-10-2025", expiry="28-10-2025")
+        >>> nse.option_price_volume_data("BANKNIFTY", "Index Options", "3M")
+        >>> nse.option_price_volume_data("NIFTY", "Index Options", "PE", "01-10-2025", expiry="28-10-2025")
         """
-
-        # --- Auto-detect arguments ---
-        for arg in args:
-            if isinstance(arg, str):
-                if re.match(r"^\d{4}$", arg):  # year
-                    if not from_year:
-                        from_year = int(arg)
-                    elif not to_year:
-                        to_year = int(arg)
-                elif arg.upper() in ["1Y", "2Y", "3Y", "5Y"]:
-                    period = arg.upper()
-
-        # --- Determine financial years ---
+        dd    = "%d-%m-%Y"
         today = datetime.now()
-        current_month = today.month
-        current_fy_start = today.year if current_month >= 4 else today.year - 1
 
-        if period and not from_year:
-            years_back = int(period.replace("Y", ""))
-            from_year = current_fy_start - years_back
-            to_year = current_fy_start + 1  # include current FY
-        elif not from_year:
-            from_year = current_fy_start
-            to_year = current_fy_start + 1
-        elif not to_year:
-            to_year = from_year + 1
+        if len(args) < 2:
+            raise ValueError("Provide at least symbol and instrument as positional arguments.")
 
-        # --- Rotate user-agent & base URLs ---
-        self.rotate_user_agent()
-        ref_url = "https://www.nseindia.com/report-detail/monthly-settlement-statistics"
-        base_api = "https://www.nseindia.com/api/financial-monthlyStats?from_date=Apr-{}&to_date=Mar-{}"
+        symbol     = args[0].strip().upper()
+        instrument = args[1].strip().lower()
+        expiry = from_date = to_date = period = option_type = strike_price = None
+
+        for arg in args[2:]:
+            arg = str(arg).strip().upper()
+            if arg in ("1D", "1W", "1M", "3M", "6M"):
+                period = arg
+            elif any(m in arg for m in _MONTH_NUM):
+                expiry = arg
+            elif arg in ("CE", "PE"):
+                option_type = arg
+            elif "-" in arg and len(arg.split("-")) == 3 and all(p.isdigit() for p in arg.split("-")):
+                if not from_date:
+                    from_date = arg
+                else:
+                    to_date = arg
+
+        expiry       = expiry       or kwargs.get("expiry")
+        from_date    = from_date    or kwargs.get("from_date")
+        to_date      = to_date      or kwargs.get("to_date")
+        period       = period       or kwargs.get("period")
+        option_type  = option_type  or kwargs.get("option_type")
+        strike_price = strike_price or kwargs.get("strike_price")
+
+        if instrument in ("optidx", "index options", "index option", "index"):
+            instrument = "OPTIDX"
+        elif instrument in ("optstk", "stock options", "stock option", "stock"):
+            instrument = "OPTSTK"
+        else:
+            raise ValueError("instrument must be 'Index Options' or 'Stock Options'")
+
+        expiry_date = None
+        if expiry:
+            try:
+                expiry = str(expiry).upper()
+                if (
+                    "-" in expiry
+                    and len(expiry.split("-")) == 3
+                    and all(p.isdigit() for p in expiry.split("-"))
+                ):
+                    expiry_date = datetime.strptime(expiry, "%d-%m-%Y").strftime("%d-%b-%Y")
+                elif any(m in expiry for m in _MONTH_NUM):
+                    # Bug 5 fix: self.get_expiries() does not exist; replaced with
+                    # the same meta-API pattern used by future_price_volume_data.
+                    mon, yr = expiry.split("-")
+                    ey      = 2000 + int(yr)
+                    meta_url = (
+                        f"https://www.nseindia.com/api/historicalOR/meta/foCPV/expireDts"
+                        f"?instrument={instrument}&symbol={symbol}&year={ey}"
+                    )
+                    meta_resp = self._warm_and_fetch(
+                        "https://www.nseindia.com/report-detail/fo_eq_security",
+                        meta_url, timeout=15
+                    )
+                    el      = meta_resp.json().get("expiresDts", [])
+                    matched = [x for x in el if mon in x.upper()]
+                    if not matched:
+                        return pd.DataFrame()
+                    expiry_date = max(
+                        matched, key=lambda d: datetime.strptime(d, "%d-%b-%Y")
+                    )
+            except Exception as exc:
+                self._log_error("option_price_volume_data expiry", exc)
+                return pd.DataFrame()
+
+        if not expiry and period:
+            d         = {"1D": 1, "1W": 7, "1M": 30, "3M": 90, "6M": 180}.get(period.upper(), 30)
+            from_date = today - timedelta(days=d)
+            to_date   = today
+
+        from_date = (
+            datetime.strptime(from_date, dd) if isinstance(from_date, str)
+            else from_date or today - timedelta(days=180)
+        )
+        to_date = (
+            datetime.strptime(to_date, dd) if isinstance(to_date, str)
+            else to_date or (datetime.strptime(expiry_date, "%d-%b-%Y") if expiry_date else today)
+        )
+
+        params = {
+            "from": from_date.strftime(dd), "to": to_date.strftime(dd),
+            "instrumentType": instrument, "symbol": symbol,
+            "year": today.year, "csv": "true",
+        }
+        if expiry_date:  params["expiryDate"]  = expiry_date
+        if option_type:  params["optionType"]  = option_type
+        if strike_price: params["strikePrice"] = strike_price
+
+        def _call():
+            return self._warm_and_fetch(
+                "https://www.nseindia.com/option-chain",
+                "https://www.nseindia.com/api/historicalOR/foCPV",
+                params=params,
+                timeout=15,
+                api_timeout=20,
+            ).json().get("data", [])
 
         try:
-            # --- Get NSE cookies ---
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()
-            cookies = ref_response.cookies.get_dict()
+            data = self._retry(_call)
+        except Exception as exc:
+            self._log_error("option_price_volume_data", exc)
+            return pd.DataFrame()
 
-            all_data = []
-            empty_fys = []
-
-            for fy_start in range(from_year, to_year):
-                fy_end = fy_start + 1
-                fin_year = f"{fy_start}-{fy_end}"
-                api_url = base_api.format(fy_start, fy_end)
-
-                # --- Fetch with retry ---
-                for attempt in range(3):
-                    try:
-                        response = self.session.get(api_url, headers=self.headers, cookies=cookies, timeout=15)
-                        if response.status_code == 200:
-                            js = response.json()
-
-                            # --- Handle top-level list or 'data' key ---
-                            if isinstance(js, list) and js:
-                                for rec in js:
-                                    rec["FinancialYear"] = fin_year
-                                all_data.extend(js)
-                                # print(f"✅ {fin_year} data fetched ({len(js)} records).")
-                            elif "data" in js and isinstance(js["data"], list) and js["data"]:
-                                for rec in js["data"]:
-                                    rec["FinancialYear"] = fin_year
-                                all_data.extend(js["data"])
-                                # print(f"✅ {fin_year} data fetched ({len(js['data'])} records).")
-                            else:
-                                empty_fys.append(fin_year)
-                                print(f"⚠️ No data for {fin_year}.")
-                            break
-                        else:
-                            print(f"⚠️ Failed for {fin_year} | HTTP {response.status_code}")
-                    except Exception as e:
-                        print(f"⚠️ Attempt {attempt+1} failed for {fin_year}: {e}")
-                        time.sleep(1)
-                time.sleep(0.8)  # polite delay
-
-            if not all_data:
-                print(f"⚠️ No settlement data found from FY {from_year} to current.")
-                return None
-
-            # --- Create DataFrame ---
-            df = pd.DataFrame(all_data)
-
-            # --- Rename columns ---
-            rename_map = {
-                "st_date": "Month",
-                "st_Mtm": "Fut MTM Settlement",
-                "st_Final": "Fut Final Settlement",
-                "st_Premium": "Opt Premium Settlement",
-                "st_Excercise": "Opt Exercise Settlement",
-                "st_Total": "Total"
-            }
-            df.rename(columns=rename_map, inplace=True)
-
-            # --- Clean numeric columns ---
-            numeric_cols = ["Fut MTM Settlement", "Fut Final Settlement",
-                            "Opt Premium Settlement", "Opt Exercise Settlement", "Total"]
-            for col in numeric_cols:
-                df[col] = pd.to_numeric(df[col].astype(str).str.replace(",", "").str.strip(), errors='coerce')
-
-            # --- Parse Month as datetime for sorting ---
-            df["Month_dt"] = pd.to_datetime(df["Month"], format="%b-%Y", errors='coerce')
-            df.sort_values(["FinancialYear", "Month_dt"], inplace=True)
-            df.reset_index(drop=True, inplace=True)
-            df["Month"] = df["Month_dt"].dt.strftime('%b-%Y')  # keep display format
-            df.drop(columns=["Month_dt"], inplace=True)
-
-            # print(f"ℹ️ Data fetching complete from FY {from_year} to FY {to_year-1}.")
-            if empty_fys:
-                print(f"⚠️ No data found for FYs: {', '.join(empty_fys)}")
-
+        df = pd.DataFrame(data)
+        if df.empty:
             return df
-        except Exception as e:
-            print(f"❌ Error fetching Monthly Settlement data: {e}")
-            return None
 
-    #---------------------------------------------------------- SEBI_Data ----------------------------------------------------------------
+        df.columns = [c.upper().replace(" ", "_") for c in df.columns]
+        for col in [
+            "FH_OPENING_PRICE", "FH_TRADE_HIGH_PRICE", "FH_TRADE_LOW_PRICE",
+            "FH_CLOSING_PRICE", "FH_LAST_TRADED_PRICE", "FH_PREV_CLS",
+            "FH_SETTLE_PRICE", "FH_TOT_TRADED_QTY", "FH_TOT_TRADED_VAL",
+            "FH_OPEN_INT", "FH_CHANGE_IN_OI", "CALCULATED_PREMIUM_VAL",
+        ]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    def sebi_circulars(self,*args, period="1W"):
+        if "FH_TOT_TRADED_QTY" in df.columns:
+            df = df[df["FH_TOT_TRADED_QTY"] > 0]
+
+        def _sfmt(x, fmt):
+            if pd.isna(x):
+                return ""
+            if isinstance(x, (pd.Timestamp, datetime)):
+                return x.strftime(fmt)
+            try:
+                return pd.to_datetime(x, errors="coerce").strftime(fmt)
+            except Exception:
+                return str(x)
+
+        for col, fmt in (
+            ("FH_TIMESTAMP",       "%d-%b-%Y"),
+            ("FH_EXPIRY_DT",       "%d-%b-%Y"),
+            ("FH_TIMESTAMP_ORDER", "%d-%b-%Y %H:%M:%S"),
+        ):
+            if col in df.columns:
+                df[col] = df[col].apply(lambda x, f=fmt: _sfmt(x, f))
+
+        return df.sort_values(
+            [c for c in ("FH_TIMESTAMP", "FH_EXPIRY_DT") if c in df.columns]
+        ).reset_index(drop=True)
+
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ── FnO — Periodic Reports ──────────────────────────────────────────────
+
+    def fno_dmy_biz_growth(
+        self,
+        *args,
+        mode:  str         = "monthly",
+        month: int | None  = None,
+        year:  int | None  = None,
+    ) -> list[dict] | None:
         """
-        Fetch SEBI circulars with flexible auto-detect arguments.
-        
-        Usage:
-            get_sebi_circulars("01-10-2025", "10-10-2025")  # explicit from and to
-            get_sebi_circulars("01-10-2025")               # from date only, to today
-            get_sebi_circulars(period="1W")                # last 1 week
+        Return F&O business-growth data (daily / monthly / yearly).
+
+        Parameters
+        ----------
+        *args : str or int
+            Positional shorthand — mode string, month name/number, or
+            4-digit year.
+        mode : str, optional
+            ``"daily"``, ``"monthly"`` (default), or ``"yearly"``.
+        month : int, optional
+            Month number 1–12 (only used for ``"daily"`` mode).
+        year : int, optional
+            4-digit year. Defaults to the current year.
+
+        Returns
+        -------
+        list of dict or None
+
+        Examples
+        --------
+        >>> nse.fno_dmy_biz_growth()
+        >>> nse.fno_dmy_biz_growth("yearly")
+        >>> nse.fno_dmy_biz_growth("daily", month="OCT", year=2025)
+        """
+        mode, month, year = _parse_biz_growth_args(args, month, year, mode)
+        return self._biz_growth_fetch("fo", mode, month, year)
+
+    def fno_monthly_settlement_report(
+        self,
+        *args,
+        from_year: int | None = None,
+        to_year:   int | None = None,
+        period:    str | None = None,
+    ) -> pd.DataFrame | None:
+        """
+        Return F&O monthly settlement statistics.
+
+        Parameters
+        ----------
+        *args : str or int
+            Positional shorthand — 4-digit year strings or period codes.
+        from_year : int, optional
+            Start financial year.
+        to_year : int, optional
+            End financial year.
+        period : str, optional
+            Shorthand: ``"1Y"``, ``"2Y"``, ``"3Y"``.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.fno_monthly_settlement_report()
+        >>> nse.fno_monthly_settlement_report("2024", "2025")
+        >>> nse.fno_monthly_settlement_report("2Y")
+        """
+        from_year, to_year, period = _parse_settlement_args(args, from_year, to_year, period)
+        return self._monthly_settlement(
+            from_year, to_year, period,
+            "https://www.nseindia.com/api/financial-monthlyStats?from_date=Apr-{}&to_date=Mar-{}",
+            {
+                "st_date":     "Month",
+                "st_Mtm":      "Fut MTM Settlement",
+                "st_Final":    "Fut Final Settlement",
+                "st_Premium":  "Opt Premium Settlement",
+                "st_Excercise":"Opt Exercise Settlement",
+                "st_Total":    "Total",
+            },
+        )
+
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ── SEBI ────────────────────────────────────────────────────────────────
+
+    def sebi_circulars(
+        self,
+        *args,
+        period: str = "1W",
+    ) -> pd.DataFrame:
+        """
+        Fetch SEBI circulars within a date range or period.
+
+        Parameters
+        ----------
+        *args : str
+            Positional date shorthand:
+            - Two dates → ``from_date``, ``to_date`` (``DD-MM-YYYY``)
+            - One date  → ``from_date`` to today
+            - Period string → e.g. ``"1M"`` (overrides *period* kwarg)
+        period : str, optional
+            Lookback period: ``"1W"`` (default), ``"2W"``, ``"3W"``,
+            ``"1M"``, ``"2M"``, ``"3M"``, ``"6M"``, ``"1Y"``, ``"2Y"``.
+            Ignored when date args are provided.
+
+        Returns
+        -------
+        pd.DataFrame
+            Columns: Date, Title, Link.
+
+        Examples
+        --------
+        >>> nse.sebi_circulars()
+        >>> nse.sebi_circulars("01-10-2025", "10-10-2025")
+        >>> nse.sebi_circulars("01-10-2025")
+        >>> nse.sebi_circulars("1M")
         """
         today = datetime.today()
-        from_date_dt = None
-        to_date_dt = None
+        mult  = {"D": 1, "W": 7, "M": 30, "Y": 365}
 
-        # --- Auto-detect arguments ---
-        if period:  # period string takes priority
-            period = period.upper()
-            if period.endswith("D"):
-                days = int(period[:-1])
-                from_date_dt = today - timedelta(days=days)
-                to_date_dt = today
-            elif period.endswith("W"):
-                weeks = int(period[:-1])
-                from_date_dt = today - timedelta(weeks=weeks)
-                to_date_dt = today
-            elif period.endswith("M"):
-                months = int(period[:-1])
-                from_date_dt = today - timedelta(days=30*months)  # approximate
-                to_date_dt = today
-            elif period.endswith("Y"):
-                years = int(period[:-1])
-                from_date_dt = today - timedelta(days=365*years)  # approximate
-                to_date_dt = today
+        # Resolve dates from positional args or period
+        if len(args) == 2:
+            fd = datetime.strptime(args[0], "%d-%m-%Y")
+            td = datetime.strptime(args[1], "%d-%m-%Y")
+        elif len(args) == 1:
+            arg = args[0].upper()
+            if len(arg) >= 2 and arg[-1] in mult and arg[:-1].isdigit():
+                # treat as period string
+                fd = today - timedelta(days=int(arg[:-1]) * mult[arg[-1]])
+                td = today
             else:
-                raise ValueError("Invalid period format. Use 1W, 1M, 3M, 6M, 1Y, etc.")
-        elif len(args) == 2:  # from_date and to_date
-            from_date_dt = datetime.strptime(args[0], "%d-%m-%Y")
-            to_date_dt = datetime.strptime(args[1], "%d-%m-%Y")
-        elif len(args) == 1:  # only from_date
-            from_date_dt = datetime.strptime(args[0], "%d-%m-%Y")
-            to_date_dt = today
+                fd = datetime.strptime(args[0], "%d-%m-%Y")
+                td = today
+        elif period:
+            p  = period.upper()
+            fd = today - timedelta(days=int(p[:-1]) * mult.get(p[-1], 7))
+            td = today
         else:
-            # default last 7 days
-            from_date_dt = today - timedelta(days=7)
-            to_date_dt = today
+            fd, td = today - timedelta(days=7), today
 
-        # Format dates for SEBI
-        from_date_str = from_date_dt.strftime("%d-%m-%Y")
-        to_date_str = to_date_dt.strftime("%d-%m-%Y")
-
-        # --- SEBI POST request ---
-        url = "https://www.sebi.gov.in/sebiweb/ajax/home/getnewslistinfo.jsp"
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://www.sebi.gov.in/sebiweb/home/HomeAction.do?doListing=yes&sid=1&ssid=7&smid=0",
-            "Origin": "https://www.sebi.gov.in",
-            "X-Requested-With": "XMLHttpRequest",
-        }
         payload = {
-            "fromDate": from_date_str,
-            "toDate": to_date_str,
-            "fromYear": "",
-            "toYear": "",
-            "deptId": "-1",
-            "sid": "1",
-            "ssid": "7",
-            "smid": "0",
-            "ssidhidden": "7",
-            "intmid": "-1",
-            "sText": "",
-            "ssText": "Circulars",
-            "smText": "",
-            "doDirect": "-1",
-            "nextValue": "1",
-            "nextDel": "1",
-            "totalpage": "1",
+            "fromDate":   fd.strftime("%d-%m-%Y"),
+            "toDate":     td.strftime("%d-%m-%Y"),
+            "fromYear":   "", "toYear": "", "deptId": "-1",
+            "sid": "1",   "ssid": "7", "smid": "0", "ssidhidden": "7",
+            "intmid": "-1", "sText": "", "ssText": "Circulars", "smText": "",
+            "doDirect": "-1", "nextValue": "1", "nextDel": "1", "totalpage": "1",
         }
+        rows = self._sebi_post(payload)
+        return self._finalise_sebi_df(pd.DataFrame(rows))
 
-        resp = requests.post(url, headers=headers, data=payload, timeout=15)
-        soup = BeautifulSoup(resp.text, "html.parser")
-        table = soup.find("table", {"id": "sample_1"})
-        rows = []
-        if table:
-            for tr in table.find_all("tr")[1:]:
-                tds = tr.find_all("td")
-                if len(tds) >= 2:
-                    date = pd.to_datetime(tds[0].text.strip(), errors='coerce')
-                    link_tag = tds[1].find("a")
-                    title = link_tag.get("title") if link_tag else tds[1].text.strip()
-                    href = link_tag.get("href") if link_tag else None
-                    if href and not href.startswith("http"):
-                        href = "https://www.sebi.gov.in" + href
-                    rows.append({"Date": date, "Title": title, "Link": href})
-        df = pd.DataFrame(rows)
-        if not df.empty:
-            df.sort_values("Date", ascending=False, inplace=True)
-            df.drop_duplicates(subset=["Date", "Title"], inplace=True)
-            df.reset_index(drop=True, inplace=True)
-            df['Date'] = df['Date'].dt.strftime('%d-%b-%Y')
-        return df
-
-    def sebi_data(self,pages=1):
+    def sebi_data(self, pages: int = 1) -> pd.DataFrame:
         """
-        Fetch latest SEBI circulars from the official AJAX endpoint.
-        :param pages: Number of pages to fetch (default: 1)
-        :return: DataFrame of circulars
+        Paginate through the SEBI circular listing and return all records.
+
+        Parameters
+        ----------
+        pages : int, optional
+            Number of pages to fetch. Default is ``1``.
+
+        Returns
+        -------
+        pd.DataFrame
+            Columns: Date, Title, Link; sorted descending by date.
+
+        Examples
+        --------
+        >>> nse.sebi_data()
+        >>> nse.sebi_data(pages=3)
         """
-        base_url = "https://www.sebi.gov.in/sebiweb/ajax/home/getnewslistinfo.jsp"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Referer": "https://www.sebi.gov.in/sebiweb/home/HomeAction.do?doListing=yes&sid=1&ssid=7&smid=0",
-            "Origin": "https://www.sebi.gov.in",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-
-        all_rows = []
-        session = requests.Session()
-
+        all_rows: list[dict] = []
         for page in range(1, pages + 1):
             payload = {
-                "nextValue": str(page),
-                "nextDel": str(page),
-                "totalpage": str(pages),
-                "nextPage": "",
-                "doDirect": "1"
+                "nextValue": str(page), "nextDel": str(page),
+                "totalpage": str(pages), "nextPage": "",
+                "doDirect":  "1",
             }
-
-            resp = session.post(base_url, headers=headers, data=payload, timeout=15)
-            if resp.status_code != 200:
-                print(f"⚠️ Page {page}: HTTP {resp.status_code} error.")
+            rows = self._sebi_post(payload)
+            if not rows:
                 break
+            all_rows.extend(rows)
 
-            soup = BeautifulSoup(resp.text, "html.parser")
-            table = soup.find("table", {"id": "sample_1"})
-            if not table:
-                print(f"⚠️ Page {page}: No table found.")
-                break
+        return self._finalise_sebi_df(pd.DataFrame(all_rows))
 
-            # Extract rows
-            for tr in table.find_all("tr")[1:]:
-                tds = tr.find_all("td")
-                if len(tds) < 2:
-                    continue
-                date = tds[0].get_text(strip=True)
-                link_tag = tds[1].find("a")
-                title = link_tag.get("title", "").strip() if link_tag else tds[1].get_text(strip=True)
-                href = link_tag.get("href") if link_tag else None
-                if href and not href.startswith("http"):
-                    href = "https://www.sebi.gov.in" + href
-                all_rows.append({"Date": date, "Title": title, "Link": href})
 
-            # print(f"✅ Page {page} extracted ({len(all_rows)} total so far)")
+    # ════════════════════════════════════════════════════════════════════════
+    # ── Miscellaneous ───────────────────────────────────────────────────────
 
-        # Build DataFrame
-        df = pd.DataFrame(all_rows)
-        if not df.empty:
-            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-            df.sort_values("Date", ascending=False, inplace=True)
-            df.drop_duplicates(subset=["Date", "Title"], keep="first", inplace=True)
-            df.reset_index(drop=True, inplace=True)
-            df['Date'] = df['Date'].dt.strftime('%d-%b-%Y')
-            # print(f"✅ Total Circulars Extracted: {len(df)}")
-        else:
-            print("⚠️ No data extracted — check SEBI endpoint or payload values.")
+    def quarterly_financial_results(self, symbol: str) -> dict | None:
+        """Return the last 3 quarterly financial results for a symbol.
 
-        return df
-    
-    def quarterly_financial_results(self,symbol: str):
-        self.rotate_user_agent()  # Rotating User-Agent
+        Parameters
+        ----------
+        symbol : str
+            NSE equity symbol, e.g. ``"TCS"``.
 
-        ref_url = 'https://www.nseindia.com/'
-        api_url = f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi?functionName=getIntegratedFilingData&symbol={symbol}"
+        Returns
+        -------
+        dict or None
+            Consolidated/Standalone data with Income, PBT, Net Profit,
+            and EPS per quarter.
 
-        # --- Fetch & process ---
+        Examples
+        --------
+        >>> nse.quarterly_financial_results("TCS")
+        """
+        return self._get_json(
+            "https://www.nseindia.com/option-chain",
+            f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
+            f"?functionName=getIntegratedFilingData&symbol={symbol}",
+        )
 
+    def recent_annual_reports(self) -> pd.DataFrame:
+        """
+        Parse the NSE annual-reports RSS feed into a structured table.
+
+        Returns
+        -------
+        pd.DataFrame
+            Columns: symbol, companyName, fyFrom, fyTo, link,
+            submissionDate, SME.
+
+        Examples
+        --------
+        >>> nse.recent_annual_reports()
+        """
         try:
-            # Get reference cookies from the main page
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()  # Ensure request was successful
-
-            # Make API call using cookies from the previous request
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()  # Ensure request was successful
-
-            # Convert response to JSON
-            data = response.json()
-
-            return data
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching data: {e}")
-            return None   
-        
-    def list_of_indices(self):
-        self.rotate_user_agent()  # Rotating User-Agent
-
-        ref_url = 'https://www.nseindia.com/'
-        api_url = f"https://www.nseindia.com/api/equity-master"
-
-        # --- Fetch & process ---
-
-        try:
-            # Get reference cookies from the main page
-            ref_response = self.session.get(ref_url, headers=self.headers, timeout=10)
-            ref_response.raise_for_status()  # Ensure request was successful
-
-            # Make API call using cookies from the previous request
-            response = self.session.get(api_url, headers=self.headers, cookies=ref_response.cookies.get_dict(), timeout=10)
-            response.raise_for_status()  # Ensure request was successful
-
-            # Convert response to JSON
-            data = response.json()
-
-            return data
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            print(f"Error fetching data: {e}")
-            return None 
-
-    def recent_annual_reports(self):
-        rss_url = "https://nsearchives.nseindia.com/content/RSS/Annual_Reports.xml"
-
-        try:
-            response = self.session.get(rss_url, headers=self.headers, timeout=10)
-            response.raise_for_status()
-
-            feed = feedparser.parse(response.text)
+            raw  = self._get_archive(
+                "https://nsearchives.nseindia.com/content/RSS/Annual_Reports.xml"
+            )
+            if not raw:
+                return pd.DataFrame()
+            feed    = feedparser.parse(raw.decode("utf-8", "ignore"))
             records = []
 
             for item in feed.entries:
-                title = item.get("title", "")
-                link = item.get("link", "")
-                desc = item.get("description", "")
-
-                filename = link.split("/")[-1]
-
-                # SME detection
-                SME = "SME" if filename.startswith("SME_AR_") else ""
-
-                # Unified regex
-                pattern = r"(?:SME_)?AR_\d+_(?P<symbol>[A-Z0-9]+)_(?P<fyFrom>\d{4})_(?P<fyTo>\d{4})_"
-                m = re.search(pattern, filename)
-
+                fn  = item.get("link", "").split("/")[-1]
+                sme = "SME" if fn.startswith("SME_AR_") else ""
+                m   = re.search(
+                    r"(?:SME_)?AR_\d+_(?P<symbol>[A-Z0-9]+)_(?P<fyFrom>\d{4})_(?P<fyTo>\d{4})_",
+                    fn,
+                )
                 if not m:
                     continue
-
-                symbol = m.group("symbol")
-                fyFrom = int(m.group("fyFrom"))
-                fyTo   = int(m.group("fyTo"))
-
-                # Submission date
-                date_match = re.search(r"(\d{2}-[A-Z]{3}-\d{2})", desc)
-                submissionDate = None
-                if date_match:
-                    submissionDate = datetime.strptime(
-                        date_match.group(1), "%d-%b-%y"
-                    ).strftime("%d-%b-%Y")
-
+                dm  = re.search(r"(\d{2}-[A-Z]{3}-\d{2})", item.get("description", ""))
+                sub = (
+                    datetime.strptime(dm.group(1), "%d-%b-%y").strftime("%d-%b-%Y")
+                    if dm else None
+                )
                 records.append({
-                    "symbol": symbol,
-                    "companyName": title,
-                    "fyFrom": fyFrom,
-                    "fyTo": fyTo,
-                    "link": link,
-                    "submissionDate": submissionDate,
-                    "SME": SME
+                    "symbol":         m.group("symbol"),
+                    "companyName":    item.get("title", ""),
+                    "fyFrom":         int(m.group("fyFrom")),
+                    "fyTo":           int(m.group("fyTo")),
+                    "link":           item.get("link", ""),
+                    "submissionDate": sub,
+                    "SME":            sme,
                 })
-
             return pd.DataFrame(records)
 
-        except Exception as e:
-            print(f"Error fetching annual reports: {e}")
+        except Exception as exc:
+            self._log_error("recent_annual_reports", exc)
             return pd.DataFrame()
+
+    def html_tables(
+        self,
+        url:         str,
+        show_tables: bool = False,
+        output:      str  = "json",
+    ) -> list | None:
+        """
+        Fetch an NSE page and extract all HTML tables.
+
+        Parameters
+        ----------
+        url : str
+            Full URL of the NSE page to scrape.
+        show_tables : bool, optional
+            If ``True``, print a preview of each table found.
+            Default is ``False``.
+        output : str, optional
+            ``"json"`` (default) returns a list of record dicts.
+            ``"df"`` returns a list of raw ``DataFrame`` objects.
+
+        Returns
+        -------
+        list or None
+            List of dicts (json mode) or list of DataFrames (df mode).
+        """
+        self.rotate_user_agent()
+        try:
+            resp = self._live_ref_fetch(
+                "https://www.nseindia.com/option-chain",
+                url,
+                timeout=20,
+                api_timeout=30,
+            )
+            if resp is None:
+                return None
+            tables = pd.read_html(StringIO(resp.text))
+            print(f"Total tables found: {len(tables)}")
+
+            if show_tables:
+                for i, t in enumerate(tables):
+                    print(f"\nTable {i}")
+                    print(t.head())
+
+            if output.lower() == "json":
+                return [t.to_dict(orient="records") for t in tables]
+            return tables
+
+        except Exception as exc:
+            self._log_error("html_tables", exc)
+            return None
+
