@@ -1,12 +1,19 @@
-#=====================================================================#
-#                                   NseKit
-#=====================================================================#
+#=============================================================================================================================#
+#                                                            NseKit
+#=============================================================================================================================#
 
-# from NseKit import NseKit, Moneycontrol
-import NseKit, Moneycontrol
+# import NseKit, Moneycontrol
+
+from NseKit import NseKit, Moneycontrol
 from rich.console import Console
 
-# #------------------------------------------ Configuration Section ----------------------------------------------------------
+# #---------------------------------------------------------- Cookie ----------------------------------------------------------
+
+# # 🔹 Cookie
+# NseKit.Nse.clear_cookie_cache()                                                                   #  Delete the cookie cache
+
+
+# #--------------------------------------------------- Configuration Section ----------------------------------------------------
 
 # You can control settings globally or per-instance.
 
@@ -24,11 +31,6 @@ get  = NseKit.Nse()
 # #-----------------
 mc   = Moneycontrol
 rich = Console()
-
-# #---------------------------------------------------------- Cookie ----------------------------------------------------------
-
-# # 🔹 Cookie
-# get.clear_cookie_cache()                                                                    #  Delete the cookie cache
 
 # #---------------------------------------------------------- NSE Data ----------------------------------------------------------
 
@@ -184,6 +186,14 @@ rich = Console()
 # # 🔹 Fetch live Capital Market statistics from NSE
 # print(get.cm_live_market_statistics())                                                    #  Capital Market statistics
 
+# #---------------------------------------------------------- Live Chart Data ----------------------------------------------------------
+
+# print(get.index_chart("NIFTY 50","1D"))                                                    # "1D" "1M" "3M" "6M" "1Y"
+# print(get.stock_chart("RELIANCE", "1D"))                                                  
+# print(get.fno_chart("TCS", "FUTSTK","30-03-2026"))
+# print(get.fno_chart("NIFTY", "OPTIDX","30-03-2026","PE25700"))
+
+# print(get.india_vix_chart())
 
 
 # #---------------------------------------------------------- Capital Market Live Data ----------------------------------------------------------
@@ -320,14 +330,6 @@ rich = Console()
 # print(get.html_tables(url, show_tables=False, output="json"))
 
 
-# #---------------------------------------------------------- Live Chart Data ----------------------------------------------------------
-
-# print(get.index_chart("NIFTY 50","1D"))                                                    # "1D" "1M" "3M" "6M" "1Y"
-# print(get.stock_chart("RELIANCE", "1D"))
-# print(get.fno_chart("TCS", "FUTSTK","30-03-2026"))
-# print(get.fno_chart("NIFTY", "OPTIDX","30-03-2026","PE25700"))
-
-# print(get.india_vix_chart())
 
 # #---------------------------------------------------------- FnO Live Data ----------------------------------------------------------
 

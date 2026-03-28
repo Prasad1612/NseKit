@@ -681,18 +681,31 @@ class Nse:
         """Randomly rotate the ``User-Agent`` header to reduce rate-limiting."""
         self.headers["User-Agent"] = random.choice(_USER_AGENTS)
 
-    def clear_cookie_cache(self) -> None:
+    @staticmethod
+    def clear_cookie_cache() -> int:
         """
         Delete the on-disk cookie cache so the next ``Nse()`` instantiation
-        performs a full warm-up.  Useful when NSE changes its session scheme.
+        performs a full warm-up.
         """
+        deleted = 0
+        base = Nse._COOKIE_CACHE
+
         for ext in ("", ".db", ".dir", ".bak", ".dat"):
-            path = self._COOKIE_CACHE + ext
+            path = base + ext
             try:
                 if os.path.exists(path):
                     os.remove(path)
+                    deleted += 1
             except OSError:
                 pass
+
+        # optional message
+        if deleted:
+            print(f"🧹 Cookie cache cleared — {deleted} file(s) deleted")
+        else:
+            print("ℹ️  No cookie cache files found")
+
+        return deleted
 
     # ── Rate Limiting ───────────────────────────────────────────────────────
 
