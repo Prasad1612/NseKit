@@ -119,8 +119,30 @@ class NseConfig:
     def __new__(cls):
         raise TypeError("NseConfig is a namespace — do not instantiate it")
 
-# Interval in seconds between requests (used by legacy tests)
-_RATE_MIN_INTERVAL: float = 1.0 / NseConfig.max_rps
+def show_config(nse) -> None:
+    """
+    Print current NSE configuration and indicate whether each value
+    comes from GLOBAL defaults or INSTANCE override.
+
+    Example
+    -------
+    >>> import NseKit
+    >>> nse = NseKit.Nse() or nse = NseKit.Nse(5.0 , 2, 1.0, True)
+    >>> NseKit.show_config(nse)
+    """
+    print("\nCurrent NSE Configuration")
+    print("-" * 40)
+
+    fields = ["max_rps", "retries", "retry_delay", "cookie_cache"]
+
+    for f in fields:
+        inst_val = getattr(nse, f)
+        global_val = getattr(NseConfig, f)
+
+        source = "GLOBAL" if inst_val == global_val else "INSTANCE"
+
+        print(f"{f:<12} : {inst_val!s:<6} [{source}]")
+
 
 _PERIOD_DELTA: dict[str, timedelta] = {
     "1D":  timedelta(days=1),

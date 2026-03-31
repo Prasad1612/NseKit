@@ -22,12 +22,6 @@ pip install NseKit
 from NseKit import NseKit, Moneycontrol
 from rich.console import Console
 
-# #---------------------------------------------------------- Cookie ----------------------------------------------------------
-
-# # 🔹 Cookie
-# NseKit.Nse.clear_cookie_cache()                                                                   #  Delete the cookie cache
-
-
 # #--------------------------------------------------- Configuration Section ----------------------------------------------------
 
 # You can control settings globally or per-instance.
@@ -36,7 +30,7 @@ from rich.console import Console
 # NseKit.NseConfig.max_rps      = 2.0    # Default: 3.0
 # NseKit.NseConfig.retries      = 3      # Default: 2
 # NseKit.NseConfig.retry_delay  = 2.0    # Default: 2.0
-# NseKit.NseConfig.cookie_cache = True   # Default: True  False
+# NseKit.NseConfig.cookie_cache = False  # Default: True  
 
 # 2. PER-INSTANCE SETTINGS (Overwrites global settings for this instance only)
 # get_custom = NseKit.Nse(max_rps = 1.0, retries = 2, retry_delay  = 3.0, cookie_cache = True)
@@ -46,6 +40,14 @@ get  = NseKit.Nse()
 # #-----------------
 mc   = Moneycontrol
 rich = Console()
+
+# # 🔹 NSE configuration
+# NseKit.show_config(get)                                                                   # current NSE configuration (GLOBAL or INSTANCE)
+
+# #---------------------------------------------------------- Cookie ----------------------------------------------------------
+
+# # 🔹 Cookie
+# NseKit.Nse.clear_cookie_cache()                                                           #  Delete the cookie cache
 
 # #---------------------------------------------------------- NSE Data ----------------------------------------------------------
 
