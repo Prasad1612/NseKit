@@ -42,11 +42,13 @@ logger = logging.getLogger(__name__)
 
 _USER_AGENTS: list[str] = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 Chrome/90.0.4430.212 Safari/537.36",
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 Chrome/91.0.4472.114 Safari/537.36",
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) "
-    "AppleWebKit/537.36 Chrome/92.0.4515.107 Safari/537.36",
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
 ]
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -117,7 +119,7 @@ class NseConfig:
     # only for the arithmetic — never during the sleep — so threads are not
     # serialised for the full inter-request interval.
     _lock:        threading.Lock = threading.Lock()
-    _tokens:      float          = 3.0   # starts full (= max_rps)
+    _tokens:      float          = 3.0   # starts full; clamped to max_rps on first _throttle call
     _last_refill: float          = 0.0   # monotonic timestamp
 
     def __init_subclass__(cls, **kw):
@@ -131,24 +133,17 @@ def show_config(nse) -> None:
     Print current NSE configuration and indicate whether each value
     comes from GLOBAL defaults or INSTANCE override.
 
+    This module-level function is kept for backward compatibility.
+    Prefer calling ``nse.show_config()`` directly.
+
     Example
     -------
     >>> import NseKit
     >>> nse = NseKit.Nse() or nse = NseKit.Nse(5.0 , 2, 1.0, True)
-    >>> NseKit.show_config(nse)
+    >>> NseKit.show_config(nse)   # legacy
+    >>> nse.show_config()         # preferred
     """
-    print("\nCurrent NSE Configuration")
-    print("-" * 40)
-
-    fields = ["max_rps", "retries", "retry_delay", "cookie_cache"]
-
-    for f in fields:
-        inst_val = getattr(nse, f)
-        global_val = getattr(NseConfig, f)
-
-        source = "GLOBAL" if inst_val == global_val else "INSTANCE"
-
-        print(f"{f:<12} : {inst_val!s:<6} [{source}]")
+    nse.show_config()
 
 
 _PERIOD_DELTA: dict[str, timedelta] = {
@@ -375,9 +370,11 @@ def _csv_from_bytes(raw: bytes) -> pd.DataFrame:
     for col in df.select_dtypes(include="object").columns:
         cleaned = df[col].str.replace(",", "", regex=False).str.strip()
         numeric = pd.to_numeric(cleaned, errors="coerce")
-        # Only replace if at least one value parsed — keep original strings otherwise
-        if numeric.notna().any():
-            df[col] = numeric.where(numeric.notna(), df[col])
+        # Only replace if at least one value parsed — keep original strings otherwise.
+        # Cache the mask to avoid computing notna() twice.
+        mask = numeric.notna()
+        if mask.any():
+            df[col] = numeric.where(mask, df[col])
         else:
             df[col] = cleaned
 
@@ -565,6 +562,37 @@ def _clean_str(df: pd.DataFrame) -> pd.DataFrame:
     return df.fillna("").replace({float("inf"): "", float("-inf"): ""})
 
 
+def _normalise_numeric_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Strip commas, attempt numeric coercion, and replace sentinel strings
+    (``"None"``, ``"nan"``, ``""``).
+
+    Used by ``_csv_from_bytes`` and ``_biz_growth_fetch`` to avoid
+    duplicating the same column-normalisation loop.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame whose object columns should be normalised.
+
+    Returns
+    -------
+    pd.DataFrame
+        Modified in-place copy with normalised columns.
+    """
+    for col in df.select_dtypes(include="object").columns:
+        cleaned = (
+            df[col]
+            .str.replace(",", "", regex=False)
+            .str.strip()
+            .replace({"None": "-", "nan": "-", "NaN": "-", "": "-"})
+        )
+        numeric = pd.to_numeric(cleaned, errors="coerce")
+        mask = numeric.notna()
+        df[col] = numeric.where(mask, other=cleaned)
+    return df
+
+
 def _sort_dedup_dates(
     df:        pd.DataFrame,
     col:       str   = "Date",
@@ -675,8 +703,11 @@ class Nse:
     )
     # Constant headers for all SEBI POST requests — built once at class definition,
     # not reconstructed on every call.
+    # Note: _SEBI_REFERER cannot be referenced by name here (class body scoping),
+    # so the Referer string is repeated; _SEBI_HEADERS["Referer"] is patched to
+    # _SEBI_REFERER immediately after the class body closes (see below).
     _SEBI_HEADERS: dict = {
-        "User-Agent":       "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "User-Agent":       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Referer":          (
             "https://www.sebi.gov.in/sebiweb/home/"
             "HomeAction.do?doListing=yes&sid=1&ssid=7&smid=0"
@@ -734,6 +765,31 @@ class Nse:
         """Randomly rotate the ``User-Agent`` header to reduce rate-limiting."""
         self.headers["User-Agent"] = random.choice(_USER_AGENTS)
 
+    def show_config(self) -> None:
+        """
+        Print the active configuration for this ``Nse`` instance, noting
+        whether each value comes from the global ``NseConfig`` defaults or
+        an instance-level override.
+
+        Example
+        -------
+        >>> nse = Nse()
+        >>> nse.show_config()
+        """
+        print("\nCurrent NSE Configuration")
+        print("-" * 40)
+        for field in ("max_rps", "retries", "retry_delay", "cookie_cache"):
+            inst_val   = getattr(self, field)
+            global_val = getattr(NseConfig, field)
+            source     = "GLOBAL" if inst_val == global_val else "INSTANCE"
+            print(f"{field:<12} : {inst_val!s:<6} [{source}]")
+
+    def __repr__(self) -> str:
+        return (
+            f"Nse(max_rps={self.max_rps}, retries={self.retries}, "
+            f"retry_delay={self.retry_delay}, cookie_cache={self.cookie_cache})"
+        )
+
     @staticmethod
     def clear_cookie_cache() -> int:
         """
@@ -781,7 +837,9 @@ class Nse:
             with NseConfig._lock:
                 now     = time.monotonic()
                 elapsed = now - NseConfig._last_refill
-                # Refill tokens proportional to time passed, capped at capacity
+                # Refill tokens proportional to time passed, capped at capacity.
+                # Also clamp the existing balance to cap so that a lower max_rps
+                # set after initialisation takes effect on the very next call.
                 NseConfig._tokens      = min(cap, NseConfig._tokens + elapsed * cap)
                 NseConfig._last_refill = now
                 if NseConfig._tokens >= 1.0:
@@ -915,8 +973,12 @@ class Nse:
     @staticmethod
     def _log_error(tag: str, exc: Exception) -> None:
         """
-        Print a standardised one-line error message and forward to the
-        ``NseKit`` logger at WARNING level.
+        Forward a standardised one-line error message to the ``NseKit``
+        logger at WARNING level.
+
+        Using ``logger.warning`` (rather than ``print``) lets callers
+        control visibility via standard ``logging`` configuration and
+        prevents unwanted console noise in library usage.
 
         Parameters
         ----------
@@ -925,9 +987,7 @@ class Nse:
         exc : Exception
             The caught exception.
         """
-        msg = f"[NseKit.{tag}] {type(exc).__name__}: {exc}"
-        print(msg)
-        logger.warning(msg)
+        logger.warning("[NseKit.%s] %s: %s", tag, type(exc).__name__, exc)
 
     def _retry(self, fn, retries: int | None = None, delay: float | None = None):
         """
@@ -1224,7 +1284,9 @@ class Nse:
                         fetched = True
                         break
                     elif resp.status_code == 429:
-                        retry_after = int(resp.headers.get("Retry-After", random.uniform(8, 12)))
+                        # Retry-After may be an integer or float string; parse via
+                        # float() first so "1.5" does not raise ValueError.
+                        retry_after = int(float(resp.headers.get("Retry-After", random.uniform(8, 12))))
                         time.sleep(retry_after)
                     else:
                         time.sleep(random.uniform(2, 4))
@@ -1692,14 +1754,9 @@ class Nse:
 
             df = pd.DataFrame(data_list)
 
-            # Normalise columns:
-            # • object cols  — strip commas, try numeric coercion, keep strings on failure
-            # • numeric cols — no astype(str) needed; just apply the "-" sentinel for NaN
-            for col in df.select_dtypes(include="object").columns:
-                cleaned = df[col].str.replace(",", "", regex=False).str.strip()
-                cleaned = cleaned.replace({"None": "-", "nan": "-", "NaN": "-", "": "-"})
-                numeric = pd.to_numeric(cleaned, errors="coerce")
-                df[col] = numeric.where(numeric.notna(), other=cleaned)
+            # Normalise columns via the shared helper (strips commas,
+            # coerces numerics, replaces None/nan sentinels with "-").
+            df = _normalise_numeric_cols(df)
 
             df = df.rename(columns=_BIZ_GROWTH_RENAME_MAPS[market_type][mode])
             # to_dict handles mixed int/float/str natively — no astype(object) copy needed
@@ -1751,13 +1808,12 @@ class Nse:
                 try:
                     js   = self._retry(_call)
                     recs = js if isinstance(js, list) else js.get("data", [])
+                    fy_label = f"{fy}-{fy + 1}"
                     for rec in recs:
                         if isinstance(rec, dict):
                             rec = dict(rec)   # shallow copy — don't mutate the original API dict
-                            rec["FinancialYear"] = f"{fy}-{fy + 1}"
-                            all_data.append(rec)
-                        else:
-                            all_data.append(rec)
+                            rec["FinancialYear"] = fy_label
+                        all_data.append(rec)
                 except Exception:
                     pass
 
@@ -2045,7 +2101,7 @@ class Nse:
         if m == "all":
             return {"Market Status": ms, "Mcap": mcap, "Nifty50": n50, "Gift Nifty": gift}
 
-        print(f"Invalid mode '{mode}'")
+        logger.warning("nse_market_status: unrecognised mode %r", mode)
         return None
 
     def nse_is_market_open(self, market: str = "Capital Market"):
@@ -4515,9 +4571,16 @@ class Nse:
         # -----------------------------
         if "vrbroadcastDt" in df.columns:
             try:
-                df["_sort"] = pd.to_datetime(df["vrbroadcastDt"], errors="coerce")
+                df["_sort"] = pd.to_datetime(df["vrbroadcastDt"], format="%d-%b-%Y %H:%M:%S", errors="coerce")
+
+                # fallback for rows without time
+                mask = df["_sort"].isna()
+                if mask.any():
+                    df.loc[mask, "_sort"] = pd.to_datetime(df.loc[mask, "vrbroadcastDt"], format="%d-%b-%Y", errors="coerce")
+
                 df.sort_values("_sort", ascending=False, inplace=True)
                 df.drop(columns="_sort", inplace=True)
+
             except Exception:
                 pass
 
@@ -7401,9 +7464,10 @@ class Nse:
             if resp is None:
                 return None
             tables = pd.read_html(StringIO(resp.text))
-            print(f"Total tables found: {len(tables)}")
+            logger.debug("NseKit.html_tables: %d table(s) found", len(tables))
 
             if show_tables:
+                print(f"Total tables found: {len(tables)}")
                 for i, t in enumerate(tables):
                     print(f"\nTable {i}")
                     print(t.head())
@@ -7415,4 +7479,11 @@ class Nse:
         except Exception as exc:
             self._log_error("html_tables", exc)
             return None
+
+
+# ── Post-class fixups ──────────────────────────────────────────────────────────
+# _SEBI_HEADERS["Referer"] must equal _SEBI_REFERER, but class-body scoping
+# prevents referencing one class attribute from another at definition time.
+# Assign it here to keep the URL in a single place.
+Nse._SEBI_HEADERS["Referer"] = Nse._SEBI_REFERER
 

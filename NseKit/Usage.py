@@ -330,6 +330,7 @@ rich = Console()
 
 # url = "https://nsearchives.nseindia.com/corporate/ixbrl/INTEGRATED_FILING_INDAS_139754_02022026201126_iXBRL_WEB.html"
 # print(get.html_tables(url, show_tables=False, output="json"))
+# print(get.html_tables(url, output="df"))
 
 
 
