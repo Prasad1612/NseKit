@@ -30,7 +30,7 @@ from rich.console import Console
 # NseKit.NseConfig.max_rps      = 2.0    # Default: 3.0
 # NseKit.NseConfig.retries      = 3      # Default: 2
 # NseKit.NseConfig.retry_delay  = 2.0    # Default: 2.0
-# NseKit.NseConfig.cookie_cache = False  # Default: True  
+# NseKit.NseConfig.cookie_cache = False  # Default: True
 
 # 2. PER-INSTANCE SETTINGS (Overwrites global settings for this instance only)
 # get_custom = NseKit.Nse(max_rps = 1.0, retries = 2, retry_delay  = 3.0, cookie_cache = True)
@@ -655,7 +655,6 @@ rich = Console()
 # data.to_csv("Data.csv", index=True)
 
 # print("CSV file saved successfully.")
-
 ```
 
 ## Requirements

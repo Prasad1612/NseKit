@@ -18,7 +18,6 @@ import logging
 import os
 import random
 import re
-import shelve
 import threading
 import time
 import warnings
@@ -81,8 +80,11 @@ class NseConfig:
     Attributes
     ----------
     max_rps : float
-        Maximum requests per second (shared across all ``Nse`` instances
-        and threads via an internal lock).  Default ``3.0``.
+        Maximum requests per second, shared across all ``Nse`` instances
+        and threads via a token-bucket rate limiter.  The lock is held
+        only for token arithmetic — never during the sleep — so threads
+        are never serialised for the full inter-request interval.
+        Default ``3.0``.
     retries : int
         Number of *extra* retry attempts after the first failure.
         Total attempts = ``retries + 1``.  Default ``2`` (3 total tries).
@@ -90,7 +92,7 @@ class NseConfig:
         Base sleep in seconds between retries.  Doubles on each subsequent
         attempt (exponential back-off).  Default ``2.0``.
     cookie_cache : bool
-        ``True`` (default) — load cookies from ``~/.nsekit_session_cache``
+        ``True`` (default) — load cookies from ``~/.nsekit_session_cache.json``
         if fresh; save after every warm-up.
         ``False`` — always perform a full warm-up; never read or write
         the on-disk cache.
@@ -110,8 +112,13 @@ class NseConfig:
     cookie_cache: bool = True
 
     # ── Internal rate-limit state (not for direct use) ────────────────────
-    _lock:         threading.Lock = threading.Lock()
-    _last_request: float          = 0.0    # monotonic timestamp
+    # A single lock guards _tokens and _last_refill so that all Nse instances
+    # in a process share one rate budget (NSE sees one IP).  The lock is held
+    # only for the arithmetic — never during the sleep — so threads are not
+    # serialised for the full inter-request interval.
+    _lock:        threading.Lock = threading.Lock()
+    _tokens:      float          = 3.0   # starts full (= max_rps)
+    _last_refill: float          = 0.0   # monotonic timestamp
 
     def __init_subclass__(cls, **kw):
         raise TypeError("NseConfig is not meant to be subclassed")
@@ -159,6 +166,7 @@ _PERIOD_DELTA: dict[str, timedelta] = {
 _SHORT_PERIODS: list[str] = ["1D", "1W", "1M", "3M", "6M", "1Y"]
 _ALL_PERIODS:   list[str] = _SHORT_PERIODS + ["2Y", "5Y", "10Y", "YTD", "MAX"]
 _DATE_PATTERN:  re.Pattern = re.compile(r"^\d{2}-\d{2}-\d{4}$")
+_YEAR_PATTERN:  re.Pattern = re.compile(r"^\d{4}$")
 
 _MONTH_NUM: dict[str, int] = {
     "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
@@ -364,13 +372,14 @@ def _csv_from_bytes(raw: bytes) -> pd.DataFrame:
     df = pd.read_csv(StringIO(content))
     df.columns = [c.strip().replace('"', "") for c in df.columns]
 
-    for col in df.columns:
-        if df[col].dtype == object:
-            series = df[col].astype(str).str.replace(",", "", regex=False).str.strip()
-            try:
-                df[col] = pd.to_numeric(series)
-            except (ValueError, TypeError):
-                df[col] = series
+    for col in df.select_dtypes(include="object").columns:
+        cleaned = df[col].str.replace(",", "", regex=False).str.strip()
+        numeric = pd.to_numeric(cleaned, errors="coerce")
+        # Only replace if at least one value parsed — keep original strings otherwise
+        if numeric.notna().any():
+            df[col] = numeric.where(numeric.notna(), df[col])
+        else:
+            df[col] = cleaned
 
     return df
 
@@ -416,10 +425,14 @@ def _parse_year_month_args(
             if upper in mode_values:
                 mode = upper
             elif upper.isdigit() and len(upper) == 4:
+                # Pure 4-digit string → year (e.g. "2025")
                 year = int(upper)
             elif upper[:3] in _MONTH_NUM:
+                # Month name prefix (e.g. "OCT", "OCTOBER")
                 month = _MONTH_NUM[upper[:3]]
             elif "-" in upper:
+                # "MON-YYYY" or "MM-YYYY" combined string; only reachable when
+                # upper is NOT all-digits (covered above) and NOT a bare month name.
                 pts = upper.split("-")
                 if len(pts) == 2:
                     if pts[0][:3] in _MONTH_NUM:
@@ -498,10 +511,9 @@ def _parse_settlement_args(args: tuple, from_year: int | None, to_year: int | No
     tuple
         ``(from_year, to_year, period)``.
     """
-    year_re = re.compile(r"^\d{4}$")
     for arg in args:
         if isinstance(arg, str):
-            if year_re.match(arg):
+            if _YEAR_PATTERN.match(arg):
                 if not from_year:
                     from_year = int(arg)
                 elif not to_year:
@@ -583,11 +595,12 @@ def _sort_dedup_dates(
     """
     if col not in df.columns:
         return df
-    df = df.copy()
-    df[col] = pd.to_datetime(df[col], format=fmt, errors="coerce")
-    df.sort_values(col, ascending=ascending, inplace=True)
-    df.drop_duplicates(subset=[col], keep="last" if not ascending else "first", inplace=True)
-    df.reset_index(drop=True, inplace=True)
+    dates = pd.to_datetime(df[col], format=fmt, errors="coerce")
+    keep = "last" if not ascending else "first"
+    df = (df.assign(**{col: dates})
+            .sort_values(col, ascending=ascending)
+            .drop_duplicates(subset=[col], keep=keep)
+            .reset_index(drop=True))
     df[col] = df[col].dt.strftime(fmt)
     return df
 
@@ -629,6 +642,13 @@ def _fmt_trade_date(trade_date: str, fmt: str = "%d%m%Y") -> str:
 
 # ── Main Class ────────────────────────────────────────────────────────────────
 
+# Process-level in-memory cookie cache — shared across all Nse instances.
+# Avoids redundant disk reads when multiple Nse() objects are created in the
+# same process (e.g. scripts that instantiate Nse() in a loop).
+# Structure: {"ts": float, "cookies": dict[str, str]}
+_PROCESS_COOKIE_CACHE: dict = {}
+
+
 class Nse:
     """
     NSE India data client.
@@ -653,8 +673,19 @@ class Nse:
         "https://www.sebi.gov.in/sebiweb/home/"
         "HomeAction.do?doListing=yes&sid=1&ssid=7&smid=0"
     )
+    # Constant headers for all SEBI POST requests — built once at class definition,
+    # not reconstructed on every call.
+    _SEBI_HEADERS: dict = {
+        "User-Agent":       "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Referer":          (
+            "https://www.sebi.gov.in/sebiweb/home/"
+            "HomeAction.do?doListing=yes&sid=1&ssid=7&smid=0"
+        ),
+        "Origin":           "https://www.sebi.gov.in",
+        "X-Requested-With": "XMLHttpRequest",
+    }
 
-    _COOKIE_CACHE = os.path.join(os.path.expanduser("~"), ".nsekit_session_cache")
+    _COOKIE_CACHE = os.path.join(os.path.expanduser("~"), ".nsekit_session_cache.json")
     _COOKIE_TTL   = 3600  # 1 hour
 
     # ── Construction ────────────────────────────────────────────────────────
@@ -710,10 +741,7 @@ class Nse:
         performs a full warm-up.
         """
         deleted = 0
-        base = Nse._COOKIE_CACHE
-
-        for ext in ("", ".db", ".dir", ".bak", ".dat"):
-            path = base + ext
+        for path in (Nse._COOKIE_CACHE, Nse._COOKIE_CACHE + ".tmp"):
             try:
                 if os.path.exists(path):
                     os.remove(path)
@@ -721,7 +749,8 @@ class Nse:
             except OSError:
                 pass
 
-        # optional message
+        _PROCESS_COOKIE_CACHE.clear()   # also invalidate the in-memory cache
+
         if deleted:
             print(f"🧹 Cookie cache cleared — {deleted} file(s) deleted")
         else:
@@ -733,21 +762,35 @@ class Nse:
 
     def _throttle(self) -> None:
         """
-        Block the calling thread just long enough to stay within
-        this instance's ``max_rps``.
+        Block the calling thread just long enough to stay within the
+        shared process-wide rate budget using a token-bucket algorithm.
 
-        Uses ``NseConfig._lock`` so that multiple ``Nse`` instances in
-        the same process share a single rate budget timeline, even if
-        they have different individual limits.
+        How it works
+        ------------
+        A shared bucket (``NseConfig._tokens``) holds up to ``max_rps``
+        tokens.  Each call consumes one token.  Tokens refill continuously
+        at ``max_rps`` per second based on elapsed wall time.
+
+        The global lock is held **only** for the arithmetic — not during
+        the sleep — so threads are never serialised for the full
+        inter-request interval.  Multiple ``Nse`` instances respect the
+        same budget because they all modify ``NseConfig._tokens``.
         """
-        min_interval = 1.0 / self.max_rps
-        with NseConfig._lock:
-            now     = time.monotonic()
-            elapsed = now - NseConfig._last_request
-            wait    = min_interval - elapsed
-            if wait > 0:
-                time.sleep(wait)
-            NseConfig._last_request = time.monotonic()
+        cap = self.max_rps          # bucket capacity = max burst
+        while True:
+            with NseConfig._lock:
+                now     = time.monotonic()
+                elapsed = now - NseConfig._last_refill
+                # Refill tokens proportional to time passed, capped at capacity
+                NseConfig._tokens      = min(cap, NseConfig._tokens + elapsed * cap)
+                NseConfig._last_refill = now
+                if NseConfig._tokens >= 1.0:
+                    NseConfig._tokens -= 1.0
+                    return          # token acquired — proceed immediately
+                # Calculate how long until the next token arrives
+                wait = (1.0 - NseConfig._tokens) / cap
+            # Sleep outside the lock so other threads can refill/acquire concurrently
+            time.sleep(wait)
 
     # ── Session Bootstrap & Cookie Management ───────────────────────────────
 
@@ -774,37 +817,53 @@ class Nse:
 
     def _load_cookies(self) -> bool:
         """
-        Try to restore session cookies from the on-disk shelve cache.
+        Try to restore session cookies from the process-level in-memory cache
+        first, then fall back to the on-disk JSON cache.
 
         Returns ``True`` when a fresh, non-expired cookie set was found and
         loaded into ``self.session``.  Returns ``False`` on any cache miss,
         expiry, or read error — the caller should then call :meth:`_warm_up`.
 
-        The previous implementation tested ``os.path.exists`` for ``.db``
-        and bare paths, which silently missed the cache on Windows
-        (``dumbdbm`` uses ``.bak/.dat/.dir``).  Letting ``shelve.open``
-        itself decide whether the file exists is both simpler and portable.
+        Two-level lookup:
+        1. ``_PROCESS_COOKIE_CACHE`` — shared dict in this process. Zero I/O.
+           Populated whenever the on-disk cache is successfully read.
+        2. On-disk JSON file — read only when the in-memory cache is cold or
+           stale. Uses a plain JSON file (no DBM overhead, no file locking).
         """
+        now = time.time()
+
+        # ── Level 1: in-memory ────────────────────────────────────────
+        mem = _PROCESS_COOKIE_CACHE
+        if mem and now - mem.get("ts", 0.0) < self._COOKIE_TTL:
+            for k, v in mem.get("cookies", {}).items():
+                self.session.cookies.set(k, v)
+            logger.debug("NseKit: session cookies loaded from memory cache")
+            return True
+
+        # ── Level 2: on-disk JSON ─────────────────────────────────────
         try:
-            with shelve.open(self._COOKIE_CACHE, flag="r") as db:
-                ts = db.get("ts", 0.0)
-                if time.time() - ts < self._COOKIE_TTL and "cookies" in db:
-                    for k, v in db["cookies"].items():
-                        self.session.cookies.set(k, v)
-                    logger.debug("NseKit: session cookies loaded from cache")
-                    return True
+            with open(self._COOKIE_CACHE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if now - data.get("ts", 0.0) < self._COOKIE_TTL:
+                cookies = data.get("cookies", {})
+                for k, v in cookies.items():
+                    self.session.cookies.set(k, v)
+                # Populate in-memory cache for subsequent Nse() instances
+                _PROCESS_COOKIE_CACHE.clear()
+                _PROCESS_COOKIE_CACHE.update(data)
+                logger.debug("NseKit: session cookies loaded from disk cache")
+                return True
         except Exception:
-            pass   # missing, corrupt, or locked — fall through to warm-up
+            pass   # missing, corrupt, or expired — fall through to warm-up
         return False
 
     def _save_cookies(self) -> None:
         """
-        Persist the current session cookies to the on-disk shelve cache.
+        Persist the current session cookies to the on-disk JSON cache.
 
-        Does nothing when ``NseConfig.cookie_cache`` is ``False``.
-        Called unconditionally after :meth:`_warm_up` so that even a
-        partial warm-up saves whatever cookies were obtained.
-        Failures are logged at DEBUG level and never propagate.
+        Does nothing when ``cookie_cache`` is ``False``.  Writes atomically
+        via a temp file + ``os.replace`` so a crash mid-write never leaves a
+        corrupt cache.  Failures are logged at DEBUG level and never propagate.
         """
         if not self.cookie_cache:
             logger.debug("NseKit: cookie cache disabled — skipping save")
@@ -813,13 +872,22 @@ class Nse:
         if not cookies:
             logger.debug("NseKit: no cookies to save — skipping cache write")
             return
+        tmp = self._COOKIE_CACHE + ".tmp"
         try:
-            with shelve.open(self._COOKIE_CACHE) as db:
-                db["cookies"] = cookies
-                db["ts"]      = time.time()
+            payload = {"ts": time.time(), "cookies": cookies}
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+            os.replace(tmp, self._COOKIE_CACHE)
+            # Mirror to in-memory cache so the next Nse() in this process skips disk
+            _PROCESS_COOKIE_CACHE.clear()
+            _PROCESS_COOKIE_CACHE.update(payload)
             logger.debug("NseKit: %d cookie(s) saved to cache", len(cookies))
         except Exception as exc:
             logger.debug("NseKit: cookie cache write failed: %s", exc)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
     def _warm_up(self) -> None:
         """
@@ -914,12 +982,13 @@ class Nse:
         """
         Single warm-up GET → session API GET, returning the ``Response``.
 
-        Centralises the four-line pattern that was duplicated verbatim in
-        ``_get_json``, ``_chart_fetch``, ``_live_ref_fetch``, and
-        ``_further_issue``:
+        Centralises three cross-cutting concerns for all HTTP callers:
 
-        1. Throttle + warm-up GET on *ref_url* (establishes cookies).
-        2. Throttle + data GET on *api_url* using those cookies.
+        1. ``rotate_user_agent()`` — randomises UA on every call.
+        2. Throttle + warm-up GET on *ref_url* (establishes cookies in
+           ``self.session`` automatically via the ``requests.Session`` jar).
+        3. Throttle + data GET on *api_url* — session already carries the
+           cookies; no manual ``cookies=`` kwarg needed.
 
         The caller is responsible for error handling / retry wrapping.
         Raises ``requests.HTTPError`` on non-2xx responses.
@@ -942,13 +1011,16 @@ class Nse:
         """
         if api_timeout is None:
             api_timeout = timeout
+        self.rotate_user_agent()   # centralised here; callers no longer need to call it
+        # Only fire the warm-up GET when the session jar is empty — if cookies
+        # were loaded from cache we can skip straight to the data request.
+        if not self.session.cookies:
+            self._throttle()
+            self.session.get(ref_url, headers=self.headers, timeout=timeout).raise_for_status()
         self._throttle()
-        ref = self.session.get(ref_url, headers=self.headers, timeout=timeout)
-        ref.raise_for_status()
-        self._throttle()
+        # Data GET — session already carries all accumulated cookies
         resp = self.session.get(
-            api_url, params=params, headers=self.headers,
-            cookies=ref.cookies.get_dict(), timeout=api_timeout,
+            api_url, params=params, headers=self.headers, timeout=api_timeout,
         )
         resp.raise_for_status()
         return resp
@@ -972,7 +1044,6 @@ class Nse:
             Parsed JSON payload, or ``None`` on persistent failure after
             2 retries.
         """
-        self.rotate_user_agent()
         try:
             return self._retry(
                 lambda: self._warm_and_fetch(ref_url, api_url, timeout=timeout).json()
@@ -995,9 +1066,8 @@ class Nse:
         bytes or None
             Raw response bytes, or ``None`` after 2 failed attempts.
         """
-        self.rotate_user_agent()
-
         def _call() -> bytes:
+            self.rotate_user_agent()
             self._throttle()
             resp = self.session.get(url, headers=self.headers, timeout=10)
             resp.raise_for_status()
@@ -1063,8 +1133,6 @@ class Nse:
         pd.DataFrame or None
             Sorted and cleaned data, or ``None`` on failure.
         """
-        self.rotate_user_agent()
-
         def _call() -> pd.DataFrame:
             resp = self._warm_and_fetch(ref_url, api_url, timeout=10, api_timeout=15)
             if "text/html" in resp.headers.get("Content-Type", ""):
@@ -1098,9 +1166,11 @@ class Nse:
         ``str.format`` arguments: ``{0}`` (start) and ``{1}`` (end) both
         as ``DD-MM-YYYY`` strings.
 
-        Uses :meth:`_warm_and_fetch` for the initial session warm-up and
-        for the mid-loop cookie refresh when a chunk fetch fails, removing
-        the duplicated inline warm-up GET blocks.
+        Uses :meth:`_warm_and_fetch` for the initial warm-up (which stores
+        cookies in ``self.session`` automatically) and for mid-loop cookie
+        refreshes on failed chunks.  The ``requests.Session`` jar is relied
+        upon for all subsequent GETs — no manual ``cookies=`` kwarg needed.
+        Respects the ``Retry-After`` header on HTTP 429 responses.
 
         Parameters
         ----------
@@ -1122,12 +1192,9 @@ class Nse:
         list
             Collected raw record dicts; empty list on session failure.
         """
-        self.rotate_user_agent()
-
-        # ── Initial warm-up: get cookies via _warm_and_fetch ─────────
+        # ── Initial warm-up: establishes cookies in self.session ─────
         try:
-            ref_resp = self._warm_and_fetch(ref_url, ref_url, timeout=10)
-            cookies  = ref_resp.cookies.get_dict() or dict(self.session.cookies)
+            self._warm_and_fetch(ref_url, ref_url, timeout=10)
         except Exception as exc:
             self._log_error("_get_chunked.session", exc)
             return []
@@ -1148,8 +1215,7 @@ class Nse:
                 try:
                     self._throttle()
                     resp = self.session.get(
-                        url, headers=self.headers,
-                        cookies=cookies, timeout=15 + att * 5,
+                        url, headers=self.headers, timeout=15 + att * 5,
                     )
                     if resp.status_code == 200:
                         data = resp.json()
@@ -1158,7 +1224,8 @@ class Nse:
                         fetched = True
                         break
                     elif resp.status_code == 429:
-                        time.sleep(random.uniform(8, 12))
+                        retry_after = int(resp.headers.get("Retry-After", random.uniform(8, 12)))
+                        time.sleep(retry_after)
                     else:
                         time.sleep(random.uniform(2, 4))
                 except Exception as exc:
@@ -1166,11 +1233,9 @@ class Nse:
                     time.sleep(random.uniform(3, 6))
 
             if not fetched:
-                # ── Cookie refresh: reuse _warm_and_fetch ────────────
+                # ── Cookie refresh ────────────────────────────────────
                 try:
-                    self.rotate_user_agent()
-                    ref_resp = self._warm_and_fetch(ref_url, ref_url, timeout=10)
-                    cookies  = ref_resp.cookies.get_dict() or dict(self.session.cookies)
+                    self._warm_and_fetch(ref_url, ref_url, timeout=10)
                 except Exception as exc:
                     logger.debug("_get_chunked cookie refresh failed: %s", exc)
                     time.sleep(random.uniform(5, 10))
@@ -1207,7 +1272,6 @@ class Nse:
         api_timeout : int or None, optional
             Timeout for the data GET. Defaults to *timeout* when ``None``.
         """
-        self.rotate_user_agent()
         try:
             return self._warm_and_fetch(ref_url, api_url, timeout=timeout, api_timeout=api_timeout)
         except Exception as exc:
@@ -1226,7 +1290,6 @@ class Nse:
         :meth:`_warm_and_fetch`, removing the previously duplicated
         warm-up + session GET block.
         """
-        self.rotate_user_agent()
         try:
             return self._retry(
                 lambda: self._warm_and_fetch(home, api_url, timeout=10).json()
@@ -1528,7 +1591,6 @@ class Nse:
             params["to_date"]   = to_date
 
         api = base_url + "?" + "&".join(f"{k}={v}" for k, v in params.items())
-        self.rotate_user_agent()
 
         try:
             data = self._retry(
@@ -1617,7 +1679,6 @@ class Nse:
             },
         }
         url = f"{base_url}/{api_path_map[market_type][mode]}"
-        self.rotate_user_agent()
 
         try:
             raw_data = self._retry(
@@ -1631,18 +1692,18 @@ class Nse:
 
             df = pd.DataFrame(data_list)
 
-            # Normalise all columns: strip commas, coerce to numeric where possible.
-            # errors="coerce" converts non-numeric strings to NaN; we then fill
-            # those back from the cleaned string series so non-numeric columns
-            # (e.g. month labels) keep their original string values.
-            for col in df.columns:
-                cleaned = df[col].astype(str).str.replace(",", "", regex=False).str.strip()
+            # Normalise columns:
+            # • object cols  — strip commas, try numeric coercion, keep strings on failure
+            # • numeric cols — no astype(str) needed; just apply the "-" sentinel for NaN
+            for col in df.select_dtypes(include="object").columns:
+                cleaned = df[col].str.replace(",", "", regex=False).str.strip()
                 cleaned = cleaned.replace({"None": "-", "nan": "-", "NaN": "-", "": "-"})
                 numeric = pd.to_numeric(cleaned, errors="coerce")
                 df[col] = numeric.where(numeric.notna(), other=cleaned)
 
             df = df.rename(columns=_BIZ_GROWTH_RENAME_MAPS[market_type][mode])
-            return df.astype(object).to_dict(orient="records")
+            # to_dict handles mixed int/float/str natively — no astype(object) copy needed
+            return df.to_dict(orient="records")
 
         except (requests.RequestException, ValueError, KeyError) as exc:
             self._log_error("_biz_growth_fetch", exc)
@@ -1692,8 +1753,11 @@ class Nse:
                     recs = js if isinstance(js, list) else js.get("data", [])
                     for rec in recs:
                         if isinstance(rec, dict):
+                            rec = dict(rec)   # shallow copy — don't mutate the original API dict
                             rec["FinancialYear"] = f"{fy}-{fy + 1}"
-                    all_data.extend(recs)
+                            all_data.append(rec)
+                        else:
+                            all_data.append(rec)
                 except Exception:
                     pass
 
@@ -1824,15 +1888,6 @@ class Nse:
 
     # ── SEBI Helpers ────────────────────────────────────────────────────────
 
-    def _sebi_headers(self) -> dict:
-        """Shared headers for all SEBI POST requests."""
-        return {
-            "User-Agent":       "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Referer":          self._SEBI_REFERER,
-            "Origin":           "https://www.sebi.gov.in",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-
     def _sebi_post(self, payload: dict) -> list[dict]:
         """
         POST to the SEBI circular listing endpoint, parse the HTML table,
@@ -1850,9 +1905,9 @@ class Nse:
         """
         try:
             self._throttle()
-            resp  = requests.post(
+            resp  = self.session.post(
                 self._SEBI_URL,
-                headers=self._sebi_headers(),   # was missing () — called as property, not method
+                headers=self._SEBI_HEADERS,
                 data=payload,
                 timeout=15,
             )
@@ -3113,7 +3168,7 @@ class Nse:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        df.replace([float("inf"), float("-inf")], None, inplace=True)
+        df.replace([np.inf, -np.inf], None, inplace=True)
         if "P/E" in df.columns:
             df.dropna(subset=["P/E"], inplace=True)
             df.ffill(inplace=True)
@@ -3228,7 +3283,6 @@ class Nse:
         --------
         >>> nse.india_vix_chart()
         """
-        self.rotate_user_agent()
 
         try:
             obj = self._get_json(
@@ -4359,7 +4413,7 @@ class Nse:
     #         return None
 
     #     df = pd.DataFrame(rows)
-    #     df.replace({float("inf"): None, float("-inf"): None}, inplace=True)
+    #     df.replace({np.inf: None, -np.inf: None}, inplace=True)
     #     df.fillna("", inplace=True)
 
     #     def _flatten(v):
@@ -4414,7 +4468,7 @@ class Nse:
         # -----------------------------
         # Clean values
         # -----------------------------
-        df.replace({float("inf"): None, float("-inf"): None}, inplace=True)
+        df.replace({np.inf: None, -np.inf: None}, inplace=True)
         df.fillna("", inplace=True)
 
         # -----------------------------
@@ -4602,7 +4656,6 @@ class Nse:
         --------
         >>> nse.cm_eod_market_activity_report("17-10-25")
         """
-        self.rotate_user_agent()
         try:
             raw = self._get_archive(
                 f"https://nsearchives.nseindia.com/archives/equities/mkt/"
@@ -5061,7 +5114,7 @@ class Nse:
         }
         df = pd.DataFrame(records)
         df = _keep_cols(df, col_map).rename(columns=col_map)
-        df.replace({float("inf"): 0, float("-inf"): 0}, inplace=True)
+        df.replace({np.inf: 0, -np.inf: 0}, inplace=True)
         df.fillna(0, inplace=True)
         df = _sort_dedup_dates(df, "Date", fmt="%d-%b-%Y", ascending=True)
         return df
@@ -5921,7 +5974,6 @@ class Nse:
         """
         from datetime import time as dtime
 
-        self.rotate_user_agent()
 
         try:
             resp = self._warm_and_fetch(
@@ -7339,7 +7391,6 @@ class Nse:
         list or None
             List of dicts (json mode) or list of DataFrames (df mode).
         """
-        self.rotate_user_agent()
         try:
             resp = self._live_ref_fetch(
                 "https://www.nseindia.com/option-chain",

@@ -119,30 +119,26 @@ class TestCookieCache:
 
     def test_clear_and_warmup_flow(self, nse):
         import os
-        import shelve
+        import json
 
         # 1. Clear
         nse.clear_cookie_cache()
-        for ext in ("", ".db", ".dir", ".bak", ".dat"):
-            assert not os.path.exists(nse._COOKIE_CACHE + ext)
+        assert not os.path.exists(nse._COOKIE_CACHE)
+        assert not os.path.exists(nse._COOKIE_CACHE + ".tmp")
 
         # 2. Warm up
         nse._warm_up()
         
         # 3. Check if created
-        found = False
-        for ext in ("", ".db", ".dir", ".bak", ".dat"):
-            if os.path.exists(nse._COOKIE_CACHE + ext):
-                found = True
-                break
-        assert found, "Cookie cache file not created after warm_up"
+        assert os.path.exists(nse._COOKIE_CACHE), "Cookie cache file not created after warm_up"
 
         # 4. Verify content
-        with shelve.open(nse._COOKIE_CACHE) as db:
-            assert "cookies" in db
-            assert "ts" in db
-            assert isinstance(db["cookies"], dict)
-            assert len(db["cookies"]) > 0
+        with open(nse._COOKIE_CACHE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+            assert "cookies" in data
+            assert "ts" in data
+            assert isinstance(data["cookies"], dict)
+            assert len(data["cookies"]) > 0
 
     def test_load_cookies_success(self, nse):
         # Ensure we have a fresh cache
