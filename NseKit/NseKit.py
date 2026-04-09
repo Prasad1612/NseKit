@@ -1987,17 +1987,30 @@ class Nse:
         rows = []
         if not table:
             return rows
+
+        last_date = ""
+
         for tr in table.find_all("tr")[1:]:
             tds = tr.find_all("td")
             if len(tds) < 2:
                 continue
+
+            date_text = tds[0].get_text(strip=True)
+            if date_text:
+                last_date = date_text
+            else:
+                date_text = last_date
+
             a_tag = tds[1].find("a")
             title = a_tag.get("title") or a_tag.get_text(strip=True) if a_tag else tds[1].get_text(strip=True)
-            href  = a_tag.get("href") if a_tag else None
+            title = " ".join(title.split())  # fix alt+enter / line breaks
+
+            href = a_tag.get("href") if a_tag else None
             if href and not href.startswith("http"):
                 href = "https://www.sebi.gov.in" + href
+
             rows.append({
-                "Date":  tds[0].get_text(strip=True),
+                "Date":  date_text,
                 "Title": title,
                 "Link":  href,
             })
