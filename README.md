@@ -10,7 +10,7 @@ pip install NseKit
 
 ## Usage
 
-"Please refer to **Usage.py** for usage."
+"Please refer to **NseKit_Usage.py** for usage."
 
 ```python
 #=============================================================================================================================#
@@ -660,7 +660,7 @@ rich = Console()
 
 ## Requirements
 
-- Python 3.12+
+- Python 3.13+
 
 ## License
 
