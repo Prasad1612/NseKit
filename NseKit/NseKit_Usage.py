@@ -144,8 +144,10 @@ rich = Console()
 # print(get.index_live_all_indices_data())                                                  # All Indices Live Snapshot
 
 # # 🔹 Specific Index Constituents
-# print(get.index_live_indices_stocks_data("NIFTY 50"))                                     # Nifty 50 Stocks DataFrame
-# print(get.index_live_indices_stocks_data("NIFTY IT", list_only=True))                     # Only Nifty 50 Symbols
+# print(get.index_live_indices_stocks_data("NIFTY 50"))                                     # Nifty 50 Stocks DataFrame     (Raw)
+# print(get.index_live_indices_stocks_data("NIFTY 50", short=True))                         # Nifty 50 Stocks DataFrame     (Short)
+# print(get.index_live_indices_stocks_data("NIFTY IT", list_only=True))                     # Only Nifty 50 Symbols         (Raw)
+# print(get.index_live_indices_stocks_data("NIFTY IT", short=True, list_only=True))         # Only Nifty 50 Symbols         (Short)
 
 # # 🔹 Nifty 50 Returns Summary
 # print(get.index_live_nifty_50_returns())                                                  # 1W–5Y Nifty Return %

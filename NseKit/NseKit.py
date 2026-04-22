@@ -2959,10 +2959,62 @@ class Nse:
         df = _keep_cols(df, cols)
         return _clean(df.fillna(0))
 
+    # def index_live_indices_stocks_data(
+    #     self,
+    #     category:  str,
+    #     list_only: bool = False,
+    # ) -> pd.DataFrame | list | None:
+    #     """
+    #     Return live stock data for all constituents in an NSE index.
+
+    #     Parameters
+    #     ----------
+    #     category : str
+    #         Index name, e.g. ``"NIFTY 50"``, ``"NIFTY BANK"``,
+    #         ``"NIFTY IT"``.
+    #     list_only : bool, optional
+    #         If ``True``, return only the list of symbol strings.
+    #         Default is ``False``.
+
+    #     Returns
+    #     -------
+    #     pd.DataFrame or list or None
+
+    #     Examples
+    #     --------
+    #     >>> nse.index_live_indices_stocks_data("NIFTY 50")
+    #     >>> nse.index_live_indices_stocks_data("NIFTY IT", list_only=True)
+    #     """
+    #     try:
+    #         enc = category.upper().replace("&", "%26").replace(" ", "%20")
+    #         raw = self._get_json(
+    #             "https://www.nseindia.com/market-data/live-equity-market",
+    #             f"https://www.nseindia.com/api/equity-stockIndices?index={enc}"
+    #         )
+    #     except Exception as exc:
+    #         self._log_error("index_live_indices_stocks_data", exc)
+    #         return None
+
+    #     df = (
+    #         pd.DataFrame(raw["data"])
+    #         .drop(["meta"], axis=1, errors="ignore")
+    #         .set_index("symbol", drop=False)
+    #     )
+    #     if list_only:
+    #         return df["symbol"].tolist()
+
+    #     col_order = [
+    #         "symbol", "previousClose", "open", "dayHigh", "dayLow", "lastPrice",
+    #         "change", "pChange", "totalTradedVolume", "totalTradedValue",
+    #         "nearWKH", "nearWKL", "perChange30d", "perChange365d", "ffmc",
+    #     ]
+    #     return _clean(_keep_cols(df, col_order))
+    
     def index_live_indices_stocks_data(
         self,
-        category:  str,
+        category: str,
         list_only: bool = False,
+        short: bool = False,
     ) -> pd.DataFrame | list | None:
         """
         Return live stock data for all constituents in an NSE index.
@@ -2975,6 +3027,9 @@ class Nse:
         list_only : bool, optional
             If ``True``, return only the list of symbol strings.
             Default is ``False``.
+        short : bool, optional
+            If ``True``, return shorted the list of symbol % chng.
+            Default is ``False``.
 
         Returns
         -------
@@ -2983,8 +3038,11 @@ class Nse:
         Examples
         --------
         >>> nse.index_live_indices_stocks_data("NIFTY 50")
+        >>> nse.index_live_indices_stocks_data("NIFTY 50", short=True)
         >>> nse.index_live_indices_stocks_data("NIFTY IT", list_only=True)
+        >>> nse.index_live_indices_stocks_data("NIFTY IT", short=True, list_only=True)
         """
+
         try:
             enc = category.upper().replace("&", "%26").replace(" ", "%20")
             raw = self._get_json(
@@ -2995,20 +3053,49 @@ class Nse:
             self._log_error("index_live_indices_stocks_data", exc)
             return None
 
-        df = (
-            pd.DataFrame(raw["data"])
-            .drop(["meta"], axis=1, errors="ignore")
-            .set_index("symbol", drop=False)
-        )
-        if list_only:
-            return df["symbol"].tolist()
+        full_df = pd.DataFrame(raw["data"]).drop(["meta"], axis=1, errors="ignore")
 
         col_order = [
             "symbol", "previousClose", "open", "dayHigh", "dayLow", "lastPrice",
             "change", "pChange", "totalTradedVolume", "totalTradedValue",
             "nearWKH", "nearWKL", "perChange30d", "perChange365d", "ffmc",
         ]
-        return _clean(_keep_cols(df, col_order))
+        full_df = full_df.reindex(columns=col_order)
+
+        category_upper = category.strip().upper()
+
+        # 🔹 SHORT MODE
+        if short:
+            index_row = full_df[full_df["symbol"].str.upper() == category_upper]
+
+            # remove index row for sorting
+            if category_upper != "SECURITIES IN F&O":
+                df = full_df[full_df["symbol"].str.upper() != category_upper].copy()
+            else:
+                df = full_df.copy()
+
+            df["pChange_float"] = (
+                df["pChange"].astype(str)
+                .str.replace("%", "", regex=False)
+                .astype(float)
+            )
+
+            df = df.sort_values("pChange_float", ascending=False).drop(columns=["pChange_float"])
+
+            # add index row back
+            if category_upper != "SECURITIES IN F&O" and not index_row.empty:
+                index_row = index_row.reindex(columns=col_order)
+                df = pd.concat([index_row, df], ignore_index=True)
+
+        else:
+            df = full_df
+
+        # 🔹 list_only handled at END (important fix)
+        if list_only:
+            return df["symbol"].tolist()
+
+        return df
+
 
     def index_live_nifty_50_returns(self) -> pd.DataFrame | None:
         """Return the periodic returns of the Nifty 50 index (1W to 5Y).
