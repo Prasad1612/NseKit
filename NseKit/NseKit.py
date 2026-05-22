@@ -3995,6 +3995,62 @@ class Nse:
     # ════════════════════════════════════════════════════════════════════════
     # ── CM — Corporate Filings (Live) ───────────────────────────────────────
 
+    ## ── insider_trading (Old)  ────────  
+
+    # def cm_live_hist_insider_trading(
+    #     self,
+    #     *args,
+    #     from_date: str | None = None,
+    #     to_date:   str | None = None,
+    #     period:    str | None = None,
+    #     symbol:    str | None = None,
+    # ) -> pd.DataFrame | None:
+    #     """
+    #     Return historical insider-trading (PIT) disclosures.
+
+    #     Parameters
+    #     ----------
+    #     *args : str
+    #         Positional shorthand — pass a symbol, date range, or period.
+    #     from_date : str, optional
+    #         Start date in ``DD-MM-YYYY``.
+    #     to_date : str, optional
+    #         End date in ``DD-MM-YYYY``.
+    #     period : str, optional
+    #         Shorthand: ``"1D"``, ``"1W"``, ``"1M"``, ``"3M"``, ``"6M"``,
+    #         ``"1Y"``.
+    #     symbol : str, optional
+    #         NSE equity symbol to filter, e.g. ``"RELIANCE"``.
+
+    #     Returns
+    #     -------
+    #     pd.DataFrame or None
+
+    #     Examples
+    #     --------
+    #     >>> nse.cm_live_hist_insider_trading()
+    #     >>> nse.cm_live_hist_insider_trading("1M")
+    #     >>> nse.cm_live_hist_insider_trading("01-01-2025", "15-10-2025")
+    #     >>> nse.cm_live_hist_insider_trading("RELIANCE")
+    #     >>> nse.cm_live_hist_insider_trading("RELIANCE", "1M")
+    #     >>> nse.cm_live_hist_insider_trading("RELIANCE", "01-01-2025", "15-10-2025")
+    #     """
+    #     cols = [
+    #         "symbol", "company", "acqName", "personCategory", "secType",
+    #         "befAcqSharesNo", "befAcqSharesPer", "remarks", "secAcq", "secVal",
+    #         "tdpTransactionType", "securitiesTypePost", "afterAcqSharesNo",
+    #         "afterAcqSharesPer", "acqfromDt", "acqtoDt", "intimDt", "acqMode",
+    #         "derivativeType", "tdpDerivativeContractType", "buyValue",
+    #         "buyQuantity", "sellValue", "sellquantity", "exchange", "date", "xbrl",
+    #     ]
+    #     return self._corp_filing(
+    #         "https://www.nseindia.com/companies-listing/corporate-filings-insider-trading",
+    #         "https://www.nseindia.com/api/corporates-pit",
+    #         *args,
+    #         from_date=from_date, to_date=to_date, symbol=symbol, period=period,
+    #         keep_cols=cols,
+    #     )
+
     def cm_live_hist_insider_trading(
         self,
         *args,
@@ -4033,17 +4089,19 @@ class Nse:
         >>> nse.cm_live_hist_insider_trading("RELIANCE", "1M")
         >>> nse.cm_live_hist_insider_trading("RELIANCE", "01-01-2025", "15-10-2025")
         """
+        # default → today (only when nothing provided)
+        if not args and not from_date and not to_date and not symbol:
+            today = datetime.now().strftime("%d-%m-%Y")
+            from_date = today
+            to_date   = today  
+
         cols = [
-            "symbol", "company", "acqName", "personCategory", "secType",
-            "befAcqSharesNo", "befAcqSharesPer", "remarks", "secAcq", "secVal",
-            "tdpTransactionType", "securitiesTypePost", "afterAcqSharesNo",
-            "afterAcqSharesPer", "acqfromDt", "acqtoDt", "intimDt", "acqMode",
-            "derivativeType", "tdpDerivativeContractType", "buyValue",
-            "buyQuantity", "sellValue", "sellquantity", "exchange", "date", "xbrl",
+            "symbol", "companyName", "regulation", "ixbrl", "typeOfSubmission",
+            "revisionRemark", "broadcastDateTime",
         ]
         return self._corp_filing(
             "https://www.nseindia.com/companies-listing/corporate-filings-insider-trading",
-            "https://www.nseindia.com/api/corporates-pit",
+            "https://www.nseindia.com/api/corporates-pit-gg",
             *args,
             from_date=from_date, to_date=to_date, symbol=symbol, period=period,
             keep_cols=cols,
@@ -7477,6 +7535,215 @@ class Nse:
             f"?functionName=getIntegratedFilingData&symbol={symbol}",
         )
 
+    # ── Quarter string helpers ─────────────────────────────────────────────
+    _QUARTER_MONTH_MAP: dict[str, int] = {
+        "JAN": 1, "FEB": 2,  "MAR": 3,
+        "APR": 4, "MAY": 5,  "JUN": 6,
+        "JUL": 7, "AUG": 8,  "SEP": 9,
+        "OCT":10, "NOV": 11, "DEC": 12,
+    }
+
+    @staticmethod
+    def _parse_quarter(quarter: str) -> str:
+        """
+        Convert a human-readable quarter string to the ``YYYY-MM`` format
+        expected by the NSE peer-comparison API.
+
+        Accepted formats (case-insensitive)
+        ------------------------------------
+        * ``"Mar 2026"``  → ``"2026-03"``
+        * ``"March 2026"`` → ``"2026-03"``
+        * ``"2026-03"``   → ``"2026-03"`` (already in API format, passed through)
+        * ``"Q4 2026"``   → raises ``ValueError``
+
+        Parameters
+        ----------
+        quarter : str
+            Quarter end-month expressed as ``"<Month> <YYYY>"`` or already
+            formatted as ``"YYYY-MM"``.
+
+        Returns
+        -------
+        str
+            Quarter string in ``"YYYY-MM"`` format.
+
+        Raises
+        ------
+        ValueError
+            If the string cannot be parsed.
+        """
+        quarter = quarter.strip()
+
+        # Already in API format
+        if re.match(r"^\d{4}-\d{2}$", quarter):
+            return quarter
+
+        # "Mar 2026" or "March 2026"
+        parts = quarter.split()
+        if len(parts) == 2:
+            mon_str, yr_str = parts[0].upper()[:3], parts[1]
+            month = Nse._QUARTER_MONTH_MAP.get(mon_str)
+            if month and yr_str.isdigit():
+                return f"{yr_str}-{month:02d}"
+
+        raise ValueError(
+            f"Cannot parse quarter '{quarter}'. "
+            "Use 'Mar 2026', 'December 2025', or 'YYYY-MM'."
+        )
+
+    def peer_comparison(
+        self,
+        symbol:  str,
+        quarter: str,
+        report_type: str = "Consolidated",
+    ) -> pd.DataFrame:
+        """
+        Fetch peer-comparison data for a stock from the NSE GetQuoteApi.
+
+        Parameters
+        ----------
+        symbol : str
+            NSE equity symbol, e.g. ``"TCS"``, ``"TRENT"``.
+        quarter : str
+            Quarter end-month.  Accepted formats:
+
+            * ``"Mar 2026"`` / ``"March 2026"`` (month + year)
+            * ``"YYYY-MM"``  (e.g. ``"2026-03"``, passed through as-is)
+
+            Common quarter-end months: Mar, Jun, Sep, Dec.
+        report_type : str, optional
+            ``"Standalone"`` or ``"Consolidated"``(default).
+            The API receives ``"S"`` or ``"C"`` respectively.
+            Case-insensitive; a bare ``"S"`` / ``"C"`` is also accepted.
+
+        Returns
+        -------
+        pd.DataFrame
+            One row per peer company.  Typical columns include:
+            ``symbol``, ``ltp``, ``pChange``, ``volume`` , ``value``, 
+            ``marketCap``, ``pe``, ``totalIncome``, ``pat``, ``eps``,
+            ``debtEqRatio``, ``promoterHolding``.
+            Returns an empty ``DataFrame`` on failure.
+
+        Examples
+        --------
+        >>> nse.peer_comparison("TRENT", "Mar 2026")
+        >>> nse.peer_comparison("TCS",   "Dec 2025", "Consolidated")
+        >>> nse.peer_comparison("INFY",  "2025-09",  "S")
+        """
+        # ── Resolve report_type to S / C ──────────────────────────────────
+        rt = report_type.strip().upper()
+        if rt in ("S", "STANDALONE"):
+            type_code = "S"
+        elif rt in ("C", "CONSOLIDATED"):
+            type_code = "C"
+        else:
+            raise ValueError(
+                f"report_type must be 'Standalone' or 'Consolidated' "
+                f"(got '{report_type}')."
+            )
+
+        # ── Parse quarter to YYYY-MM ───────────────────────────────────────
+        quarter_code = self._parse_quarter(quarter)
+
+        # ── Build URL & fetch ──────────────────────────────────────────────
+        symbol = symbol.strip().upper()
+        url = (
+            "https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
+            f"?functionName=getPeerComparisonData"
+            f"&symbol={symbol}"
+            f"&type={type_code}"
+            f"&quarter={quarter_code}"
+            f"&param=industry&index="
+        )
+
+        data = self._get_json("https://www.nseindia.com/option-chain", url)
+
+        if not data:
+            return pd.DataFrame()
+
+        # API may return a list directly or wrap it under a key
+        if isinstance(data, list):
+            records = data
+        elif isinstance(data, dict):
+            # Try common wrapper keys
+            for key in ("data", "peers", "result", "peerData"):
+                if key in data and isinstance(data[key], list):
+                    records = data[key]
+                    break
+            else:
+                # Flatten whatever we got
+                records = [data]
+        else:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(records)
+
+        # Numeric coercion for common fields
+        numeric_cols = [
+            "marketCap", "value", "volume", "eps", "ltp",
+            "pat", "pe", "promoterHolding", "totalIncome",
+            "pChange", "PChange",
+        ]
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # ── Unit conversions ──────────────────────────────────────────────────
+        # API returns totalIncome & pat in ₹ Lakhs → convert to ₹ Crores
+        # API returns marketCap in ₹ (absolute) → convert to ₹ Crores
+        # API returns value in ₹ (absolute) → convert to ₹ Crores
+        # API returns volume in units → convert to Lakhs
+        if "totalIncome" in df.columns:
+            df["totalIncome"] = (df["totalIncome"] / 100).round(2)   # Lakhs → Crores
+        if "pat" in df.columns:
+            df["pat"] = (df["pat"] / 100).round(2)                   # Lakhs → Crores
+        if "marketCap" in df.columns:
+            df["marketCap"] = (df["marketCap"] / 1e7).round(2)       # ₹ → Crores
+        if "value" in df.columns:
+            df["value"] = (df["value"] / 1e7).round(2)               # ₹ → Crores
+        if "volume" in df.columns:
+            df["volume"] = (df["volume"] / 1e5).round(2)             # units → Lakhs
+
+        # ── Column selection & ordering ───────────────────────────────────────
+        col_order = [
+            "symbol",
+            "ltp",
+            "pChange",
+            "volume",        # Lakhs
+            "value",         # ₹ Cr.
+            "marketCap",     # ₹ Cr.
+            "pe",
+            "totalIncome",   # ₹ Cr.
+            "pat",           # ₹ Cr.
+            "eps",
+            "debtEqRatio",
+            "promoterHolding",
+        ]
+        _drop = {"series", "marketType", "PChange"}
+        existing = [c for c in col_order if c in df.columns]
+        extra    = [c for c in df.columns if c not in col_order and c not in _drop]
+        df = df[existing + extra]
+
+        # ── Friendly column rename ────────────────────────────────────────────
+        rename_map = {
+            "symbol":          "Symbol",
+            "ltp":             "LTP (₹)",
+            "pChange":         "% Chng",
+            "volume":          "Volume (Lakhs)",
+            "value":           "Value (₹ Cr.)",
+            "marketCap":       "Mkt Cap (₹ Cr.)",
+            "pe":              "P/E",
+            "totalIncome":     "Total Income (₹ Cr.)",
+            "pat":             "Net Profit (₹ Cr.)",
+            "eps":             "EPS (₹)",
+            "debtEqRatio":     "Debt/Equity",
+            "promoterHolding": "Promoter %",
+        }
+        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+        return df
+
     def recent_annual_reports(self) -> pd.DataFrame:
         """
         Parse the NSE annual-reports RSS feed into a structured table.
@@ -7586,4 +7853,3 @@ class Nse:
 # prevents referencing one class attribute from another at definition time.
 # Assign it here to keep the URL in a single place.
 Nse._SEBI_HEADERS["Referer"] = Nse._SEBI_REFERER
-

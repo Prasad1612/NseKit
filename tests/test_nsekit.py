@@ -1,5 +1,5 @@
 """
-test_nsekit.py  —  High-level NseKit + Usage coverage
+test_nsekit.py — Professional test suite for NseKit
 ================================================================
 Rule:  PASS  → real data returned (non-None, non-empty)
        FAIL  → None / empty DataFrame / empty list / exception
@@ -981,3 +981,98 @@ class TestIPO:
 
     def test_ipo_tracker_mainboard(self, nse):
         _has_data(nse.ipo_tracker_summary("Mainboard"), label="ipo_tracker_main")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 18. PEER COMPARISON
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestParseQuarter:
+    """Offline unit tests for the _parse_quarter static helper."""
+
+    @pytest.mark.parametrize("inp,expected", [
+        ("Mar 2026",      "2026-03"),
+        ("March 2026",    "2026-03"),
+        ("dec 2025",      "2025-12"),
+        ("December 2025", "2025-12"),
+        ("Jun 2025",      "2025-06"),
+        ("2025-09",       "2025-09"),   # pass-through
+        ("2026-03",       "2026-03"),   # pass-through
+    ])
+    def test_valid_quarters(self, inp, expected):
+        assert NseKit.Nse._parse_quarter(inp) == expected
+
+    @pytest.mark.parametrize("bad", ["Q4 2025", "2025", "Mar", "13 2025", ""])
+    def test_invalid_quarter_raises(self, bad):
+        with pytest.raises(ValueError, match="Cannot parse quarter"):
+            NseKit.Nse._parse_quarter(bad)
+
+
+@pytest.mark.live
+class TestPeerComparison:
+
+    SYMBOL  = "TRENT"
+    QUARTER = "Dec 2025"
+
+    EXPECTED_COLS = {
+        "Symbol", "LTP (₹)", "% Chng", "Volume (Lakhs)", "Value (₹ Cr.)",
+        "Mkt Cap (₹ Cr.)", "P/E", "Total Income (₹ Cr.)",
+        "Net Profit (₹ Cr.)", "EPS (₹)", "Debt/Equity", "Promoter %",
+    }
+
+    def test_standalone_returns_df(self, nse):
+        df = nse.peer_comparison(self.SYMBOL, self.QUARTER, "Standalone")
+        _has_df(df, min_rows=1, cols=self.EXPECTED_COLS, label="peer_standalone")
+
+    def test_consolidated_returns_df(self, nse):
+        df = nse.peer_comparison(self.SYMBOL, self.QUARTER, "Consolidated")
+        _has_df(df, min_rows=1, cols=self.EXPECTED_COLS, label="peer_consolidated")
+
+    def test_short_type_s(self, nse):
+        df = nse.peer_comparison(self.SYMBOL, self.QUARTER, "S")
+        _has_df(df, min_rows=1, label="peer_S")
+
+    def test_short_type_c(self, nse):
+        df = nse.peer_comparison(self.SYMBOL, self.QUARTER, "C")
+        _has_df(df, min_rows=1, label="peer_C")
+
+    def test_quarter_passthrough_format(self, nse):
+        df = nse.peer_comparison(self.SYMBOL, "2025-12", "S")
+        _has_df(df, min_rows=1, label="peer_passthrough")
+
+    def test_symbol_column_present(self, nse):
+        df = nse.peer_comparison(self.SYMBOL, self.QUARTER)
+        assert "Symbol" in df.columns
+
+    def test_queried_symbol_in_results(self, nse):
+        df = nse.peer_comparison(self.SYMBOL, self.QUARTER)
+        assert self.SYMBOL in df["Symbol"].values, \
+            f"{self.SYMBOL} not found in peer results"
+
+    def test_no_series_markettype_pchange_cols(self, nse):
+        df = nse.peer_comparison(self.SYMBOL, self.QUARTER)
+        dropped = {"series", "marketType", "PChange"}
+        present = dropped & set(df.columns)
+        assert not present, f"Unexpected columns still present: {present}"
+
+    def test_mktcap_in_crores(self, nse):
+        """Mkt Cap should be in crores (< 1e9), not absolute rupees."""
+        df = nse.peer_comparison(self.SYMBOL, self.QUARTER)
+        col = "Mkt Cap (₹ Cr.)"
+        if col in df.columns:
+            assert df[col].max() < 1e9, "marketCap looks like absolute ₹, not crores"
+
+    def test_volume_in_lakhs(self, nse):
+        """Volume (Lakhs) should be < 1e6 for any realistic stock."""
+        df = nse.peer_comparison(self.SYMBOL, self.QUARTER)
+        col = "Volume (Lakhs)"
+        if col in df.columns:
+            assert df[col].max() < 1e6, "Volume looks like raw units, not Lakhs"
+
+    def test_invalid_report_type_raises(self, nse):
+        with pytest.raises(ValueError, match="report_type must be"):
+            nse.peer_comparison(self.SYMBOL, self.QUARTER, "XYZZY")
+
+    def test_invalid_quarter_raises(self, nse):
+        with pytest.raises(ValueError, match="Cannot parse quarter"):
+            nse.peer_comparison(self.SYMBOL, "Q4 2025")

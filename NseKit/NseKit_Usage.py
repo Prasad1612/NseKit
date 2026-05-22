@@ -233,11 +233,11 @@ rich = Console()
 
 # # 🔹 Insider Trading
 # print(get.cm_live_hist_insider_trading())                                                 # Today's Insider trading  
-# print(get.cm_live_hist_insider_trading("1M"))                                             # period                 "1D", "1W", "1M", "3M", "6M", "1Y"
-# print(get.cm_live_hist_insider_trading("01-01-2025", "15-10-2025"))                       # Date range
+# print(get.cm_live_hist_insider_trading("1W"))                                             # period                 "1D", "1W", "1M", "3M", "6M", "1Y"
+# print(get.cm_live_hist_insider_trading("01-05-2026", "10-05-2026"))                       # Date range
 # print(get.cm_live_hist_insider_trading("RELIANCE"))                                       # Today Insider trading for a symbol
 # print(get.cm_live_hist_insider_trading("RELIANCE", "1M"))                                 # Symbol with period     "1D", "1W", "1M", "3M", "6M", "1Y"
-# print(get.cm_live_hist_insider_trading("RELIANCE", "01-01-2025", "15-10-2025"))           # Symbol + date range
+# print(get.cm_live_hist_insider_trading("RELIANCE", "15-05-2026", "22-05-2026"))           # Symbol + date range
 
 # # 🔹 Corporate Announcements
 # print(get.cm_live_hist_corporate_announcement())                                          # Corporate announcements 
@@ -326,6 +326,11 @@ rich = Console()
 # print(get.cm_live_hist_br_sr("01-01-2025", "15-10-2025"))                                 # Date range
 # print(get.cm_live_hist_br_sr("RELIANCE", "01-01-2025", "15-10-2025"))                     # Symbol + date range
 
+# # 🔹 Peer Comparison
+# print(get.peer_comparison("TRENT", "Mar 2026"))
+# print(get.peer_comparison("TCS",   "Dec 2025", "Consolidated"))
+# print(get.peer_comparison("INFY",  "2025-09",  "C"))
+# print(get.peer_comparison("TRENT", "2026-03",  "S"))
 
 # # 🔹 Quarterly Results - {JSON}
 # print(get.quarterly_financial_results('TCS'))                                             # Last 3 Quarterly Results Consolidated/Standalone (Income, PBT, Net Profit, EPS)
