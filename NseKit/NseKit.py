@@ -9,7 +9,7 @@ Usage::
 
     from NseKit import Nse
     nse = Nse()
-    nse.cm_live_equity_price_info("RELIANCE")
+    nse.cm_live_equity_info("RELIANCE")
 """
 
 import csv
@@ -692,7 +692,7 @@ class Nse:
 
         from NseKit import Nse
         nse = Nse()
-        df  = nse.cm_live_equity_price_info("RELIANCE")
+        df  = nse.cm_live_equity_info("RELIANCE")
         print(df)
     """
 
@@ -3532,7 +3532,7 @@ class Nse:
 
         Examples
         --------
-        >>> nse.cm_live_equity_full_info("RELIANCE")
+        >>> nse.cm_live_equity_info("RELIANCE")
         """
         symbol = symbol.replace(" ", "%20").replace("&", "%26")
         self.rotate_user_agent()
@@ -4652,6 +4652,41 @@ class Nse:
     # ════════════════════════════════════════════════════════════════════════
     # ── CM — EOD ────────────────────────────────────────────────────────────
 
+    # def cm_eod_fii_dii_activity(self, exchange: str = "All") -> pd.DataFrame | None:
+    #     """
+    #     Return the latest FII and DII activity data.
+
+    #     Parameters
+    #     ----------
+    #     exchange : str, optional
+    #         ``"Nse"`` for NSE-only data, or ``"All"`` (default) for combined.
+
+    #     Returns
+    #     -------
+    #     pd.DataFrame or None
+
+    #     Examples
+    #     --------
+    #     >>> nse.cm_eod_fii_dii_activity()
+    #     >>> nse.cm_eod_fii_dii_activity("Nse")
+    #     """
+    #     self.rotate_user_agent()
+    #     ep = {
+    #         "Nse": "https://www.nseindia.com/api/fiidiiTradeNse",
+    #         "All": "https://www.nseindia.com/api/fiidiiTradeReact",
+    #     }
+    #     try:
+    #         resp = self._warm_and_fetch(
+    #             "https://www.nseindia.com/reports/fii-dii",
+    #             ep.get(exchange, ep["All"]),
+    #             timeout=10
+    #         )
+    #         return pd.DataFrame(resp.json())
+    #     except Exception as exc:
+    #         self._log_error("cm_eod_fii_dii_activity", exc)
+    #         return None
+
+
     def cm_eod_fii_dii_activity(self, exchange: str = "All") -> pd.DataFrame | None:
         """
         Return the latest FII and DII activity data.
@@ -4681,10 +4716,22 @@ class Nse:
                 ep.get(exchange, ep["All"]),
                 timeout=10
             )
-            return pd.DataFrame(resp.json())
+            df = pd.DataFrame(resp.json())
+
+            # Reorder and rename columns
+            df = df[["category", "date", "buyValue", "sellValue", "netValue"]]
+            df.columns = [
+                "Category",
+                "Date",
+                "Buy Value (₹ Cr)",
+                "Sell Value (₹ Cr)",
+                "Net Value (₹ Cr)",
+            ]
+            return df
         except Exception as exc:
             self._log_error("cm_eod_fii_dii_activity", exc)
             return None
+
 
     def cm_eod_market_activity_report(self, trade_date: str) -> list | None:
         """
