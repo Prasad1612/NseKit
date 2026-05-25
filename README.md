@@ -562,6 +562,10 @@ rich = Console()
 # # 🔹 FII Stats
 # print(get.fno_eod_fii_stats("17-10-2025"))                                                # FII statistics for a specific trade date (DD-MM-YYYY)
 
+# # 🔹 Client Category Wise Turnover
+# print(get.fno_eod_client_wise_turnover("22-05-2026"))                                     # Client Category Wise Turnover     - excel table data only
+# print(get.fno_eod_client_wise_turnover("22-05-2026",raw_data=True))                       # Client Category Wise Turnover     - raw excel data
+
 # # 🔹 Top 10 Futures
 # print(get.fno_eod_top10_fut("17-10-2025"))                                                # Top 10 futures contracts (DD-MM-YYYY)
 
@@ -579,9 +583,14 @@ rich = Console()
 
 # # 🔹 Participant-Wise Open Interest
 # print(get.fno_eod_participant_wise_oi("17-10-2025"))                                      # Participant-wise OI data (DD-MM-YYYY)
+# print(get.fno_eod_participant_wise_oi("17-10-2025",raw_data=True)) 
 
 # # 🔹 Participant-Wise Volume
 # print(get.fno_eod_participant_wise_vol("17-10-2025"))                                     # Participant-wise volume data (DD-MM-YYYY)
+# print(get.fno_eod_participant_wise_vol("17-10-2025",raw_data=True)) 
+
+# # 🔹 Top 10 Clearing Members
+# print(get.fno_eod_top_10_clearing_members("18-05-2026"))                                  # Volume and Turnover data of top 10 Clearing Members
 
 # # 🔹  Historical Futures
 # print(get.future_price_volume_data("NIFTY", "Index", "OCT-25", "01-10-2025", "17-10-2025"))
@@ -610,6 +619,7 @@ rich = Console()
 # print(get.fno_monthly_settlement_report())                                                # Current FY F&O settlement stats
 # print(get.fno_monthly_settlement_report("2024", "2025"))                                  # Specific FY range
 # print(get.fno_monthly_settlement_report("2Y"))                                            # Last 2 FYs
+
 
 
 # #---------------------------------------------------------- SEBI Data ----------------------------------------------------------

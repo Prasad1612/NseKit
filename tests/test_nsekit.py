@@ -724,6 +724,13 @@ class TestFnoLive:
     def test_fno_ban_list(self, nse):
         _has_data(nse.fno_eod_sec_ban(self.EOD_DATE), label="ban_list")
 
+    def test_fno_eod_top_10_clearing_members(self, nse):
+        _has_data(nse.fno_eod_top_10_clearing_members(self.EOD_DATE), label="top_10_clearing_members")
+
+    def test_fno_eod_client_wise_turnover(self, nse):
+        _has_data(nse.fno_eod_client_wise_turnover(self.EOD_DATE), label="client_wise_turnover")
+
+
     def test_symbol_full_fno_data(self, nse):
         _has_dict(nse.symbol_full_fno_live_data("TCS"), label="full_fno_tcs")
 

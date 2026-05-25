@@ -1139,7 +1139,7 @@ class Nse:
             self._log_error("_get_archive", exc)
             return None
 
-    def _get_csv_archive(self, url: str) -> pd.DataFrame | None:
+    def _get_csv_archive(self, url: str, **kwargs) -> pd.DataFrame | None:
         """
         Fetch a static CSV archive and parse it into a ``DataFrame``.
 
@@ -1157,7 +1157,7 @@ class Nse:
         if raw is None:  # Bug 2 fix: b"" (empty file) is valid; only None signals error
             return None
         try:
-            return pd.read_csv(BytesIO(raw))
+            return pd.read_csv(BytesIO(raw), **kwargs)
         except Exception as exc:
             self._log_error("_get_csv_archive", exc)
             return None
@@ -1861,17 +1861,40 @@ class Nse:
             self._log_error("_pre_open", exc)
             return None
 
-    def _fao_participant_csv(self, trade_date: str, suffix: str) -> pd.DataFrame | None:
+    def _fao_participant_csv(
+        self,
+        trade_date: str,
+        suffix: str,
+        raw_data: bool = False,
+    ) -> pd.DataFrame | None:
         """
         Shared fetch for participant-wise OI and volume CSVs.
-
         *suffix* is either ``"oi"`` or ``"vol"``.
+        *raw_data* if True returns the raw CSV without any processing.
         """
         ds = _fmt_trade_date(trade_date, "%d%m%Y").upper()
-        return self._get_csv_archive(
+
+        if raw_data:
+            return self._get_csv_archive(
+                f"https://nsearchives.nseindia.com/content/nsccl/"
+                f"fao_participant_{suffix}_{ds}.csv"
+            )
+
+        # skiprows=1 → skip "Participant 2026" metadata row
+        # Row 1 becomes header automatically
+        df = self._get_csv_archive(
             f"https://nsearchives.nseindia.com/content/nsccl/"
-            f"fao_participant_{suffix}_{ds}.csv"
+            f"fao_participant_{suffix}_{ds}.csv",
+            skiprows=1,
         )
+        if df is None:
+            return None
+
+        # Drop trailing empty/NaN columns
+        df = df.loc[:, df.columns.notna()]
+        df = df.loc[:, df.columns.str.strip() != ""]
+
+        return df
 
     def _holidays(
         self,
@@ -6630,6 +6653,84 @@ class Nse:
             f"fo_secban_{_fmt_trade_date(trade_date).upper()}.csv"
         )
 
+    def fno_eod_top_10_clearing_members(self, trade_date: str) -> pd.DataFrame | None:
+        """Return the Volume and Turnover data of top 10 Clearing Members (no. of contracts) in Derivatives for a trade date.
+
+        Parameters
+        ----------
+        trade_date : str
+            Date in ``DD-MM-YYYY`` format.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.fno_eod_top_10_clearing_members("17-10-2025")
+        """
+        return self._get_csv_archive(
+            f"https://nsearchives.nseindia.com/content/nsccl/"
+            f"fao_top10cm_to_{_fmt_trade_date(trade_date).upper()}.csv"
+        )
+    
+
+    def fno_eod_client_wise_turnover(
+        self,
+        trade_date: str,
+        raw_data: bool = False
+    ) -> pd.DataFrame | None:
+        """Return the Client Category Wise Turnover data.
+
+        Parameters
+        ----------
+        trade_date : str
+            Date in ``DD-MM-YYYY`` format.
+
+        raw_data : bool, default False
+            If True, return raw Excel data.
+            If False, return cleaned turnover table only.
+
+        Returns
+        -------
+        pd.DataFrame or None
+
+        Examples
+        --------
+        >>> nse.fno_eod_client_wise_turnover("17-10-2025")
+        >>> nse.fno_eod_client_wise_turnover("17-10-2025",raw_data=True)
+        """
+
+        fmt = datetime.strptime(trade_date,"%d-%m-%Y").strftime("%d%m%y")
+
+        raw = self._get_archive(
+            f"https://nsearchives.nseindia.com/archives/fo/cat/fo_cat_turnover_{fmt}.xls"
+        )
+
+        if not raw:
+            return None
+
+        df = self._read_excel(raw)
+
+        if df is None or df.empty:
+            return None
+
+        # Return full raw Excel data
+        if raw_data:
+            return df
+
+        # Clean turnover table only
+        df = df.iloc[1:8].reset_index(drop=True)
+
+        df.columns = [
+            "Trade Date",
+            "Client Categories",
+            "Buy Value in ₹ Cr",
+            "Sell Value in ₹ Cr",
+        ]
+
+        return df
+
     def fno_eod_mwpl_3(self, trade_date: str) -> pd.DataFrame | None:
         """
         Return the MWPL (Market Wide Position Limit) client-wise Excel file.
@@ -6702,13 +6803,20 @@ class Nse:
                     return pd.read_csv(zf.open(name))
         return None
 
-    def fno_eod_participant_wise_oi(self, trade_date: str) -> pd.DataFrame | None:
+    def fno_eod_participant_wise_oi(
+        self,
+        trade_date: str,
+        raw_data: bool = False,
+    ) -> pd.DataFrame | None:
         """Return participant-wise open interest for a trade date.
 
         Parameters
         ----------
         trade_date : str
             Date in ``DD-MM-YYYY`` format.
+        raw_data : bool, optional
+            If True, returns raw CSV data without removing the first metadata row.
+            Default is False.
 
         Returns
         -------
@@ -6717,16 +6825,25 @@ class Nse:
         Examples
         --------
         >>> nse.fno_eod_participant_wise_oi("17-10-2025")
+        >>> nse.fno_eod_participant_wise_oi("17-10-2025", raw_data=True)
         """
-        return self._fao_participant_csv(trade_date, "oi")
+        return self._fao_participant_csv(trade_date, "oi", raw_data=raw_data)
 
-    def fno_eod_participant_wise_vol(self, trade_date: str) -> pd.DataFrame | None:
+
+    def fno_eod_participant_wise_vol(
+        self,
+        trade_date: str,
+        raw_data: bool = False,
+    ) -> pd.DataFrame | None:
         """Return participant-wise trading volume for a trade date.
 
         Parameters
         ----------
         trade_date : str
             Date in ``DD-MM-YYYY`` format.
+        raw_data : bool, optional
+            If True, returns raw CSV data without removing the first metadata row.
+            Default is False.
 
         Returns
         -------
@@ -6735,8 +6852,11 @@ class Nse:
         Examples
         --------
         >>> nse.fno_eod_participant_wise_vol("17-10-2025")
+        >>> nse.fno_eod_participant_wise_vol("17-10-2025", raw_data=True)
         """
-        return self._fao_participant_csv(trade_date, "vol")
+        return self._fao_participant_csv(trade_date, "vol", raw_data=raw_data)
+
+
 
     def fno_eom_lot_size(self, symbol: str | None = None) -> pd.DataFrame | None:
         """
