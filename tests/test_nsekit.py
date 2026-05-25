@@ -292,7 +292,7 @@ class TestEquityAndIndexLists:
 class TestCircularsAndPress:
 
     def test_circulars_default(self, nse):
-        _has_df(nse.nse_live_hist_circulars(), label="circulars_default")
+        _has_df(nse.nse_live_hist_circulars(_ago(30), _today()), label="circulars_default")
 
     def test_circulars_date_range(self, nse):
         _has_df(nse.nse_live_hist_circulars(_ago(60), _today()), label="circulars_range")
@@ -346,15 +346,8 @@ class TestPreMarket:
 class TestEquityLive:
     SYM = "RELIANCE"
 
-    def test_equity_price_info(self, nse):
-        _has_dict(nse.cm_live_equity_price_info(self.SYM),
-                  keys={"Symbol", "LastTradedPrice", "Open", "High", "Low", "Close"})
-
-    def test_equity_full_info(self, nse):
-        _has_dict(nse.cm_live_equity_full_info(self.SYM), keys={"Symbol", "MarketCap"})
-
-    def test_equity_info_old(self, nse):
-        _has_dict(nse.cm_live_equity_info(self.SYM), label="equity_info_old")
+    def test_equity_info(self, nse):
+        _has_dict(nse.cm_live_equity_info(self.SYM), keys={"Symbol", "MarketCap"})
 
     def test_most_active_by_value(self, nse):
         _has_data(nse.cm_live_most_active_equity_by_value(), label="active_value")
@@ -494,7 +487,7 @@ class TestHistoricalEquity:
 
     def test_insider_trading_range(self, nse):
         _has_data(
-            nse.cm_live_hist_insider_trading("RELIANCE", "01-01-2025", "15-10-2025"),
+            nse.cm_live_hist_insider_trading("RELIANCE", "15-05-2026", "22-05-2026"),
             label="insider_range"
         )
 

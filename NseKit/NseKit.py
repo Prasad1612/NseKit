@@ -2959,57 +2959,7 @@ class Nse:
         df = _keep_cols(df, cols)
         return _clean(df.fillna(0))
 
-    # def index_live_indices_stocks_data(
-    #     self,
-    #     category:  str,
-    #     list_only: bool = False,
-    # ) -> pd.DataFrame | list | None:
-    #     """
-    #     Return live stock data for all constituents in an NSE index.
 
-    #     Parameters
-    #     ----------
-    #     category : str
-    #         Index name, e.g. ``"NIFTY 50"``, ``"NIFTY BANK"``,
-    #         ``"NIFTY IT"``.
-    #     list_only : bool, optional
-    #         If ``True``, return only the list of symbol strings.
-    #         Default is ``False``.
-
-    #     Returns
-    #     -------
-    #     pd.DataFrame or list or None
-
-    #     Examples
-    #     --------
-    #     >>> nse.index_live_indices_stocks_data("NIFTY 50")
-    #     >>> nse.index_live_indices_stocks_data("NIFTY IT", list_only=True)
-    #     """
-    #     try:
-    #         enc = category.upper().replace("&", "%26").replace(" ", "%20")
-    #         raw = self._get_json(
-    #             "https://www.nseindia.com/market-data/live-equity-market",
-    #             f"https://www.nseindia.com/api/equity-stockIndices?index={enc}"
-    #         )
-    #     except Exception as exc:
-    #         self._log_error("index_live_indices_stocks_data", exc)
-    #         return None
-
-    #     df = (
-    #         pd.DataFrame(raw["data"])
-    #         .drop(["meta"], axis=1, errors="ignore")
-    #         .set_index("symbol", drop=False)
-    #     )
-    #     if list_only:
-    #         return df["symbol"].tolist()
-
-    #     col_order = [
-    #         "symbol", "previousClose", "open", "dayHigh", "dayLow", "lastPrice",
-    #         "change", "pChange", "totalTradedVolume", "totalTradedValue",
-    #         "nearWKH", "nearWKL", "perChange30d", "perChange365d", "ffmc",
-    #     ]
-    #     return _clean(_keep_cols(df, col_order))
-    
     def index_live_indices_stocks_data(
         self,
         category: str,
@@ -3045,12 +2995,24 @@ class Nse:
 
         try:
             enc = category.upper().replace("&", "%26").replace(" ", "%20")
+            # Securities in F&O uses a different endpoint
+            STOCK_INDEX_CATEGORIES = {"SECURITIES IN F&O"}  # add others if needed
+
+            if category.strip().upper() in STOCK_INDEX_CATEGORIES:
+                api_url = f"https://www.nseindia.com/api/equity-stockIndex?index={enc}"
+            else:
+                api_url = f"https://www.nseindia.com/api/equity-stock-indices?index={enc}"
+
             raw = self._get_json(
                 "https://www.nseindia.com/market-data/live-equity-market",
-                f"https://www.nseindia.com/api/equity-stockIndices?index={enc}"
+                api_url
             )
         except Exception as exc:
             self._log_error("index_live_indices_stocks_data", exc)
+            return None
+        
+        if "data" not in raw:
+            self._log_error("index_live_indices_stocks_data", f"No 'data' key in response: {list(raw.keys())}")
             return None
 
         full_df = pd.DataFrame(raw["data"]).drop(["meta"], axis=1, errors="ignore")
@@ -3551,139 +3513,6 @@ class Nse:
         }])
 
     def cm_live_equity_info(self, symbol: str) -> dict | None:
-        """
-        Return basic equity information for a symbol.
-
-        Parameters
-        ----------
-        symbol : str
-            NSE equity symbol, e.g. ``"RELIANCE"``.
-
-        Returns
-        -------
-        dict or None
-            Keys: Symbol, companyName, industry, boardStatus,
-            tradingStatus, tradingSegment, derivatives, surveillance,
-            surveillanceDesc, Facevalue, TotalSharesIssued.
-
-        Examples
-        --------
-        >>> nse.cm_live_equity_info("RELIANCE")
-        """
-        symbol = symbol.replace(" ", "%20").replace("&", "%26")
-        self.rotate_user_agent()
-
-        def _call():
-            data = self._get_json(
-                f"https://www.nseindia.com/get-quotes/equity?symbol={symbol}",
-                f"https://www.nseindia.com/api/quote-equity?symbol={symbol}"
-            )
-            if not data or "error" in data:
-                raise ValueError("No data")
-            return {
-                "Symbol":          symbol,
-                "companyName":     data["info"]["companyName"],
-                "industry":        data["info"]["industry"],
-                "boardStatus":     data["securityInfo"]["boardStatus"],
-                "tradingStatus":   data["securityInfo"]["tradingStatus"],
-                "tradingSegment":  data["securityInfo"]["tradingSegment"],
-                "derivatives":     data["securityInfo"]["derivatives"],
-                "surveillance":    data["securityInfo"]["surveillance"]["surv"],
-                "surveillanceDesc":data["securityInfo"]["surveillance"]["desc"],
-                "Facevalue":       data["securityInfo"]["faceValue"],
-                "TotalSharesIssued":data["securityInfo"]["issuedSize"],
-            }
-
-        try:
-            return self._retry(_call)
-        except Exception as exc:
-            self._log_error("cm_live_equity_info", exc)
-            return None
-
-    def cm_live_equity_price_info(self, symbol: str) -> dict | None:
-        """
-        Return live price info including OHLC, VWAP, and the 5-level order book.
-
-        Parameters
-        ----------
-        symbol : str
-            NSE equity symbol, e.g. ``"RELIANCE"``.
-
-        Returns
-        -------
-        dict or None
-            Keys: Symbol, PreviousClose, LastTradedPrice, Change,
-            PercentChange, Open, Close, High, Low, VWAP, UpperCircuit,
-            LowerCircuit, Sector, Bid/Ask Price & Quantity 1–5.
-
-        Examples
-        --------
-        >>> nse.cm_live_equity_price_info("RELIANCE")
-        """
-        symbol = symbol.replace(" ", "%20").replace("&", "%26")
-        self.rotate_user_agent()
-
-        def _call():
-            ref_url = f"https://www.nseindia.com/get-quotes/equity?symbol={symbol}"
-            data = self._get_json(
-                ref_url,
-                f"https://www.nseindia.com/api/quote-equity?symbol={symbol}"
-            )
-            trd  = self._get_json(
-                ref_url,
-                f"https://www.nseindia.com/api/quote-equity?symbol={symbol}&section=trade_info"
-            )
-
-            if not data or "error" in data:
-                raise ValueError("No data")
-
-            # Bug 3 fix: trade-info call may return None; guard before accessing .get()
-            trd  = trd or {}
-            ob   = trd.get("marketDeptOrderBook", {})
-            bids = ob.get("bid", [])
-            asks = ob.get("ask", [])
-            bp   = [e.get("price",    0) for e in bids[:5]] + [0] * (5 - len(bids))
-            bq   = [e.get("quantity", 0) for e in bids[:5]] + [0] * (5 - len(bids))
-            ap   = [e.get("price",    0) for e in asks[:5]] + [0] * (5 - len(asks))
-            aq   = [e.get("quantity", 0) for e in asks[:5]] + [0] * (5 - len(asks))
-            pi   = data["priceInfo"]
-            ii   = data["industryInfo"]
-
-            result = {
-                "Symbol":                    symbol,
-                "PreviousClose":             pi["previousClose"],
-                "LastTradedPrice":           pi["lastPrice"],
-                "Change":                    pi["change"],
-                "PercentChange":             pi["pChange"],
-                "deliveryToTradedQuantity":  trd.get("securityWiseDP", {}).get("deliveryToTradedQuantity"),
-                "Open":                      pi["open"],
-                "Close":                     pi["close"],
-                "High":                      pi["intraDayHighLow"]["max"],
-                "Low":                       pi["intraDayHighLow"]["min"],
-                "VWAP":                      pi["vwap"],
-                "UpperCircuit":              pi["upperCP"],
-                "LowerCircuit":              pi["lowerCP"],
-                "Macro":                     ii["macro"],
-                "Sector":                    ii["sector"],
-                "Industry":                  ii["industry"],
-                "BasicIndustry":             ii["basicIndustry"],
-                "totalBuyQuantity":          ob.get("totalBuyQuantity",  0),
-                "totalSellQuantity":         ob.get("totalSellQuantity", 0),
-            }
-            for i in range(5):
-                result[f"Bid Price {i+1}"]    = bp[i]
-                result[f"Bid Quantity {i+1}"] = bq[i]
-                result[f"Ask Price {i+1}"]    = ap[i]
-                result[f"Ask Quantity {i+1}"] = aq[i]
-            return result
-
-        try:
-            return self._retry(_call)
-        except Exception as exc:
-            self._log_error("cm_live_equity_price_info", exc)
-            return None
-
-    def cm_live_equity_full_info(self, symbol: str) -> dict | None:
         """
         Return comprehensive live data for a symbol.
 
@@ -4653,8 +4482,7 @@ class Nse:
         """
         ref_url = "https://www.nseindia.com/companies-listing/corporate-filings-voting-results"
         data = self._get_json(
-            ref_url,
-            "https://www.nseindia.com/api/corporate-voting-results?"
+            ref_url,"https://www.nseindia.com/api/corporate-voting-results?"
         )
 
         if not data:
@@ -6590,73 +6418,6 @@ class Nse:
 
     # ════════════════════════════════════════════════════════════════════════
     # ── FnO — EOD ───────────────────────────────────────────────────────────
-
-    # def fno_eod_bhav_copy(self, trade_date: str = "") -> pd.DataFrame | None:
-    #     """
-    #     Download the F&O bhavcopy for a trade date.
-
-    #     Tries the direct archive URL first; falls back to the NSE reports
-    #     API if it returns non-200. Rows with all-zero price/volume columns
-    #     are filtered out automatically.
-
-    #     Parameters
-    #     ----------
-    #     trade_date : str
-    #         Date in ``DD-MM-YYYY`` format.
-
-    #     Returns
-    #     -------
-    #     pd.DataFrame or None
-
-    #     Examples
-    #     --------
-    #     >>> nse.fno_eod_bhav_copy("17-10-2025")
-    #     """
-    #     self.rotate_user_agent()
-    #     url = (
-    #         f"https://nsearchives.nseindia.com/content/fo/"
-    #         f"BhavCopy_NSE_FO_0_0_0_{_fmt_trade_date(trade_date, '%Y%m%d')}_F_0000.csv.zip"
-    #     )
-    #     dt_label = datetime.strptime(trade_date, "%d-%m-%Y").strftime("%d-%b-%Y")
-    #     dt_label = dt_label[:3] + dt_label[3:].capitalize()
-    #     try:
-    #         resp = self._warm_and_fetch(
-    #             "https://www.nseindia.com/reports-archives",
-    #             url,
-    #             timeout=15
-    #         )
-    #         if resp.status_code == 200:
-    #             df = self._zip_csv(resp.content)
-    #         else:
-    #             url2 = (
-    #                 f"https://www.nseindia.com/api/reports?archives="
-    #                 f"%5B%7B%22name%22%3A%22F%26O%20-%20Bhavcopy(csv)%22%2C"
-    #                 f"%22type%22%3A%22archives%22%2C%22category%22%3A"
-    #                 f"%22derivatives%22%2C%22section%22%3A%22equity%22%7D%5D"
-    #                 f"&date={dt_label}&type=equity&mode=single"
-    #             )
-    #             resp2 = self._warm_and_fetch(
-    #                 "https://www.nseindia.com/reports-archives",
-    #                 url2,
-    #                 timeout=10
-    #             )
-    #             df = self._zip_csv(resp2.content)
-
-    #         if not df.empty:
-    #             try:
-    #                 df = df[~(
-    #                     (df.iloc[:, 22] == 0) & (df.iloc[:, 23] == 0) &
-    #                     (df.iloc[:, 24] == 0) & (df.iloc[:, 25] == 0)
-    #                 )]
-    #                 df = df.sort_values(by=df.columns[24], ascending=False)
-    #             except IndexError:
-    #                 pass
-    #         return df
-
-    #     except Exception as exc:
-    #         self._log_error("fno_eod_bhav_copy", exc)
-    #         return None
-
 
     def fno_eod_bhav_copy(self, trade_date: str = "") -> pd.DataFrame | None:
         """

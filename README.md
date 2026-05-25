@@ -217,15 +217,8 @@ rich = Console()
 
 # #---------------------------------------------------------- Capital Market Live Data ----------------------------------------------------------
 
-# # 🔹 Equity Information           (Old)
-# print(get.cm_live_equity_info("RELIANCE"))                                                # Equity details for a symbol
-
-# # 🔹 Equity Price Information     (Old)
-# print(get.cm_live_equity_price_info("RELIANCE"))                                          # Detailed price data with bid/ask levels
-
-
-# # 🔹 Equity Information           (New)
-# print(get.cm_live_equity_full_info("RELIANCE"))                                           # Equity details for a symbol
+# # 🔹 Equity Information
+# print(get.cm_live_equity_info("RELIANCE"))                                           # Equity details for a symbol
 
 
 # # 🔹 Most Active Equities by Value
@@ -353,8 +346,6 @@ rich = Console()
 # url = "https://nsearchives.nseindia.com/corporate/ixbrl/INTEGRATED_FILING_INDAS_139754_02022026201126_iXBRL_WEB.html"
 # print(get.html_tables(url, show_tables=False, output="json"))
 # print(get.html_tables(url, output="df"))
-
-
 
 # #---------------------------------------------------------- FnO Live Data ----------------------------------------------------------
 
