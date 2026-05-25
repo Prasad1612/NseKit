@@ -236,6 +236,9 @@ class TestMarketStatus:
     def test_live_market_statistics(self, nse):
         _has_df(nse.cm_live_market_statistics(), label="market_statistics")
 
+    def test_live_latency_nanosec(self, nse):
+        _has_df(nse.latency_nanosec(), label="latency_nanosec")
+
     def test_gift_nifty(self, nse):
         _has_df(nse.cm_live_gifty_nifty(), label="gift_nifty")
 

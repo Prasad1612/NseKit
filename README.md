@@ -205,6 +205,8 @@ rich = Console()
 # # 🔹 Fetch live Capital Market statistics from NSE
 # print(get.cm_live_market_statistics())                                                    #  Capital Market statistics
 
+# print(get.latency_nanosec())                                                              #  Average order acknowledgement latency in nanoseconds
+
 # #---------------------------------------------------------- Live Chart Data ----------------------------------------------------------
 
 # print(get.index_chart("NIFTY 50","1D"))                                                    # "1D" "1M" "3M" "6M" "1Y"
@@ -218,7 +220,7 @@ rich = Console()
 # #---------------------------------------------------------- Capital Market Live Data ----------------------------------------------------------
 
 # # 🔹 Equity Information
-# print(get.cm_live_equity_info("RELIANCE"))                                           # Equity details for a symbol
+# print(get.cm_live_equity_info("RELIANCE"))                                                # Equity details for a symbol
 
 
 # # 🔹 Most Active Equities by Value

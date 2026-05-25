@@ -7552,6 +7552,64 @@ class Nse:
 
         return df
 
+
+    def latency_nanosec(self) -> pd.DataFrame | None:
+        """
+        Return NSE's current average order acknowledgement latency in nanoseconds.
+
+        NSE publishes a live feed of its *Immediate Acknowledgement* latency —
+        the time (in nanoseconds) between receiving an order and sending back
+        the receipt confirmation.  This is a pure infrastructure health metric
+        and is updated in real time during market hours.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Single-row DataFrame with raw API columns:
+
+            * ``timeStamp``          — server-side timestamp.
+            * ``data``               — latency value in nanoseconds.
+            * ``dissemination_flag`` — broadcast flag string from NSE.
+
+            Returns ``None`` if the API call fails or returns no data.
+
+        Examples
+        --------
+        >>> nse.latency_nanosec()
+        """
+        try:
+            raw = self._get_json(
+                "https://www.nseindia.com/option-chain",
+                "https://www.nseindia.com/api/NextApi/apiClient/commonApi"
+                "?functionName=getLatencyNanoSec",
+            )
+        except Exception as exc:
+            self._log_error("latency_nanosec", exc)
+            return None
+
+        if not isinstance(raw, dict) or "data" not in raw:
+            return None
+
+        inner = raw["data"]
+        if not isinstance(inner, dict):
+            return None
+
+        df = pd.DataFrame([inner])
+        # Rename columns
+        df = df.rename(columns={
+            "timeStamp": "timestamp",
+            "data": "latency_ns",
+            "dissemination_flag": "is_disseminated"
+        })
+
+        # df = df.rename(columns={
+        #     "timeStamp": "exchange_timestamp",
+        #     "data": "avg_order_ack_latency_ns",
+        #     "dissemination_flag": "broadcast_active"
+        # })
+        return df
+
+
     def recent_annual_reports(self) -> pd.DataFrame:
         """
         Parse the NSE annual-reports RSS feed into a structured table.
