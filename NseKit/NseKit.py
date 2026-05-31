@@ -3535,6 +3535,289 @@ class Nse:
             "Date":                       d.get("asOnDate"),
         }])
 
+    def cm_live_stocks_traded(
+        self,
+        series:      str | None   = None,
+        mkt_cap_gte: float | None = None,
+        mkt_cap_lte: float | None = None,
+    ) -> pd.DataFrame | None:
+        """
+        Return live stocks-traded data from NSE with optional filtering.
+
+        Fetches ``https://www.nseindia.com/api/live-analysis-stocksTraded``
+        and returns a clean DataFrame.  All three filter parameters can be
+        combined freely.
+
+        Parameters
+        ----------
+        series : str, optional
+            Trading series to keep (case-insensitive).  Common values:
+            ``"EQ"`` (normal equity), ``"BE"`` (trade-for-trade), ``"BZ"``,
+            ``"SM"``, ``"ST"``, etc.  Pass ``None`` (default) to include all
+            series.
+        mkt_cap_gte : float, optional
+            Lower bound for Market Cap in **₹ Crores** (inclusive ≥).
+            Rows with ``Mkt Cap (₹ Cr.) < mkt_cap_gte`` are dropped.
+        mkt_cap_lte : float, optional
+            Upper bound for Market Cap in **₹ Crores** (inclusive ≤).
+            Rows with ``Mkt Cap (₹ Cr.) > mkt_cap_lte`` are dropped.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Columns:
+
+            * ``Symbol``          — ticker symbol
+            * ``Series``          — trading series (EQ, BE, …)
+            * ``Last Price (₹)``  — last traded price
+            * ``Change (₹)``      — absolute change from previous close
+            * ``% Change``        — percentage change
+            * ``Volume (Lakhs)``  — total traded volume in Lakhs
+            * ``Value (₹ Cr.)``   — total traded value in ₹ Crores
+            * ``Mkt Cap (₹ Cr.)`` — total market capitalisation in ₹ Crores
+
+            Returns ``None`` if the API call fails or no rows survive the
+            applied filters.
+
+        Examples
+        --------
+        >>> nse = NseKit.Nse()
+
+        All stocks (no filter):
+        >>> nse.cm_live_stocks_traded()
+
+        EQ series only:
+        >>> nse.cm_live_stocks_traded("EQ")
+        >>> nse.cm_live_stocks_traded(series="EQ")
+
+        Market cap ≥ ₹1000 Cr:
+        >>> nse.cm_live_stocks_traded(mkt_cap_gte=1000)
+
+        Market cap ≤ ₹500 Cr:
+        >>> nse.cm_live_stocks_traded(mkt_cap_lte=500)
+
+        Combined — EQ series AND Mkt Cap ≥ ₹1000 Cr:
+        >>> nse.cm_live_stocks_traded("EQ", mkt_cap_gte=1000)
+
+        Combined — EQ series AND Mkt Cap between ₹500 Cr and ₹5000 Cr:
+        >>> nse.cm_live_stocks_traded("EQ", mkt_cap_gte=500, mkt_cap_lte=5000)
+        """
+        # ── 1. Fetch ──────────────────────────────────────────────────────────
+        raw = self._get_json(
+            "https://www.nseindia.com/market-data/live-equity-market",
+            "https://www.nseindia.com/api/live-analysis-stocksTraded",
+        )
+        if not raw or "total" not in raw or "data" not in raw["total"]:
+            return None
+
+        records = raw["total"]["data"]
+        if not records:
+            return None
+
+        df = pd.DataFrame(records)
+
+        # ── 2. Column selection & rename ──────────────────────────────────────
+        # NSE already supplies all columns in the correct display units —
+        # no conversion needed; just rename and round for clean output.
+        col_map = {
+            "symbol":            "Symbol",
+            "series":            "Series",
+            "lastPrice":         "Last Price (₹)",
+            "change":            "Change (₹)",
+            "pchange":           "% Change",
+            "totalTradedVolume": "Volume (Lakhs)",
+            "totalTradedValue":  "Value (₹ Cr.)",
+            "totalMarketCap":    "Mkt Cap (₹ Cr.)",
+        }
+        keep = [c for c in col_map if c in df.columns]
+        df = df[keep].rename(columns={c: col_map[c] for c in keep})
+
+        # Round numeric columns to 2 decimal places for clean display
+        for col in ("Last Price (₹)", "Change (₹)", "% Change",
+                    "Volume (Lakhs)", "Value (₹ Cr.)", "Mkt Cap (₹ Cr.)"):
+            if col in df.columns:
+                df[col] = df[col].round(2)
+
+        # ── 3. Filters ────────────────────────────────────────────────────────
+        if series is not None:
+            s = series.strip().upper()
+            if "Series" in df.columns:
+                df = df[df["Series"].str.upper() == s]
+
+        mkt_col = "Mkt Cap (₹ Cr.)"
+        if mkt_cap_gte is not None and mkt_col in df.columns:
+            df = df[df[mkt_col] >= mkt_cap_gte]
+
+        if mkt_cap_lte is not None and mkt_col in df.columns:
+            df = df[df[mkt_col] <= mkt_cap_lte]
+
+        df = df.reset_index(drop=True)
+        return df if not df.empty else None
+
+    def cm_live_price_band_hitters(
+        self,
+        band:          str        = "all",
+        sec_type:      str        = "AllSec",
+        series:        str | None = None,
+        turnover_gte:  float | None = None,
+        turnover_lte:  float | None = None,
+    ) -> pd.DataFrame | None:
+        """
+        Return live Price Band Hitters data from NSE.
+
+        Parameters
+        ----------
+        band : str, optional
+            Which price-band group to return.  One of:
+
+            * ``"upper"``  — stocks hitting the upper circuit
+            * ``"lower"``  — stocks hitting the lower circuit
+            * ``"both"``   — stocks that hit both circuits on the same day
+            * ``"all"``    — concatenate upper + lower + both (default)
+
+            Case-insensitive.
+        sec_type : str, optional
+            Sub-section within each band.  One of:
+
+            * ``"AllSec"``   — all securities (default)
+            * ``"SecGtr20"`` — securities with price > 20
+            * ``"SecLwr20"`` — securities with price ≤ 20
+
+            Case-sensitive (matches NSE key names exactly).
+        series : str, optional
+            Filter by trading series (e.g. ``"EQ"``, ``"BE"``, ``"BZ"``,
+            ``"SM"``, ``"ST"``).  Case-insensitive.  ``None`` = all series.
+        turnover_gte : float, optional
+            Keep only rows where ``Turnover (₹ Cr.) ≥ turnover_gte``.
+        turnover_lte : float, optional
+            Keep only rows where ``Turnover (₹ Cr.) ≤ turnover_lte``.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Columns:
+
+            * ``Symbol``           — ticker symbol
+            * ``Series``           — trading series
+            * ``LTP (₹)``          — last traded price
+            * ``Change (₹)``       — absolute change
+            * ``% Change``         — percentage change
+            * ``Price Band (%)``   — applicable price band limit
+            * ``High Price``       — session high
+            * ``Low Price``        — session low
+            * ``52W High``         — 52-week high
+            * ``52W Low``          — 52-week low
+            * ``Volume (Lakhs)``   — total traded volume (Lakhs)
+            * ``Turnover (₹ Cr.)`` — total traded value (₹ Crores)
+            * ``Band``             — which band the row belongs to
+                                     (``"Upper"`` / ``"Lower"`` / ``"Both"``)
+
+            Returns ``None`` if the API call fails or no rows survive the
+            applied filters.
+
+        Examples
+        --------
+        >>> nse = NseKit.Nse()
+
+        All band-hitters (upper + lower + both):
+        >>> nse.cm_live_price_band_hitters()
+
+        Upper circuit only:
+        >>> nse.cm_live_price_band_hitters("upper")
+
+        Lower circuit, EQ series only:
+        >>> nse.cm_live_price_band_hitters("lower", series="EQ")
+
+        Upper circuit, securities with price > 20, turnover ≥ ₹5 Cr:
+        >>> nse.cm_live_price_band_hitters("upper", "SecGtr20", turnover_gte=5)
+
+        Both bands, all securities, turnover between ₹1–10 Cr:
+        >>> nse.cm_live_price_band_hitters("both", turnover_gte=1, turnover_lte=10)
+        """
+        # ── 1. Fetch ──────────────────────────────────────────────────────────
+        raw = self._get_json(
+            "https://www.nseindia.com/market-data/price-band-hitter",
+            "https://www.nseindia.com/api/live-analysis-price-band-hitter",
+        )
+        if not raw:
+            return None
+
+        # ── 2. Resolve which band(s) to include ───────────────────────────────
+        band_key = band.strip().lower()
+        band_map = {
+            "upper": [("upper", "Upper")],
+            "lower": [("lower", "Lower")],
+            "both":  [("both",  "Both")],
+            "all":   [("upper", "Upper"), ("lower", "Lower"), ("both", "Both")],
+        }
+        if band_key not in band_map:
+            raise ValueError(
+                f"band must be 'upper', 'lower', 'both', or 'all' — got {band!r}"
+            )
+
+        valid_sec = {"AllSec", "SecGtr20", "SecLwr20"}
+        if sec_type not in valid_sec:
+            raise ValueError(
+                f"sec_type must be one of {sorted(valid_sec)} — got {sec_type!r}"
+            )
+
+        # ── 3. Build DataFrame from selected band(s) ──────────────────────────
+        frames: list[pd.DataFrame] = []
+        for api_key, label in band_map[band_key]:
+            section = raw.get(api_key, {}).get(sec_type, {})
+            records = section.get("data", [])
+            if records:
+                tmp = pd.DataFrame(records)
+                tmp["_band"] = label
+                frames.append(tmp)
+
+        if not frames:
+            return None
+
+        df = pd.concat(frames, ignore_index=True)
+
+        # ── 4. Column selection & rename ──────────────────────────────────────
+        # NSE already supplies Volume in Lakhs and Turnover in ₹ Cr — no conversion.
+        col_map = {
+            "symbol":         "Symbol",
+            "series":         "Series",
+            "ltp":            "LTP (₹)",
+            "change":         "Change (₹)",
+            "pChange":        "% Change",
+            "priceBand":      "Price Band (%)",
+            "highPrice":      "High Price",
+            "lowPrice":       "Low Price",
+            "yearHigh":       "52W High",
+            "yearLow":        "52W Low",
+            "totalTradedVol": "Volume (Lakhs)",
+            "turnover":       "Turnover (₹ Cr.)",
+            "_band":          "Band",
+        }
+        keep = [c for c in col_map if c in df.columns]
+        df = df[keep].rename(columns={c: col_map[c] for c in keep})
+
+        # Round numeric columns for clean display
+        for col in ("LTP (₹)", "Change (₹)", "% Change", "High Price",
+                    "Low Price", "52W High", "52W Low",
+                    "Volume (Lakhs)", "Turnover (₹ Cr.)"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").round(2)
+
+        # ── 5. Filters ────────────────────────────────────────────────────────
+        if series is not None:
+            s = series.strip().upper()
+            if "Series" in df.columns:
+                df = df[df["Series"].str.upper() == s]
+
+        to_col = "Turnover (₹ Cr.)"
+        if turnover_gte is not None and to_col in df.columns:
+            df = df[df[to_col] >= turnover_gte]
+        if turnover_lte is not None and to_col in df.columns:
+            df = df[df[to_col] <= turnover_lte]
+
+        df = df.reset_index(drop=True)
+        return df if not df.empty else None
+
     def cm_live_equity_info(self, symbol: str) -> dict | None:
         """
         Return comprehensive live data for a symbol.

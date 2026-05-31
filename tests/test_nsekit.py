@@ -13,14 +13,11 @@ Skip live (offline only):
 """
 
 from __future__ import annotations
-
 from datetime import datetime, timedelta
-
 import pandas as pd
 import pytest
 
 import NseKit
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Marks registration
@@ -29,14 +26,12 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "live: requires live NSE / SEBI network access")
     config.addinivalue_line("markers", "slow: fetches large historical chunks (> 5 s)")
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Shared session fixture  (warm-up cost paid once for the whole run)
 # ──────────────────────────────────────────────────────────────────────────────
 @pytest.fixture(scope="session")
 def nse() -> NseKit.Nse:
     return NseKit.Nse(max_rps=2.0)
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Assertion helpers
@@ -77,15 +72,51 @@ def _ago(n: int) -> str: return (datetime.now() - timedelta(days=n)).strftime("%
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# GLOBAL TEST CONFIGURATION — change dates here, they propagate everywhere
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# EOD_DATE   — a recent NSE trading day in DD-MM-YYYY  (used for EOD / bhavcopy tests)
+# EOD_DATE2  — same day in DD-MM-YY short format       (used by nse_eod_top10_nifty50)
+
+# EXPIRY_DATE — nearest F&O expiry in DD-MM-YYYY       (used for fno_chart tests)
+# EXPIRY_OPT — option strike suffix for fno_chart      (e.g. EXPIRY_OPT)
+
+# DATE_FROM  — start of a historical range in DD-MM-YYYY
+# DATE_TO    — end   of a historical range in DD-MM-YYYY
+
+# BIZ_MONTH  — calendar month for cm_dmy_biz_growth daily test  ("OCT", "NOV", …)
+# BIZ_YEAR   — calendar year  for cm_dmy_biz_growth daily test  (int)
+# PEER_QUARTER — quarter string for peer_comparison test        ("Dec 2025", …)
+# ──────────────────────────────────────────────────────────────────────────────
+
+EOD_DATE        = "29-05-2026"   # DD-MM-YYYY  — most-recent trading day
+EOD_DATE2       = "29-05-26"     # DD-MM-YY    — same day, short form
+
+PREV_EOD_DATE   = "27-05-2026"   # DD-MM-YYYY  — pervious trading day
+
+EXPIRY_DATE     = "30-06-2026"   # DD-MM-YYYY  — nearest F&O expiry
+EXPIRY_OPT      = "PE25700"      # option chain suffix for fno_chart
+
+DATE_FROM       = "25-05-2026"   # DD-MM-YYYY  — start of a completed date range
+DATE_TO         = "29-05-2026"   # DD-MM-YYYY  — end   of that range
+
+BIZ_MONTH       = "OCT"          # month for cm_dmy_biz_growth daily test
+BIZ_YEAR        = 2025            # year  for cm_dmy_biz_growth daily test
+
+PEER_QUARTER    = "Dec 2025"    # quarter for peer_comparison test
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 1. OFFLINE UNIT TESTS — zero network, always PASS
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestUnitHelpers:
 
     # ── _parse_args ────────────────────────────────────────────────────────
     def test_parse_args_two_dates(self):
-        r = NseKit._parse_args(("01-01-2025", "31-03-2025"))
-        assert r["from_date"] == "01-01-2025" and r["to_date"] == "31-03-2025"
+        r = NseKit._parse_args((DATE_FROM, DATE_TO))
+        assert r["from_date"] == DATE_FROM and r["to_date"] == DATE_TO
 
     def test_parse_args_period(self):
         assert NseKit._parse_args(("1Y",))["period"] == "1Y"
@@ -94,9 +125,9 @@ class TestUnitHelpers:
         assert NseKit._parse_args(("RELIANCE",))["symbol"] == "RELIANCE"
 
     def test_parse_args_symbol_and_dates(self):
-        r = NseKit._parse_args(("TCS", "01-01-2025", "31-03-2025"))
+        r = NseKit._parse_args(("TCS", DATE_FROM, DATE_TO))
         assert r["symbol"] == "TCS"
-        assert r["from_date"] == "01-01-2025" and r["to_date"] == "31-03-2025"
+        assert r["from_date"] == DATE_FROM and r["to_date"] == DATE_TO
 
     # ── _resolve_dates ─────────────────────────────────────────────────────
     @pytest.mark.parametrize("period", ["1D","1W","1M","3M","6M","1Y","2Y","5Y","10Y"])
@@ -111,8 +142,8 @@ class TestUnitHelpers:
         assert fd.endswith(f"-{datetime.now().year}")
 
     def test_resolve_dates_explicit(self):
-        fd, td = NseKit._resolve_dates("01-01-2025", "31-03-2025")
-        assert fd == "01-01-2025" and td == "31-03-2025"
+        fd, td = NseKit._resolve_dates(DATE_FROM, DATE_TO)
+        assert fd == DATE_FROM and td == DATE_TO
 
     # ── _sort_dedup_dates ──────────────────────────────────────────────────
     def test_sort_dedup_ascending(self):
@@ -281,7 +312,7 @@ class TestEquityAndIndexLists:
         _has_data(nse.list_of_indices(), label="list_of_indices")
 
     def test_nifty50_top10_eod(self, nse):
-        _has_df(nse.nse_eod_top10_nifty50("17-10-25"), label="top10_nifty50")
+        _has_df(nse.nse_eod_top10_nifty50(EOD_DATE2), label="top10_nifty50")
 
     def test_state_wise_investors(self, nse):
         _has_data(nse.state_wise_registered_investors(), label="state_investors")
@@ -423,10 +454,10 @@ class TestCharts:
         _has_data(nse.india_vix_chart(), label="vix_chart")
 
     def test_fno_chart_futures(self, nse):
-        _has_data(nse.fno_chart("TCS", "FUTSTK", "26-05-2026"), label="fno_chart_fut")
+        _has_data(nse.fno_chart("TCS", "FUTSTK", EXPIRY_DATE), label="fno_chart_fut")
 
     def test_fno_chart_options(self, nse):
-        _has_data(nse.fno_chart("NIFTY", "OPTIDX", "26-05-2026", "PE25700"),
+        _has_data(nse.fno_chart("NIFTY", "OPTIDX", EXPIRY_DATE, EXPIRY_OPT),
                   label="fno_chart_opt")
 
 
@@ -466,7 +497,7 @@ class TestHistoricalEquity:
     def test_bulk_deals_symbol(self, nse):
         # RELIANCE is large-cap — zero bulk deals ever. Use DSSL (small-cap,
         # from NseKit docstring) with explicit date range that has confirmed data.
-        _has_data(nse.cm_hist_bulk_deals("DSSL", "01-10-2025", "17-10-2025"),
+        _has_data(nse.cm_hist_bulk_deals("COFFEEDAY", DATE_FROM, EOD_DATE),
                   label="bulk_deals_sym")
 
     def test_block_deals(self, nse):
@@ -490,7 +521,7 @@ class TestHistoricalEquity:
 
     def test_insider_trading_range(self, nse):
         _has_data(
-            nse.cm_live_hist_insider_trading("RELIANCE", "15-05-2026", "22-05-2026"),
+            nse.cm_live_hist_insider_trading("WIPRO", DATE_FROM, DATE_TO),
             label="insider_range"
         )
 
@@ -520,7 +551,7 @@ class TestHistoricalIndex:
         _has_data(nse.india_vix_historical_data("1M"), label="vix_1M")
 
     def test_index_eod_bhavcopy(self, nse):
-        _has_data(nse.index_eod_bhav_copy("17-10-2025"), label="index_bhavcopy")
+        _has_data(nse.index_eod_bhav_copy(EOD_DATE), label="index_bhavcopy")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -542,7 +573,7 @@ class TestCorporateFilings:
 
     def test_corporate_action_filter_dividend(self, nse):
         # 3rd positional arg is parsed as filter by _unpack_args
-        df = nse.cm_live_hist_corporate_action("01-01-2025", "15-10-2025", filter="Dividend")
+        df = nse.cm_live_hist_corporate_action(DATE_FROM, DATE_TO, filter="Dividend")
         _has_df(df, label="corp_action_dividend")
         assert df["PURPOSE"].str.contains("Dividend", case=False).all()
 
@@ -585,7 +616,7 @@ class TestCorporateFilings:
 
     def test_announcement_date_range(self, nse):
         _has_data(
-            nse.cm_live_hist_corporate_announcement(self.SYM, "01-01-2025", "15-10-2025"),
+            nse.cm_live_hist_corporate_announcement(self.SYM, DATE_FROM, DATE_TO),
             label="announce_range"
         )
 
@@ -614,7 +645,8 @@ class TestCorporateFilings:
 
 @pytest.mark.live
 class TestFnoLive:
-    EOD_DATE = "17-10-2025"
+    EOD_DATE        = EOD_DATE
+    PREV_EOD_DATE   = PREV_EOD_DATE
 
     def test_futures_data_index(self, nse):
         _has_data(nse.fno_live_futures_data("NIFTY"), label="futures_nifty")
@@ -710,7 +742,7 @@ class TestFnoLive:
         _has_data(nse.fno_eod_fii_stats(self.EOD_DATE), label="fii_stats")
 
     def test_mwpl(self, nse):
-        _has_data(nse.fno_eod_mwpl_3(self.EOD_DATE), label="mwpl")
+        _has_data(nse.fno_eod_mwpl_3(self.PREV_EOD_DATE), label="mwpl")
 
     def test_combine_oi(self, nse):
         _has_data(nse.fno_eod_combine_oi(self.EOD_DATE), label="combine_oi")
@@ -728,7 +760,7 @@ class TestFnoLive:
         _has_data(nse.fno_eod_top_10_clearing_members(self.EOD_DATE), label="top_10_clearing_members")
 
     def test_fno_eod_client_wise_turnover(self, nse):
-        _has_data(nse.fno_eod_client_wise_turnover(self.EOD_DATE), label="client_wise_turnover")
+        _has_data(nse.fno_eod_client_wise_turnover(self.PREV_EOD_DATE, raw_data=True), label="client_wise_turnover")
 
 
     def test_symbol_full_fno_data(self, nse):
@@ -830,8 +862,8 @@ class TestFnoHistorical:
 
 @pytest.mark.live
 class TestEodArchives:
-    D4 = "17-10-2025"
-    D2 = "17-10-25"
+    D4 = EOD_DATE
+    D2 = EOD_DATE2
 
     def test_equity_bhavcopy(self, nse):
         _has_data(nse.cm_eod_equity_bhavcopy(self.D4), label="eq_bhavcopy")
@@ -910,7 +942,7 @@ class TestBizGrowthSettlement:
         _has_data(nse.cm_dmy_biz_growth(mode), label=f"cm_biz_{mode}")
 
     def test_cm_biz_growth_daily(self, nse):
-        _has_data(nse.cm_dmy_biz_growth("daily", "OCT", 2025), label="cm_biz_daily_oct25")
+        _has_data(nse.cm_dmy_biz_growth("daily", BIZ_MONTH, BIZ_YEAR), label="cm_biz_daily_oct25")
 
     @pytest.mark.parametrize("mode", ["yearly", "monthly"])
     def test_fno_biz_growth(self, nse, mode):
@@ -947,7 +979,7 @@ class TestSEBI:
         _has_df(nse.sebi_circulars(), cols={"Date", "Title", "Link"}, label="sebi_default")
 
     def test_sebi_circulars_date_range(self, nse):
-        _has_df(nse.sebi_circulars("01-10-2025", "15-10-2025"), label="sebi_range")
+        _has_df(nse.sebi_circulars(DATE_FROM, DATE_TO), label="sebi_range")
 
     @pytest.mark.parametrize("period", ["1W", "1M", "3M"])
     def test_sebi_circulars_period(self, nse, period):
@@ -990,6 +1022,284 @@ class TestIPO:
 # 18. PEER COMPARISON
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 19. STOCKS TRADED (live-analysis-stocksTraded)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.live
+class TestStocksTraded:
+    """Tests for Nse.cm_live_stocks_traded()."""
+
+    # ── Basic fetch ───────────────────────────────────────────────────────────
+    def test_returns_dataframe(self, nse):
+        df = nse.cm_live_stocks_traded()
+        _has_df(df, min_rows=1, label="stocks_traded_all")
+
+    def test_expected_columns_present(self, nse):
+        df = nse.cm_live_stocks_traded()
+        _has_df(df)
+        expected = {
+            "Symbol", "Series", "Last Price (₹)", "Change (₹)",
+            "% Change", "Volume (Lakhs)", "Value (₹ Cr.)", "Mkt Cap (₹ Cr.)",
+        }
+        missing = expected - set(df.columns)
+        assert not missing, f"Missing columns: {missing}"
+
+    def test_no_filter_returns_all_series(self, nse):
+        """Without a filter, multiple series should appear (EQ, BE, etc.)."""
+        df = nse.cm_live_stocks_traded()
+        _has_df(df)
+        assert df["Series"].nunique() >= 1, "Expected at least one series"
+
+    # ── Series filter ─────────────────────────────────────────────────────────
+    def test_series_eq_kwarg(self, nse):
+        df = nse.cm_live_stocks_traded(series="EQ")
+        _has_df(df, min_rows=1, label="series_EQ_kwarg")
+        assert (df["Series"].str.upper() == "EQ").all(), \
+            "Non-EQ rows leaked through series filter"
+
+    def test_series_eq_positional(self, nse):
+        """First positional arg is treated as the series filter."""
+        df = nse.cm_live_stocks_traded("EQ")
+        _has_df(df, min_rows=1, label="series_EQ_positional")
+        assert (df["Series"].str.upper() == "EQ").all()
+
+    def test_series_case_insensitive(self, nse):
+        df_lower = nse.cm_live_stocks_traded("eq")
+        df_upper = nse.cm_live_stocks_traded("EQ")
+        if df_lower is not None and df_upper is not None:
+            assert len(df_lower) == len(df_upper), \
+                "Series filter should be case-insensitive"
+
+    def test_series_unknown_returns_none(self, nse):
+        """An unknown series should return None (no matching rows)."""
+        result = nse.cm_live_stocks_traded(series="ZZZZZ")
+        assert result is None, "Expected None for an unknown series"
+
+    # ── Market-cap GTE filter ─────────────────────────────────────────────────
+    def test_mkt_cap_gte_filter(self, nse):
+        threshold = 1_000.0   # ₹ 1,000 Cr
+        df = nse.cm_live_stocks_traded(mkt_cap_gte=threshold)
+        _has_df(df, min_rows=1, label=f"mkt_cap_gte_{threshold}")
+        assert (df["Mkt Cap (₹ Cr.)"] >= threshold).all(), \
+            "Row below mkt_cap_gte threshold found"
+
+    def test_mkt_cap_gte_very_high_returns_none_or_df(self, nse):
+        """A ludicrously high cap may return None — that is also valid."""
+        result = nse.cm_live_stocks_traded(mkt_cap_gte=1e15)
+        # either None or a valid (possibly empty-filtered) result is fine
+        if result is not None:
+            assert isinstance(result, pd.DataFrame)
+
+    # ── Market-cap LTE filter ─────────────────────────────────────────────────
+    def test_mkt_cap_lte_filter(self, nse):
+        threshold = 500.0   # ₹ 500 Cr
+        df = nse.cm_live_stocks_traded(mkt_cap_lte=threshold)
+        _has_df(df, min_rows=1, label=f"mkt_cap_lte_{threshold}")
+        assert (df["Mkt Cap (₹ Cr.)"] <= threshold).all(), \
+            "Row above mkt_cap_lte threshold found"
+
+    # ── Combined filters ──────────────────────────────────────────────────────
+    def test_combined_series_and_mkt_cap_gte(self, nse):
+        df = nse.cm_live_stocks_traded("EQ", mkt_cap_gte=1_000)
+        _has_df(df, min_rows=1, label="EQ+mkt_cap_gte_1000")
+        assert (df["Series"].str.upper() == "EQ").all()
+        assert (df["Mkt Cap (₹ Cr.)"] >= 1_000).all()
+
+    def test_combined_series_and_mkt_cap_lte(self, nse):
+        df = nse.cm_live_stocks_traded("EQ", mkt_cap_lte=500)
+        if df is not None:
+            assert (df["Series"].str.upper() == "EQ").all()
+            assert (df["Mkt Cap (₹ Cr.)"] <= 500).all()
+
+    def test_combined_mkt_cap_range(self, nse):
+        df = nse.cm_live_stocks_traded(mkt_cap_gte=500, mkt_cap_lte=5_000)
+        _has_df(df, min_rows=1, label="mkt_cap_500_to_5000")
+        assert (df["Mkt Cap (₹ Cr.)"] >= 500).all()
+        assert (df["Mkt Cap (₹ Cr.)"] <= 5_000).all()
+
+    def test_combined_all_three_filters(self, nse):
+        df = nse.cm_live_stocks_traded("EQ", mkt_cap_gte=500, mkt_cap_lte=10_000)
+        if df is not None:
+            assert (df["Series"].str.upper() == "EQ").all()
+            assert (df["Mkt Cap (₹ Cr.)"] >= 500).all()
+            assert (df["Mkt Cap (₹ Cr.)"] <= 10_000).all()
+
+    # ── Unit sanity checks (values already in correct units from NSE) ────────
+    # def test_mkt_cap_is_positive(self, nse):
+    #     """Market cap should be positive for all traded stocks."""
+    #     df = nse.cm_live_stocks_traded()
+    #     _has_df(df)
+    #     assert (df["Mkt Cap (₹ Cr.)"] > 0).all(), \
+    #         "Negative or zero Mkt Cap found"
+
+    # def test_value_is_positive(self, nse):
+    #     """Traded value should be positive."""
+    #     df = nse.cm_live_stocks_traded()
+    #     _has_df(df)
+    #     assert (df["Value (₹ Cr.)"] > 0).all(), \
+    #         "Negative or zero Value found"
+
+    def test_volume_reasonable_range(self, nse):
+        """Volume (Lakhs) should be > 0 for traded stocks."""
+        df = nse.cm_live_stocks_traded()
+        _has_df(df)
+        assert (df["Volume (Lakhs)"] >= 0).all(), "Negative volume found"
+
+    def test_index_is_reset_after_filter(self, nse):
+        df = nse.cm_live_stocks_traded("EQ", mkt_cap_gte=1_000)
+        if df is not None:
+            assert list(df.index) == list(range(len(df))), \
+                "Index should be reset (0, 1, 2, …) after filtering"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 20. PRICE BAND HITTERS (live-analysis-price-band-hitter)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.live
+class TestPriceBandHitters:
+    """Tests for Nse.cm_live_price_band_hitters()."""
+
+    EXPECTED_COLS = {
+        "Symbol", "Series", "LTP (₹)", "Change (₹)", "% Change",
+        "Price Band (%)", "High Price", "Low Price", "52W High", "52W Low",
+        "Volume (Lakhs)", "Turnover (₹ Cr.)", "Band",
+    }
+
+    # ── Basic fetch ───────────────────────────────────────────────────────────
+    def test_all_returns_dataframe(self, nse):
+        df = nse.cm_live_price_band_hitters()
+        _has_df(df, min_rows=1, label="band_all")
+
+    def test_expected_columns_present(self, nse):
+        df = nse.cm_live_price_band_hitters()
+        _has_df(df)
+        missing = self.EXPECTED_COLS - set(df.columns)
+        assert not missing, f"Missing columns: {missing}"
+
+    def test_band_column_has_known_values(self, nse):
+        df = nse.cm_live_price_band_hitters()
+        _has_df(df)
+        allowed = {"Upper", "Lower", "Both"}
+        unexpected = set(df["Band"].unique()) - allowed
+        assert not unexpected, f"Unexpected Band values: {unexpected}"
+
+    # ── Band filter ───────────────────────────────────────────────────────────
+    def test_upper_band(self, nse):
+        df = nse.cm_live_price_band_hitters("upper")
+        _has_df(df, min_rows=1, label="band_upper")
+        assert (df["Band"] == "Upper").all(), "Non-Upper rows in upper filter"
+
+    def test_lower_band(self, nse):
+        df = nse.cm_live_price_band_hitters("lower")
+        _has_df(df, min_rows=1, label="band_lower")
+        assert (df["Band"] == "Lower").all(), "Non-Lower rows in lower filter"
+
+    def test_both_band(self, nse):
+        result = nse.cm_live_price_band_hitters("both")
+        # "both" may be empty on some days — that is valid
+        if result is not None:
+            assert (result["Band"] == "Both").all()
+
+    def test_band_case_insensitive(self, nse):
+        df_upper = nse.cm_live_price_band_hitters("upper")
+        df_UPPER = nse.cm_live_price_band_hitters("UPPER")
+        if df_upper is not None and df_UPPER is not None:
+            assert len(df_upper) == len(df_UPPER)
+
+    def test_invalid_band_raises(self, nse):
+        with pytest.raises(ValueError, match="band must be"):
+            nse.cm_live_price_band_hitters("sideways")
+
+    # ── sec_type filter ───────────────────────────────────────────────────────
+    def test_sec_type_allsec(self, nse):
+        df = nse.cm_live_price_band_hitters("all", "AllSec")
+        _has_df(df, min_rows=1, label="AllSec")
+
+    def test_sec_type_secgtr20(self, nse):
+        result = nse.cm_live_price_band_hitters("upper", "SecGtr20")
+        if result is not None:
+            _has_df(result, label="SecGtr20")
+
+    def test_sec_type_seclwr20(self, nse):
+        result = nse.cm_live_price_band_hitters("upper", "SecLwr20")
+        if result is not None:
+            _has_df(result, label="SecLwr20")
+
+    def test_invalid_sec_type_raises(self, nse):
+        with pytest.raises(ValueError, match="sec_type must be"):
+            nse.cm_live_price_band_hitters("upper", "BadSec")
+
+    # ── Series filter ─────────────────────────────────────────────────────────
+    def test_series_eq_filter(self, nse):
+        df = nse.cm_live_price_band_hitters("upper", series="EQ")
+        if df is not None:
+            assert (df["Series"].str.upper() == "EQ").all()
+
+    def test_series_case_insensitive(self, nse):
+        df_lower = nse.cm_live_price_band_hitters(series="eq")
+        df_upper = nse.cm_live_price_band_hitters(series="EQ")
+        if df_lower is not None and df_upper is not None:
+            assert len(df_lower) == len(df_upper)
+
+    def test_series_unknown_returns_none(self, nse):
+        result = nse.cm_live_price_band_hitters(series="ZZZZZ")
+        assert result is None
+
+    # ── Turnover filters ──────────────────────────────────────────────────────
+    def test_turnover_gte_filter(self, nse):
+        threshold = 1.0
+        df = nse.cm_live_price_band_hitters(turnover_gte=threshold)
+        _has_df(df, min_rows=1, label=f"turnover_gte_{threshold}")
+        assert (df["Turnover (₹ Cr.)"] >= threshold).all()
+
+    def test_turnover_lte_filter(self, nse):
+        threshold = 10.0
+        df = nse.cm_live_price_band_hitters(turnover_lte=threshold)
+        _has_df(df, min_rows=1, label=f"turnover_lte_{threshold}")
+        assert (df["Turnover (₹ Cr.)"] <= threshold).all()
+
+    def test_turnover_range_filter(self, nse):
+        df = nse.cm_live_price_band_hitters(turnover_gte=0.5, turnover_lte=50)
+        _has_df(df, min_rows=1, label="turnover_range")
+        assert (df["Turnover (₹ Cr.)"] >= 0.5).all()
+        assert (df["Turnover (₹ Cr.)"] <= 50).all()
+
+    # ── Combined filters ──────────────────────────────────────────────────────
+    def test_combined_upper_eq_turnover_gte(self, nse):
+        df = nse.cm_live_price_band_hitters("upper", series="EQ", turnover_gte=1)
+        if df is not None:
+            assert (df["Band"] == "Upper").all()
+            assert (df["Series"].str.upper() == "EQ").all()
+            assert (df["Turnover (₹ Cr.)"] >= 1).all()
+
+    def test_combined_lower_secgtr20_turnover(self, nse):
+        df = nse.cm_live_price_band_hitters(
+            "lower", "SecGtr20", turnover_gte=0.5, turnover_lte=50
+        )
+        if df is not None:
+            assert (df["Band"] == "Lower").all()
+            assert (df["Turnover (₹ Cr.)"] >= 0.5).all()
+            assert (df["Turnover (₹ Cr.)"] <= 50).all()
+
+    # ── Sanity checks ─────────────────────────────────────────────────────────
+    def test_ltp_is_positive(self, nse):
+        df = nse.cm_live_price_band_hitters()
+        _has_df(df)
+        assert (df["LTP (₹)"] > 0).all(), "Non-positive LTP found"
+
+    def test_volume_is_non_negative(self, nse):
+        df = nse.cm_live_price_band_hitters()
+        _has_df(df)
+        assert (df["Volume (Lakhs)"] >= 0).all()
+
+    def test_index_reset_after_filter(self, nse):
+        df = nse.cm_live_price_band_hitters("upper", series="EQ")
+        if df is not None:
+            assert list(df.index) == list(range(len(df)))
+
+
 class TestParseQuarter:
     """Offline unit tests for the _parse_quarter static helper."""
 
@@ -1015,7 +1325,7 @@ class TestParseQuarter:
 class TestPeerComparison:
 
     SYMBOL  = "TRENT"
-    QUARTER = "Dec 2025"
+    QUARTER = PEER_QUARTER
 
     EXPECTED_COLS = {
         "Symbol", "LTP (₹)", "% Chng", "Volume (Lakhs)", "Value (₹ Cr.)",

@@ -211,8 +211,8 @@ rich = Console()
 
 # print(get.index_chart("NIFTY 50","1D"))                                                    # "1D" "1M" "3M" "6M" "1Y"
 # print(get.stock_chart("RELIANCE", "1D"))                                                  
-# print(get.fno_chart("TCS", "FUTSTK","30-03-2026"))
-# print(get.fno_chart("NIFTY", "OPTIDX","30-03-2026","PE25700"))
+# print(get.fno_chart("TCS", "FUTSTK","30-06-2026"))
+# print(get.fno_chart("NIFTY", "OPTIDX","30-06-2026","PE25700"))
 
 # print(get.india_vix_chart())
 
@@ -222,6 +222,30 @@ rich = Console()
 # # 🔹 Equity Information
 # print(get.cm_live_equity_info("RELIANCE"))                                                # Equity details for a symbol
 
+
+# # 🔹 Stocks Traded (live-analysis-stocksTraded)
+# print(get.cm_live_stocks_traded())                                                        # All stocks — no filter
+# print(get.cm_live_stocks_traded("EQ"))                                                    # EQ series only (positional)
+# print(get.cm_live_stocks_traded(series="EQ"))                                             # EQ series only (keyword)
+# print(get.cm_live_stocks_traded(mkt_cap_gte=1000))                                        # Mkt Cap ≥ ₹1,000 Cr
+# print(get.cm_live_stocks_traded(mkt_cap_lte=500))                                         # Mkt Cap ≤ ₹500 Cr
+# print(get.cm_live_stocks_traded("EQ", mkt_cap_gte=1000))                                  # EQ + Mkt Cap ≥ ₹1,000 Cr
+# print(get.cm_live_stocks_traded("EQ", mkt_cap_lte=500))                                   # EQ + Mkt Cap ≤ ₹500 Cr
+# print(get.cm_live_stocks_traded("EQ", mkt_cap_gte=500, mkt_cap_lte=5000))                 # EQ + Mkt Cap between ₹500–5,000 Cr
+
+# # 🔹 Price Band Hitters (live-analysis-price-band-hitter)
+# print(get.cm_live_price_band_hitters())                                                   # All (upper + lower + both), AllSec
+# print(get.cm_live_price_band_hitters("upper"))                                            # Upper circuit only
+# print(get.cm_live_price_band_hitters("lower"))                                            # Lower circuit only
+# print(get.cm_live_price_band_hitters("both"))                                             # Both circuits same day
+# print(get.cm_live_price_band_hitters("upper", "SecGtr20"))                                # Upper, price > 20
+# print(get.cm_live_price_band_hitters("lower", "SecLwr20"))                                # Lower, price ≤ 20
+# print(get.cm_live_price_band_hitters("upper", series="EQ"))                               # Upper + EQ series
+# print(get.cm_live_price_band_hitters("lower", series="BE"))                               # Lower + BE series
+# print(get.cm_live_price_band_hitters(turnover_gte=5))                                     # Turnover ≥ ₹5 Cr
+# print(get.cm_live_price_band_hitters(turnover_lte=10))                                    # Turnover ≤ ₹10 Cr
+# print(get.cm_live_price_band_hitters("upper", series="EQ", turnover_gte=1))               # Combined — upper + EQ + turnover ≥ ₹1 Cr
+# print(get.cm_live_price_band_hitters("lower", "SecGtr20", turnover_gte=0.5, turnover_lte=50)) # Full combo
 
 # # 🔹 Most Active Equities by Value
 # print(get.cm_live_most_active_equity_by_value())                                          # Most active equities by traded value
@@ -470,7 +494,7 @@ rich = Console()
 # print(get.cm_eod_eq_band_changes("17-10-2025"))                                           # Band changes for date
 
 # # 🔹 Equity Price Band(EOD)
-# print(get.cm_eod_eq_price_band("17-10-2025"))                                             # Price bands for date
+# print(get.cm_eod_eq_price_band("29-05-2026"))                                             # Price bands for date
 
 # # 🔹 Equity Price Band(Historical)
 # print(get.cm_hist_eq_price_band())                                                        # today date data for all symbol
