@@ -212,7 +212,7 @@ rich = Console()
 # print(get.index_chart("NIFTY 50","1D"))                                                    # "1D" "1M" "3M" "6M" "1Y"
 # print(get.stock_chart("RELIANCE", "1D"))                                                  
 # print(get.fno_chart("TCS", "FUTSTK","30-06-2026"))
-# print(get.fno_chart("NIFTY", "OPTIDX","30-06-2026","PE25700"))
+# print(get.fno_chart("NIFTY", "OPTIDX","30-03-2026","PE25700"))
 
 # print(get.india_vix_chart())
 
@@ -223,7 +223,7 @@ rich = Console()
 # print(get.cm_live_equity_info("RELIANCE"))                                                # Equity details for a symbol
 
 
-# # 🔹 Stocks Traded (live-analysis-stocksTraded)
+# # 🔹 Stocks Traded
 # print(get.cm_live_stocks_traded())                                                        # All stocks — no filter
 # print(get.cm_live_stocks_traded("EQ"))                                                    # EQ series only (positional)
 # print(get.cm_live_stocks_traded(series="EQ"))                                             # EQ series only (keyword)
@@ -233,7 +233,7 @@ rich = Console()
 # print(get.cm_live_stocks_traded("EQ", mkt_cap_lte=500))                                   # EQ + Mkt Cap ≤ ₹500 Cr
 # print(get.cm_live_stocks_traded("EQ", mkt_cap_gte=500, mkt_cap_lte=5000))                 # EQ + Mkt Cap between ₹500–5,000 Cr
 
-# # 🔹 Price Band Hitters (live-analysis-price-band-hitter)
+# # 🔹 Price Band Hitters
 # print(get.cm_live_price_band_hitters())                                                   # All (upper + lower + both), AllSec
 # print(get.cm_live_price_band_hitters("upper"))                                            # Upper circuit only
 # print(get.cm_live_price_band_hitters("lower"))                                            # Lower circuit only
@@ -444,17 +444,30 @@ rich = Console()
 # # 🔹 Option Chain
 # print(get.fno_live_option_chain("RELIANCE"))                                              # Option chain for a stock symbol
 # print(get.fno_live_option_chain("NIFTY"))                                                 # Option chain for an index
-# print(get.fno_live_option_chain("RELIANCE", expiry_date="27-Jan-2026"))                   # Option chain with specific expiry
-# print(get.fno_live_option_chain("RELIANCE", oi_mode="compact"))                           # Compact option chain data
+# print(get.fno_live_option_chain("RELIANCE", expiry_date="30-Jun-2026"))                   # Option chain with specific expiry
+# print(get.fno_live_option_chain("RELIANCE", "28-Jul-2026"))                               # Option chain with specific expiry
+# print(get.fno_live_option_chain("RELIANCE", strike_price="1320"))                         # Option chain for a specific strike price (all expiries)
+# print(get.fno_live_option_chain("NIFTY", "23500"))                                        # Option chain for a specific strike price (all expiries)
 
-# print(get.fno_live_option_chain_raw("M&M", expiry_date="27-Jan-2026"))                    # Raw Option chain with specific expiry     {JSON}
+# print(get.fno_live_option_chain("RELIANCE", oi_mode="compact"))                           # Compact option chain data
+# print(get.fno_live_option_chain("RELIANCE", "compact"))                                   # Compact option chain data
+
+# print(get.fno_live_option_chain("TCS", expiry_date="30-Jun-2026", oi_mode="compact"))     # Compact Option chain with specific expiry
+# print(get.fno_live_option_chain("ITC", "30-Jun-2026", "compact"))                         # Compact Option chain with specific expiry
+# print(get.fno_live_option_chain("ITC", strike_price="23500", oi_mode="compact"))          # Compact Option chain with specific strike price
+# print(get.fno_live_option_chain("NIFTY", "23500", "compact"))                             # Compact Option chain with specific strike price
+
+# print(get.fno_live_option_chain_raw("M&M", expiry_date="30-Jun-2026"))                    # Raw Option chain with specific expiry           {JSON}
+# print(get.fno_live_option_chain_raw("M&M", "30-Jun-2026"))                                # Raw Option chain with specific expiry           {JSON}
+# print(get.fno_live_option_chain_raw("M&M", strike_price="23500"))                         # Raw Option chain with specific strike price     {JSON}
+# print(get.fno_live_option_chain_raw("M&M", "23500"))                                      # Raw Option chain with specific strike price     {JSON}
 
 # # 🔹 Active Contracts
 # print(get.fno_live_active_contracts("NIFTY"))                                             # Active index option contracts
-# print(get.fno_live_active_contracts("NIFTY", expiry_date="27-Jan-2026"))                   # Active index contracts with expiry
+# print(get.fno_live_active_contracts("NIFTY", expiry_date="30-Jun-2026"))                  # Active index contracts with expiry
 
 # print(get.fno_live_active_contracts("RELIANCE"))                                          # Active stock option contracts
-# print(get.fno_live_active_contracts("RELIANCE", expiry_date="27-Jan-2026"))                # Active stock contracts with expiry
+# print(get.fno_live_active_contracts("RELIANCE", expiry_date="30-Jun-2026"))               # Active stock contracts with expiry
 
 
 # #---------------------------------------------------------- CM EOD Data ----------------------------------------------------------

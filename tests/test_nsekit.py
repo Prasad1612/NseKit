@@ -674,6 +674,47 @@ class TestFnoLive:
     def test_option_chain_stock(self, nse):
         _has_data(nse.fno_live_option_chain("RELIANCE"), label="option_chain_reliance")
 
+    def test_option_chain_compact(self, nse):
+        df = nse.fno_live_option_chain("NIFTY", oi_mode="compact")
+        _has_data(df, label="option_chain_compact")
+        # bid/ask columns must NOT be present in compact mode
+        assert "CALLS_Bid_Qty" not in df.columns, "compact should not have bid/ask cols"
+
+    def test_option_chain_compact_positional(self, nse):
+        # passing "compact" as bare positional arg should work identically
+        df = nse.fno_live_option_chain("NIFTY", "compact")
+        _has_data(df, label="option_chain_compact_pos")
+        assert "CALLS_Bid_Qty" not in df.columns
+
+    def test_option_chain_strike_price_kwarg(self, nse):
+        # fetch all expiries for a specific strike using keyword arg
+        df = nse.fno_live_option_chain("NIFTY", strike_price="23500")
+        _has_data(df, label="option_chain_strike_kwarg")
+        # every row must carry the requested strike
+        assert (df["Strike_Price"] == 23500.0).all(), \
+            "Expected all rows to have Strike_Price == 23500"
+        # multiple expiry rows expected
+        assert df["Expiry_Date"].nunique() >= 1
+
+    def test_option_chain_strike_price_positional(self, nse):
+        # bare numeric string in positional slot should resolve to strike_price
+        df = nse.fno_live_option_chain("NIFTY", "23500")
+        _has_data(df, label="option_chain_strike_pos")
+        assert (df["Strike_Price"] == 23500.0).all()
+
+    def test_option_chain_strike_price_compact(self, nse):
+        # strike_price + compact mode via kwargs
+        df = nse.fno_live_option_chain("NIFTY", strike_price="23500", oi_mode="compact")
+        _has_data(df, label="option_chain_strike_compact_kw")
+        assert "CALLS_Bid_Qty" not in df.columns
+
+    def test_option_chain_strike_price_compact_positional(self, nse):
+        # "23500" then "compact" as positional args
+        df = nse.fno_live_option_chain("NIFTY", "23500", "compact")
+        _has_data(df, label="option_chain_strike_compact_pos")
+        assert "CALLS_Bid_Qty" not in df.columns
+        assert (df["Strike_Price"] == 23500.0).all()
+
     def test_option_chain_raw(self, nse):
         # fno_live_option_chain_raw needs "DD-Mon-YYYY" (e.g. "26-May-2026")
         # fno_expiry_dates("NIFTY","Current") returns "DD-MM-YYYY"; convert format
@@ -683,6 +724,16 @@ class TestFnoLive:
         expiry_fmt = datetime.strptime(expiry_ddmmyyyy, "%d-%m-%Y").strftime("%d-%b-%Y")
         _has_dict(nse.fno_live_option_chain_raw("NIFTY", expiry_date=expiry_fmt),
                   label="option_chain_raw")
+
+    def test_option_chain_raw_strike_kwarg(self, nse):
+        # raw endpoint with strike_price keyword
+        _has_dict(nse.fno_live_option_chain_raw("NIFTY", strike_price="23500"),
+                  label="option_chain_raw_strike_kw")
+
+    def test_option_chain_raw_strike_positional(self, nse):
+        # bare numeric string in positional slot should be treated as strike_price
+        _has_dict(nse.fno_live_option_chain_raw("NIFTY", "23500"),
+                  label="option_chain_raw_strike_pos")
 
     def test_active_contracts_index(self, nse):
         _has_data(nse.fno_live_active_contracts("NIFTY"), label="active_contracts_nifty")
