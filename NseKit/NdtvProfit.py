@@ -1,6 +1,5 @@
 import requests
 import pandas as pd
-import random
 import time
 from typing import Union, Optional
 
@@ -33,6 +32,7 @@ class NdtvProfit:
         "roll-spread": "Roll Spread",
         "rollover": "Rollover",
         "roll-over-percentage": "Rollover %",
+        "rollover-percentage": "Rollover %",
         "put-call-ratio": "PCR",
         "call-open-interest": "Call OI",
         "call-open-interest-change": "Call OI Chg",
@@ -45,7 +45,6 @@ class NdtvProfit:
         "total-open-interest": "Total OI",
         "total-open-interest-change-percentage": "Total OI Chg %",
         "1m-open-interest-change-percentage": "1M OI Chg %",
-        "rollover-percentage": "Rollover %",
         "pcr-open-interest-current": "PCR (OI)",
         "pcr-open-interest-previous": "PCR (OI Prev)",
         "pcr-open-interest-change": "PCR (OI Chg)",
@@ -67,6 +66,9 @@ class NdtvProfit:
         "premium-discount": "Prem/Disc",
         "premium-discount-percentage": "Prem/Disc %",
         "accumulated-volume": "Total Volume",
+        "bulk-deal-value": "Bulk Deal Value",
+        "bulk-deal-volume": "Bulk Deal Volume",
+        "bulk-deal-future": "Bulk Deal Future",
         "turnover": "Turnover",
         "sector": "Sector",
         "number-of-futures": "Futures Count",
@@ -91,10 +93,23 @@ class NdtvProfit:
     }
 
     # Desired column order (Rearrangeable)
-    COLUMN_ORDER = ["Symbol", "Symbol/Strike", "Type", "Expiry Date", "Strike Price", "Spot Price", "CMP", "Price Chg %", "Premium", "Volume", "OI", "OI Chg %", "PCR", "Prem/Disc %", "Rollover %"]
+    COLUMN_ORDER = ["Symbol", "Symbol/Strike", "Type", "Expiry Date", "Strike Price", "Spot Price",
+                    "CMP", "Price Chg %", "Premium", "Volume", "OI", "OI Chg %", "PCR", "Prem/Disc %", "Rollover %"]
+
+    # Shared futures column order and exclude list (used by all futures methods)
+    _FUTURES_COL_ORDER = ["Symbol", "Expiry Date", "Future Price", "Future Chg", "Future Chg %",
+                          "Spot Price", "Prem/Disc", "Prem/Disc %", "Total Volume", "OI", "OI Chg",
+                          "OI Chg %", "OI Turnover", "Turnover", "Rollover %"]
+    _FUTURES_EXCLUDE   = ["Basis", "CMP", "Expiry", "Rollover", "Volume", "Price Chg", "Price Chg %",
+                          "Bulk Deal Value", "Bulk Deal Volume", "Bulk Deal Future", "Vol Chg", "Vol Chg %"]
+
+    # Shared options column order / exclude (used by active-volume and top-OI methods)
+    _OPTIONS_COL_ORDER = ["Symbol", "Strike Price", "Type", "Symbol/Strike", "Expiry Date",
+                          "Spot Price", "Premium", "Volume (Contracts)", "OI (Contracts)", "OI Chg %"]
+    _OPTIONS_EXCLUDE   = ["Underlying Price"]
 
     def __init__(self, convert_to_cr: bool = False, filter_old_expiry: bool = False):
-        self.base_url = "https://www.ndtvprofit.com/foapi"
+        self.base_url = "https://www.ndtvprofit.com/api/v2"
         self.convert_to_cr = convert_to_cr
         self.filter_old_expiry = filter_old_expiry
         self.session = requests.Session()
@@ -106,8 +121,8 @@ class NdtvProfit:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.ndtvprofit.com/markets/fando",
-            "Origin": "https://www.ndtvprofit.com",
+            "Referer": "https://www.ndtvprofit.com/markets/option-chain",
+            "Origin": "https://www.ndtvprofit.com/markets",
             "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
             "Sec-Ch-Ua-Mobile": "?0",
             "Sec-Ch-Ua-Platform": '"Windows"',
@@ -116,88 +131,108 @@ class NdtvProfit:
             "Sec-Fetch-Site": "same-origin",
             "X-Requested-With": "XMLHttpRequest"
         })
-        # Establish session/cookies
         try:
-            self.session.get("https://www.ndtvprofit.com/", timeout=10)
+            self.session.get("https://www.ndtvprofit.com/markets", timeout=10)
             time.sleep(0.5)
-            self.session.get("https://www.ndtvprofit.com/markets/fando", timeout=10)
+            self.session.get("https://www.ndtvprofit.com/markets/option-chain", timeout=10)
         except:
             pass
 
     def _get_params(self, type_str: str = None, instrument_str: str = None, order_str: str = None) -> dict:
         """Helper to convert string arguments to API parameter values."""
-        type_map = {"call": 1, "put": 2, "premium": 1, "discount": 0}
-        inst_map = {"index": 1, "stock": 2}
+        type_map  = {"call": 1, "put": 2, "premium": 1, "discount": 0}
+        inst_map  = {"index": 1, "stock": 2}
         order_map = {"up": 1, "down": 0, "highest": 1, "lowest": 0}
-        
+
         params = {}
         if type_str:
             params["type"] = type_map.get(type_str.lower(), type_str)
-            if type_str.lower() in ["premium", "discount"]:
-                params["premium"] = type_map.get(type_str.lower())
-        
+            if type_str.lower() in ("premium", "discount"):
+                params["premium"] = type_map[type_str.lower()]
         if instrument_str:
             params["instrument"] = inst_map.get(instrument_str.lower(), instrument_str)
-            
         if order_str:
             params["order"] = order_map.get(order_str.lower(), order_str)
-            
         return params
 
-    def _format_output(self, data: Union[list, dict], output: str, header_map: dict = None, column_order: list = None, exclude: list = None, convert_to_cr: Optional[bool] = None, filter_old_expiry: Optional[bool] = None) -> Union[pd.DataFrame, dict, list]:
+    def _ok(self, json_data: dict) -> bool:
+        """Check if the v2 API response is successful."""
+        return json_data.get("responseCode") == 200 and "data" in json_data
+
+    def _fetch(self, url: str, params: dict = None, *, output: str, col_order: list,
+               exclude: list, error_msg: str, empty,
+               convert_to_cr: Optional[bool] = None,
+               filter_old_expiry: Optional[bool] = None):
+        """
+        Single shared fetch-and-format helper used by every public method.
+        Eliminates the repeated try/get/raise/json/_ok/_format_output/except/return pattern.
+        """
+        try:
+            response = self.session.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            json_data = response.json()
+            if self._ok(json_data):
+                return self._format_output(
+                    json_data["data"], output,
+                    column_order=col_order, exclude=exclude,
+                    convert_to_cr=convert_to_cr, filter_old_expiry=filter_old_expiry
+                )
+        except Exception as e:
+            print(f"{error_msg}: {e}")
+        return empty
+
+    def _format_output(self, data: Union[list, dict], output: str, header_map: dict = None,
+                       column_order: list = None, exclude: list = None,
+                       convert_to_cr: Optional[bool] = None,
+                       filter_old_expiry: Optional[bool] = None) -> Union[pd.DataFrame, dict, list]:
         """Format the API response into either a DataFrame or JSON (dict/list)."""
-        # Resolve parameters using instance defaults if not explicitly provided
-        convert = convert_to_cr if convert_to_cr is not None else self.convert_to_cr
+        convert    = convert_to_cr    if convert_to_cr    is not None else self.convert_to_cr
         filter_exp = filter_old_expiry if filter_old_expiry is not None else self.filter_old_expiry
 
-        if output.lower() == "dataframe":
-            if isinstance(data, list):
-                clean_data = [item for item in data if item is not None]
-                df = pd.DataFrame(clean_data)
-            elif isinstance(data, dict):
-                df = pd.DataFrame([data])
-            else:
-                return pd.DataFrame()
-            
-            if df.empty:
-                return df
+        if output.lower() != "dataframe":
+            return data
 
-            # Filter old expiry dates
-            if filter_exp and 'expiry-date' in df.columns:
-                try:
-                    today = pd.Timestamp.now().normalize()
-                    df['temp_expiry'] = pd.to_datetime(df['expiry-date'])
-                    df = df[df['temp_expiry'] >= today].copy()
-                    df.drop(columns=['temp_expiry'], inplace=True)
-                except Exception as e:
-                    print(f"Error filtering expiry dates: {e}")
+        if isinstance(data, list):
+            df = pd.DataFrame([item for item in data if item is not None])
+        elif isinstance(data, dict):
+            df = pd.DataFrame([data])
+        else:
+            return pd.DataFrame()
 
-            # Conversion to Crores
-            if convert:
-                turnover_cols = ["notional-turnover", "premium-turnover", "open-interest-turnover", "turnover"]
-                for col in turnover_cols:
-                    if col in df.columns:
-                        df[col] = pd.to_numeric(df[col], errors='coerce') / 10000000
-
-            # Use provided map or global default
-            mapping = header_map if header_map is not None else self.HEADER_MAP
-            df.rename(columns=mapping, inplace=True)
-            
-            # Use provided order or global default
-            order = column_order if column_order is not None else self.COLUMN_ORDER
-            
-            # Reorder columns: keep priority items first, then the rest
-            all_cols = list(df.columns)
-            priority_cols = [c for c in order if c in all_cols]
-            other_cols = [c for c in all_cols if c not in priority_cols]
-            df = df[priority_cols + other_cols]
-
-            # Drop excluded columns if any
-            if exclude:
-                df.drop(columns=[col for col in exclude if col in df.columns], inplace=True, errors='ignore')
-            
+        if df.empty:
             return df
-        return data
+
+        # Filter old expiry dates
+        if filter_exp and "expiry-date" in df.columns:
+            try:
+                today = pd.Timestamp.now().normalize()
+                df["temp_expiry"] = pd.to_datetime(df["expiry-date"])
+                df = df[df["temp_expiry"] >= today].copy()
+                df.drop(columns=["temp_expiry"], inplace=True)
+            except Exception as e:
+                print(f"Error filtering expiry dates: {e}")
+
+        # Conversion to Crores
+        if convert:
+            for col in ("notional-turnover", "premium-turnover", "open-interest-turnover", "turnover"):
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce") / 10_000_000
+
+        # Rename columns
+        df.rename(columns=header_map if header_map is not None else self.HEADER_MAP, inplace=True)
+
+        # Reorder: priority columns first, then the rest
+        order = column_order if column_order is not None else self.COLUMN_ORDER
+        all_cols      = list(df.columns)
+        priority_cols = [c for c in order if c in all_cols]
+        other_cols    = [c for c in all_cols if c not in priority_cols]
+        df = df[priority_cols + other_cols]
+
+        # Drop excluded columns
+        if exclude:
+            df.drop(columns=[c for c in exclude if c in df.columns], inplace=True, errors="ignore")
+
+        return df
 
     # --------------- General ---------------
 
@@ -206,18 +241,16 @@ class NdtvProfit:
         Fetch Future summary for a given index.
         Example: api.get_nifty_summary("NIFTY 50")
         """
-        url = f"{self.base_url}/future/getSummary"
-        params = {"exchangeSymbol": index_symbol}
-        
-        # Method specific ordering
-        order = ["Symbol", "Spot Price", "Basis", "1M Future", "2M Future", "Roll Spread", "Rollover %", "OI", "OI Chg %", "PCR"]
-        
+        col_order = ["Symbol", "Spot Price", "Basis", "1M Future", "2M Future", "Roll Spread", "Rollover %", "OI", "OI Chg %", "PCR"]
         try:
-            response = self.session.get(url, params=params, timeout=10)
+            response = self.session.get(f"{self.base_url}/stock-summary", params={"symbol": index_symbol}, timeout=10)
             response.raise_for_status()
             json_data = response.json()
-            if json_data.get("status") and "data" in json_data:
-                return self._format_output(json_data["data"], output, column_order=order, exclude=exclude)
+            if self._ok(json_data):
+                data = json_data["data"]
+                if isinstance(data, dict) and "symbol" not in data:
+                    data["symbol"] = index_symbol          # v2 omits the symbol key
+                return self._format_output(data, output, column_order=col_order, exclude=exclude)
         except Exception as e:
             print(f"Error fetching Nifty Summary: {e}")
         return pd.DataFrame() if output == "dataframe" else {}
@@ -225,297 +258,225 @@ class NdtvProfit:
     def get_stock_details(self, mode: str = "All", output: str = "dataframe", exclude: list = None) -> Union[pd.DataFrame, list]:
         """
         Fetch Stock Details.
-
-        mode:
-            "All" → return full dataset
-            "Nse" → return only rows where nsecode is not blank
+        mode: "All" → full dataset | "Nse" → only rows where nsecode is not blank
         """
-
-        url = "https://www.ndtvprofit.com/next/feapi/stock/stock-details"
-
         try:
-            response = self.session.get(url, timeout=10)
+            response = self.session.get(f"{self.base_url}/stock-search", timeout=10)
             response.raise_for_status()
-            json_data = response.json()
+            df = pd.DataFrame(response.json())
 
-            df = pd.DataFrame(json_data)
-
-            # NSE Mode Filtering
             if mode.lower() == "nse":
-                df = df[
-                    df["nsecode"].notna() &
-                    (df["nsecode"].str.strip() != "")
-                ]
+                df = df[df["nsecode"].notna() & (df["nsecode"].str.strip() != "")]
 
-            # Rename columns for clean output
-            df = df.rename(columns={
-                "COMPNAME": "Company Name",
-                "nsecode": "NSE Code",
-                "bsecode": "BSE Code",
-                "ISIN": "ISIN",
-                "STOCKID": "Stock ID"
-            })
+            df = df.rename(columns={"COMPNAME": "Company Name", "nsecode": "NSE Code",
+                                    "bsecode": "BSE Code", "ISIN": "ISIN", "STOCKID": "Stock ID"})
+            df = df[["Company Name", "NSE Code", "BSE Code", "ISIN", "Stock ID"]]
 
-            # Reorder columns
-            col_order = ["Company Name", "NSE Code", "BSE Code", "ISIN", "Stock ID"]
-            df = df[col_order]
-
-            if output == "dataframe":
-                if exclude:
-                    df.drop(columns=[col for col in exclude if col in df.columns], inplace=True, errors='ignore')
-                return df
-            else:
-                return df.to_dict(orient="records")
+            if exclude:
+                df.drop(columns=[c for c in exclude if c in df.columns], inplace=True, errors="ignore")
+            return df if output == "dataframe" else df.to_dict(orient="records")
 
         except Exception as e:
             print(f"Error fetching Stock Details: {e}")
-
         return pd.DataFrame() if output == "dataframe" else []
 
     # --------------- Options ---------------
 
-    def get_most_active_options_by_volume(self, type: str = "call", instrument: str = "stock", limit: int = 200, output: str = "dataframe", exclude: list = None, convert_to_cr: Optional[bool] = None, filter_old_expiry: Optional[bool] = None) -> Union[pd.DataFrame, list]:
+    def get_most_active_options_by_volume(self, type: str = "call", instrument: str = "stock", limit: int = 200,
+                                          output: str = "dataframe", exclude: list = None,
+                                          convert_to_cr: Optional[bool] = None, filter_old_expiry: Optional[bool] = None) -> Union[pd.DataFrame, list]:
         """
         Fetch Most Active Options by Volume.
-        Example: api.get_options_by_volume("call", "stock", limit=5)
+        Example: api.get_most_active_options_by_volume("call", "stock", limit=5)
         """
         p = self._get_params(type_str=type, instrument_str=instrument)
-        url = f"{self.base_url}/option/getByVolume"
-        params = {"type": p.get("type"), "instrument": p.get("instrument"), "limit": limit}
-        
-        # Method specific ordering
-        order = ["Symbol", "Strike Price", "Type", "Symbol/Strike", "Expiry Date",  "Spot Price", "Premium", "Volume (Contracts)", "OI (Contracts)", "OI Chg %"]
-        exclude=["Underlying Price"]
-        
-        try:
-            response = self.session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            json_data = response.json()
-            if json_data.get("status") and "data" in json_data:
-                return self._format_output(json_data["data"], output, column_order=order, exclude=exclude, convert_to_cr=convert_to_cr, filter_old_expiry=filter_old_expiry)
-        except Exception as e:
-            print(f"Error fetching Options by Volume: {e}")
-        return pd.DataFrame() if output == "dataframe" else []
+        return self._fetch(
+            f"{self.base_url}/active-index-stock-options",
+            {"type": p["type"], "instrument": p["instrument"], "limit": limit},
+            output=output, col_order=self._OPTIONS_COL_ORDER,
+            exclude=(exclude or []) + self._OPTIONS_EXCLUDE,
+            error_msg="Error fetching Options by Volume",
+            empty=pd.DataFrame() if output == "dataframe" else [],
+            convert_to_cr=convert_to_cr, filter_old_expiry=filter_old_expiry,
+        )
 
-    def get_top_open_interest(self, type: str = "call", instrument: str = "stock", limit: int = 200, output: str = "dataframe", exclude: list = None, convert_to_cr: Optional[bool] = None, filter_old_expiry: Optional[bool] = None) -> Union[pd.DataFrame, list]:
+    def get_top_open_interest(self, type: str = "call", instrument: str = "stock", limit: int = 200,
+                              output: str = "dataframe", exclude: list = None,
+                              convert_to_cr: Optional[bool] = None, filter_old_expiry: Optional[bool] = None) -> Union[pd.DataFrame, list]:
         """
         Fetch Top Open Interest Options.
         Example: api.get_top_open_interest("call", "stock", limit=5)
         """
         p = self._get_params(type_str=type, instrument_str=instrument)
-        url = f"{self.base_url}/option/getByOi"
-        params = {"type": p.get("type"), "instrument": p.get("instrument"), "limit": limit}
-        
-        # Method specific ordering
-        order = ["Symbol", "Strike Price", "Type", "Symbol/Strike", "Expiry Date",  "Spot Price", "Premium", "Volume (Contracts)", "OI (Contracts)", "OI Chg %"]
-        exclude=["Underlying Price"]
-        
-        try:
-            response = self.session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            json_data = response.json()
-            if json_data.get("status") and "data" in json_data:
-                return self._format_output(json_data["data"], output, column_order=order, exclude=exclude, convert_to_cr=convert_to_cr, filter_old_expiry=filter_old_expiry)
-        except Exception as e:
-            print(f"Error fetching Options by OI: {e}")
-        return pd.DataFrame() if output == "dataframe" else []
+        return self._fetch(
+            f"{self.base_url}/open-interest-index-stock-options",
+            {"type": p["type"], "instrument": p["instrument"], "limit": limit},
+            output=output, col_order=self._OPTIONS_COL_ORDER,
+            exclude=(exclude or []) + self._OPTIONS_EXCLUDE,
+            error_msg="Error fetching Options by OI",
+            empty=pd.DataFrame() if output == "dataframe" else [],
+            convert_to_cr=convert_to_cr, filter_old_expiry=filter_old_expiry,
+        )
 
-    def get_oi_breakup(self, instrument: str = "stock", last_expiry: bool = False, output: str = "dataframe", exclude: list = None, convert_to_cr: Optional[bool] = None, filter_old_expiry: Optional[bool] = None) -> Union[pd.DataFrame, list]:
+    def get_oi_breakup(self, instrument: str = "stock", limit: int = 200, last_expiry: bool = False,
+                       output: str = "dataframe", exclude: list = None,
+                       convert_to_cr: Optional[bool] = None, filter_old_expiry: Optional[bool] = None) -> Union[pd.DataFrame, list]:
         """
         Fetch F&O Open Interest Break-up.
-        Example: api.get_fo_oi_breakup("stock", last_expiry=False)
+        Example: api.get_oi_breakup("stock", last_expiry=False)
         """
         p = self._get_params(instrument_str=instrument)
-        url = f"{self.base_url}/option/getFOBreakUp"
-        params = {"instrument": p.get("instrument"), "lastExpiry": str(last_expiry).lower()}
-        
-        # Method specific ordering
-        order = ["Symbol/Strike", "Future OI", "Future OI Chg %", "Call OI", "Call OI Chg %", "Put OI", "Put OI Chg %", "Total OI", "Total OI Chg %", "1M OI Chg %", "Rollover %"]
-        exclude=["Call OI (Prev)", "Put OI (Prev)", "Future OI (Prev)","Spot Price"]
-        try:
-            response = self.session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            json_data = response.json()
-            if json_data.get("status") and "data" in json_data:
-                return self._format_output(json_data["data"], output, column_order=order, exclude=exclude, convert_to_cr=convert_to_cr, filter_old_expiry=filter_old_expiry)
-        except Exception as e:
-            print(f"Error fetching F&O OI Breakup: {e}")
-        return pd.DataFrame() if output == "dataframe" else []
+        col_order = ["Symbol/Strike", "Future OI", "Future OI Chg %", "Call OI", "Call OI Chg %",
+                     "Put OI", "Put OI Chg %", "Total OI", "Total OI Chg %", "1M OI Chg %", "Rollover %"]
+        return self._fetch(
+            f"{self.base_url}/total-fo-index-stock-options",
+            {"instrument": p["instrument"], "limit": limit, "lastExpiry": str(last_expiry).lower()},
+            output=output, col_order=col_order,
+            exclude=(exclude or []) + ["Call OI (Prev)", "Put OI (Prev)", "Future OI (Prev)", "Spot Price"],
+            error_msg="Error fetching F&O OI Breakup",
+            empty=pd.DataFrame() if output == "dataframe" else [],
+            convert_to_cr=convert_to_cr, filter_old_expiry=filter_old_expiry,
+        )
 
-    def get_oi_change_since_last_expiry(self, instrument: str = "stock", last_expiry: bool = True, output: str = "dataframe", exclude: list = None, convert_to_cr: Optional[bool] = None, filter_old_expiry: Optional[bool] = None) -> Union[pd.DataFrame, list]:
+    def get_oi_change_since_last_expiry(self, instrument: str = "stock", limit: int = 200, last_expiry: bool = True,
+                                        output: str = "dataframe", exclude: list = None,
+                                        convert_to_cr: Optional[bool] = None, filter_old_expiry: Optional[bool] = None) -> Union[pd.DataFrame, list]:
         """
         Fetch F&O Open Interest Change Since Last Expiry.
         Example: api.get_oi_change_since_last_expiry("stock", last_expiry=True)
         """
         p = self._get_params(instrument_str=instrument)
-        url = f"{self.base_url}/option/getFOBreakUp"
-        params = {"instrument": p.get("instrument"), "lastExpiry": str(last_expiry).lower()}
-        
-        # Method specific ordering
-        order = ["Symbol/Strike", "Future OI", "Future OI Chg %", "Call OI", "Call OI Chg %", "Put OI", "Put OI Chg %", "Total OI", "Total OI Chg %"]
-        exclude=["Call OI (Prev)", "Put OI (Prev)", "Future OI (Prev)","Spot Price","1M OI Chg %", "Rollover %"]
-        
-        try:
-            response = self.session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            json_data = response.json()
-            if json_data.get("status") and "data" in json_data:
-                return self._format_output(json_data["data"], output, column_order=order, exclude=exclude, convert_to_cr=convert_to_cr, filter_old_expiry=filter_old_expiry)
-        except Exception as e:
-            print(f"Error fetching F&O OI Breakup: {e}")
-        return pd.DataFrame() if output == "dataframe" else []
+        col_order = ["Symbol/Strike", "Future OI", "Future OI Chg %", "Call OI", "Call OI Chg %",
+                     "Put OI", "Put OI Chg %", "Total OI", "Total OI Chg %"]
+        return self._fetch(
+            f"{self.base_url}/total-fo-index-stock-options",
+            {"instrument": p["instrument"], "limit": limit, "lastExpiry": str(last_expiry).lower()},
+            output=output, col_order=col_order,
+            exclude=(exclude or []) + ["Call OI (Prev)", "Put OI (Prev)", "Future OI (Prev)",
+                                       "Spot Price", "1M OI Chg %", "Rollover %"],
+            error_msg="Error fetching F&O OI Change Since Last Expiry",
+            empty=pd.DataFrame() if output == "dataframe" else [],
+            convert_to_cr=convert_to_cr, filter_old_expiry=filter_old_expiry,
+        )
 
-    def get_pcr_data(self, instrument: str = "stock", output: str = "dataframe", exclude: list = None, convert_to_cr: Optional[bool] = None, filter_old_expiry: Optional[bool] = None) -> Union[pd.DataFrame, list]:
+    def get_pcr_data(self, instrument: str = "stock", limit: int = 200, output: str = "dataframe", exclude: list = None,
+                     convert_to_cr: Optional[bool] = None, filter_old_expiry: Optional[bool] = None) -> Union[pd.DataFrame, list]:
         """
         Fetch Put Call Ratio data.
         Example: api.get_pcr_data("stock")
         """
         p = self._get_params(instrument_str=instrument)
-        url = f"{self.base_url}/option/getPcr"
-        params = {"instrument": p.get("instrument")}
-        
-        # Method specific ordering
-        order = ["Symbol", "Spot Price", "Call OI", "Call OI Chg", "Put OI", "Put OI Chg","PCR (OI)", "PCR (OI Prev)", "PCR (OI Chg)", "PCR (Vol)", "PCR (Vol Prev)", "PCR (Vol Chg)"]
-        exclude=["Call OI Chg %", "Put OI Chg %"]        
-        try:
-            response = self.session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            json_data = response.json()
-            if json_data.get("status") and "data" in json_data:
-                return self._format_output(json_data["data"], output, column_order=order, exclude=exclude, convert_to_cr=convert_to_cr, filter_old_expiry=filter_old_expiry)
-        except Exception as e:
-            print(f"Error fetching PCR Data: {e}")
-        return pd.DataFrame() if output == "dataframe" else []
+        col_order = ["Symbol", "Spot Price", "Call OI", "Call OI Chg", "Put OI", "Put OI Chg",
+                     "PCR (OI)", "PCR (OI Prev)", "PCR (OI Chg)", "PCR (Vol)", "PCR (Vol Prev)", "PCR (Vol Chg)"]
+        return self._fetch(
+            f"{self.base_url}/put-call-ratio",
+            {"instrument": p["instrument"], "limit": limit},
+            output=output, col_order=col_order,
+            exclude=(exclude or []) + ["Call OI Chg %", "Put OI Chg %"],
+            error_msg="Error fetching PCR Data",
+            empty=pd.DataFrame() if output == "dataframe" else [],
+            convert_to_cr=convert_to_cr, filter_old_expiry=filter_old_expiry,
+        )
 
     # --------------- Futures ---------------
 
-    def get_future_by_oi(self, order: str = "up", limit: int = 200, output: str = "dataframe", exclude: list = None, convert_to_cr: Optional[bool] = None, filter_old_expiry: Optional[bool] = None) -> Union[pd.DataFrame, list]:
+    def _futures_fetch(self, url: str, params: dict, extra_exclude: list = None, *,
+                       output: str, error_msg: str,
+                       convert_to_cr: Optional[bool], filter_old_expiry: Optional[bool],
+                       user_exclude: list = None) -> Union[pd.DataFrame, list]:
+        """Shared fetch for all futures endpoints (same col_order & base exclude list)."""
+        exclude = self._FUTURES_EXCLUDE + (extra_exclude or []) + (user_exclude or [])
+        return self._fetch(url, params, output=output, col_order=self._FUTURES_COL_ORDER,
+                           exclude=exclude, error_msg=error_msg,
+                           empty=pd.DataFrame() if output == "dataframe" else [],
+                           convert_to_cr=convert_to_cr, filter_old_expiry=filter_old_expiry)
+
+    def get_future_by_oi(self, order: str = "up", limit: int = 200, output: str = "dataframe",
+                         exclude: list = None, convert_to_cr: Optional[bool] = None,
+                         filter_old_expiry: Optional[bool] = None) -> Union[pd.DataFrame, list]:
         """
         Fetch Future Open Interest Gainers or Losers.
         Example: api.get_future_by_oi("up") or api.get_future_by_oi("down")
         """
         p = self._get_params(order_str=order)
-        url = f"{self.base_url}/future/getByOi"
-        params = {"order": p.get("order"), "limit": limit}
-        
-        col_order = ["Symbol", "Expiry Date","Future Price", "Future Chg", "Future Chg %", "Spot Price", "Prem/Disc", "Prem/Disc %", "Total Volume", "OI", "OI Chg", "OI Chg %", "OI Turnover", "Turnover", "Rollover %" ]
-        exclude_list = ["Basis", "CMP", "Expiry", "Rollover", "Volume", "Price Chg", "Price Chg %"]         
-        if exclude:
-            exclude_list.extend(exclude)
-            
-        try:
-            response = self.session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            json_data = response.json()
-            if json_data.get("status") and "data" in json_data:
-                return self._format_output(json_data["data"], output, column_order=col_order, exclude=exclude_list, convert_to_cr=convert_to_cr, filter_old_expiry=filter_old_expiry)
-        except Exception as e:
-            print(f"Error fetching Future by OI: {e}")
-        return pd.DataFrame() if output == "dataframe" else []
+        return self._futures_fetch(
+            f"{self.base_url}/open-interest-up-down", {"order": p["order"], "limit": limit},
+            output=output, error_msg="Error fetching Future by OI",
+            convert_to_cr=convert_to_cr, filter_old_expiry=filter_old_expiry, user_exclude=exclude,
+        )
 
-    def get_future_by_premium_discount(self, type: str = "premium", limit: int = 200, output: str = "dataframe", exclude: list = None, convert_to_cr: Optional[bool] = None, filter_old_expiry: Optional[bool] = None) -> Union[pd.DataFrame, list]:
+    def get_future_by_premium_discount(self, type: str = "premium", limit: int = 200,
+                                       output: str = "dataframe", exclude: list = None,
+                                       convert_to_cr: Optional[bool] = None,
+                                       filter_old_expiry: Optional[bool] = None) -> Union[pd.DataFrame, list]:
         """
         Fetch Future by Premium or Discount.
         Example: api.get_future_by_premium_discount("premium")
         """
         p = self._get_params(type_str=type)
-        url = f"{self.base_url}/future/getByPremiumDiscount"
-        params = {"premium": p.get("premium"), "limit": limit}
+        return self._futures_fetch(
+            f"{self.base_url}/greatest-premium-discount", {"premium": p["premium"], "limit": limit, "order": 1},
+            output=output, error_msg="Error fetching Future by Premium/Discount",
+            convert_to_cr=convert_to_cr, filter_old_expiry=filter_old_expiry, user_exclude=exclude,
+        )
 
-        col_order = ["Symbol", "Expiry Date","Future Price", "Future Chg", "Future Chg %", "Spot Price", "Prem/Disc", "Prem/Disc %", "Total Volume", "OI", "OI Chg", "OI Chg %", "OI Turnover", "Turnover", "Rollover %" ]
-        exclude_list = ["Basis", "CMP", "Expiry", "Rollover", "Volume", "Price Chg", "Price Chg %"] 
-        if exclude:
-            exclude_list.extend(exclude)
-
-        try:
-            response = self.session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            json_data = response.json()
-
-            if json_data.get("status") and "data" in json_data:
-                return self._format_output(json_data["data"], output, column_order=col_order, exclude=exclude_list, convert_to_cr=convert_to_cr, filter_old_expiry=filter_old_expiry)
-
-        except Exception as e:
-            print(f"Error fetching Future by Premium/Discount: {e}")
-
-        return pd.DataFrame() if output == "dataframe" else []
-
-    def get_future_by_rollover(self, order: str = "highest", limit: int = 200, output: str = "dataframe", exclude: list = None, convert_to_cr: Optional[bool] = None, filter_old_expiry: Optional[bool] = None) -> Union[pd.DataFrame, list]:
+    def get_future_by_rollover(self, order: str = "highest", limit: int = 200,
+                               output: str = "dataframe", exclude: list = None,
+                               convert_to_cr: Optional[bool] = None,
+                               filter_old_expiry: Optional[bool] = None) -> Union[pd.DataFrame, list]:
         """
         Fetch Future by Rollover percentage.
         Example: api.get_future_by_rollover("highest") or api.get_future_by_rollover("lowest")
         """
         p = self._get_params(order_str=order)
-        url = f"{self.base_url}/future/getByRollover"
-        params = {"order": p.get("order"), "limit": limit}
-        
-        col_order = ["Symbol", "Expiry Date","Future Price", "Future Chg", "Future Chg %", "Spot Price", "Prem/Disc", "Prem/Disc %", "Total Volume", "OI", "OI Chg", "OI Chg %", "OI Turnover", "Turnover", "Rollover %" ]
-        exclude_list = ["Basis", "CMP", "Expiry", "Rollover", "Volume", "Price Chg", "Price Chg %"]        
-        if exclude:
-            exclude_list.extend(exclude)
+        return self._futures_fetch(
+            f"{self.base_url}/highest-lowest-future-rollover", {"order": p["order"], "limit": limit},
+            output=output, error_msg="Error fetching Future by Rollover",
+            convert_to_cr=convert_to_cr, filter_old_expiry=filter_old_expiry, user_exclude=exclude,
+        )
 
-        try:
-            response = self.session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            json_data = response.json()
-            if json_data.get("status") and "data" in json_data:
-                return self._format_output(json_data["data"], output, column_order=col_order, exclude=exclude_list, convert_to_cr=convert_to_cr, filter_old_expiry=filter_old_expiry)
-        except Exception as e:
-            print(f"Error fetching Future by Rollover: {e}")
-        return pd.DataFrame() if output == "dataframe" else []
-
-    def get_buildups(self, buildup_type: str = "long_buildup", limit: int = 200, output: str = "dataframe", exclude: list = None, convert_to_cr: Optional[bool] = None, filter_old_expiry: Optional[bool] = None) -> Union[pd.DataFrame, list]:
+    def get_buildups(self, buildup_type: str = "long_buildup", limit: int = 200,
+                     output: str = "dataframe", exclude: list = None,
+                     convert_to_cr: Optional[bool] = None,
+                     filter_old_expiry: Optional[bool] = None) -> Union[pd.DataFrame, list]:
         """
         Fetch Hedging/Buildup status.
-        buildup_type options: "long_buildup", "long_unwinding", "short_covering", "short_buildup"
+        buildup_type: "long_buildup" | "long_unwinding" | "short_covering" | "short_buildup"
         """
         build_map = {
-            "long_buildup": {"price": 1, "oi": 1, "order": 1},
+            "long_buildup":   {"price": 1, "oi": 1, "order": 1},
             "long_unwinding": {"price": 0, "oi": 0, "order": 0},
             "short_covering": {"price": 1, "oi": 0, "order": 0},
-            "short_buildup": {"price": 0, "oi": 1, "order": 1}
+            "short_buildup":  {"price": 0, "oi": 1, "order": 1},
         }
-        params = build_map.get(buildup_type.lower(), build_map["long_buildup"])
-        params["limit"] = limit
-        
-        url = f"{self.base_url}/future/getByhedging"
-        
-        col_order = ["Symbol", "Expiry Date","Future Price", "Future Chg", "Future Chg %", "Spot Price", "Prem/Disc", "Prem/Disc %", "Total Volume", "OI", "OI Chg", "OI Chg %", "OI Turnover", "Turnover", "Rollover %" ]
-        exclude_list = ["Basis", "CMP", "Expiry", "Rollover", "Volume", "Price Chg", "Price Chg %"]       
-        if exclude:
-            exclude_list.extend(exclude)
+        params = {**build_map.get(buildup_type.lower(), build_map["long_buildup"]), "limit": limit}
+        return self._futures_fetch(
+            f"{self.base_url}/short-covering", params,
+            output=output, error_msg="Error fetching Buildups",
+            convert_to_cr=convert_to_cr, filter_old_expiry=filter_old_expiry, user_exclude=exclude,
+        )
 
-        try:
-            response = self.session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            json_data = response.json()
-            if json_data.get("status") and "data" in json_data:
-                return self._format_output(json_data["data"], output, column_order=col_order, exclude=exclude_list, convert_to_cr=convert_to_cr, filter_old_expiry=filter_old_expiry)
-        except Exception as e:
-            print(f"Error fetching Buildups: {e}")
-        return pd.DataFrame() if output == "dataframe" else []
-
-    def get_future_active_volume(self, show_large_change: bool = False, limit: int = 200, output: str = "dataframe", exclude: list = None, convert_to_cr: Optional[bool] = None, filter_old_expiry: Optional[bool] = None) -> Union[pd.DataFrame, list]:
+    def get_future_active_volume(self, show_large_change: bool = False, limit: int = 200,
+                                 output: str = "dataframe", exclude: list = None,
+                                 convert_to_cr: Optional[bool] = None,
+                                 filter_old_expiry: Optional[bool] = None) -> Union[pd.DataFrame, list]:
         """
         Fetch Most Active Futures by Volume or Large Volume Change.
         """
-        url = f"{self.base_url}/future/getByVolume"
-        params = {"byChange": 1 if show_large_change else 0, "order": 1, "limit": limit}
-        
-        col_order = ["Symbol", "Expiry Date","Future Price", "Future Chg", "Future Chg %", "Spot Price", "Prem/Disc", "Prem/Disc %", "Total Volume", "OI", "OI Chg", "OI Chg %", "OI Turnover", "Turnover", "Rollover %" ]
-        exclude_list = ["Basis", "CMP", "Expiry", "Rollover", "Volume", "Price Chg", "Price Chg %"]         
-        if exclude:
-            exclude_list.extend(exclude)
+        return self._futures_fetch(
+            f"{self.base_url}/most-active-contracts",
+            {"byChange": int(show_large_change), "order": 1, "limit": limit},
+            output=output, error_msg="Error fetching Future Volume",
+            convert_to_cr=convert_to_cr, filter_old_expiry=filter_old_expiry, user_exclude=exclude,
+        )
 
-        try:
-            response = self.session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            json_data = response.json()
-            if json_data.get("status") and "data" in json_data:
-                return self._format_output(json_data["data"], output, column_order=col_order, exclude=exclude_list, convert_to_cr=convert_to_cr, filter_old_expiry=filter_old_expiry)
-        except Exception as e:
-            print(f"Error fetching Future Volume: {e}")
-        return pd.DataFrame() if output == "dataframe" else []
+    # def get_sectoral_movement(self, output: str = "dataframe", exclude: list = None) -> Union[pd.DataFrame, list]:
+    #     """
+    #     NOTE: Removed in NDTV Profit API v2 — endpoint discontinued.
+    #     """
+    #     print("Warning: get_sectoral_movement() is not available in the new NDTV Profit API v2. "
+    #           "The /future/getSectoralMovement endpoint has been discontinued.")
+    #     return pd.DataFrame() if output == "dataframe" else []
 
     def get_sectoral_movement(self, output: str = "dataframe", exclude: list = None) -> Union[pd.DataFrame, list]:
         """
