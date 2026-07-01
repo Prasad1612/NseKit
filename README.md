@@ -7,7 +7,12 @@ A Python package to fetch data from the National Stock Exchange (NSE) of India, 
 ```bash
 pip install NseKit
 ```
+or 
 
+## Upgrade
+```bash
+pip install -U NseKit
+```
 ## Usage
 
 "Please refer to **NseKit_Usage.py** for usage."

@@ -2116,6 +2116,19 @@ class Nse:
                 "perChange":        "PercentChange",
             })
 
+        elif isinstance(data.get("marketState"), list):
+            rows = [s for s in data["marketState"] if s.get("index") == "NIFTY 50"]
+            if rows:
+                n50 = pd.DataFrame(rows).rename(columns={
+                    "tradeDate":     "DateTime",
+                    "index":         "Index",
+                    "last":          "LTP",
+                    "variation":     "Change",
+                    "percentChange": "%Change",
+                })
+                n50 = n50[["Index", "LTP", "Change", "%Change", 
+                           "marketStatusMessage", "DateTime"]]
+
         if isinstance(data.get("giftnifty"), dict):
             gift = pd.DataFrame([data["giftnifty"]]).rename(columns={
                 "SYMBOL":           "Symbol",
@@ -3019,7 +3032,7 @@ class Nse:
         try:
             enc = category.upper().replace("&", "%26").replace(" ", "%20")
             # Securities in F&O uses a different endpoint
-            STOCK_INDEX_CATEGORIES = {"SECURITIES IN F&O"}  # add others if needed
+            STOCK_INDEX_CATEGORIES = {"PERMITTED TO TRADE","SECURITIES IN F&O"}  # add others if needed
 
             if category.strip().upper() in STOCK_INDEX_CATEGORIES:
                 api_url = f"https://www.nseindia.com/api/equity-stockIndex?index={enc}"
