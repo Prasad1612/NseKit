@@ -3425,8 +3425,50 @@ class Nse:
         ]
         return pd.DataFrame(rows)
 
-    def india_vix_chart(self) -> pd.DataFrame | None:
+    # def india_vix_chart(self) -> pd.DataFrame | None:
+    #     """Return live intraday chart data for the India VIX index.
+
+    #     Returns
+    #     -------
+    #     pd.DataFrame or None
+    #         Columns: datetime_utc, price, flag.
+
+    #     Examples
+    #     --------
+    #     >>> nse.india_vix_chart()
+    #     """
+
+    #     try:
+    #         obj = self._get_json(
+    #             "https://www.nseindia.com/market-data/live-market-indices",
+    #             "https://www.nseindia.com/api/chart-databyindex-dynamic?index=INDIA%20VIX&type=index"
+    #         )
+    #     except Exception as exc:
+    #         self._log_error("india_vix_chart", exc)
+    #         return None
+
+    #     if obj is None:
+    #         return None
+
+    #     rows = [
+    #         {
+    #             "datetime_utc": pd.to_datetime(ts, unit="ms", utc=True).strftime("%Y-%m-%d %H:%M:%S"),
+    #             "price": price,
+    #             "flag":  flag,
+    #         }
+    #         for ts, price, flag in obj.get("grapthData", [])
+    #     ]
+    #     return pd.DataFrame(rows)
+
+
+    def india_vix_chart(self, interval: str = "sec") -> pd.DataFrame | None:
         """Return live intraday chart data for the India VIX index.
+
+        Parameters
+        ----------
+        interval : {"sec", "min"}, default "sec"
+            "sec" returns raw per-second data as given by the API.
+            "min" resamples/aggregates the data down to one row per minute.
 
         Returns
         -------
@@ -3435,7 +3477,8 @@ class Nse:
 
         Examples
         --------
-        >>> nse.india_vix_chart()
+        >>> nse.india_vix_chart()            # per-second data
+        >>> nse.india_vix_chart("min")       # per-minute data
         """
 
         try:
@@ -3452,13 +3495,28 @@ class Nse:
 
         rows = [
             {
-                "datetime_utc": pd.to_datetime(ts, unit="ms", utc=True).strftime("%Y-%m-%d %H:%M:%S"),
+                "datetime_utc": pd.to_datetime(ts, unit="ms", utc=True),
                 "price": price,
-                "flag":  flag,
+                "flag": flag,
             }
             for ts, price, flag in obj.get("grapthData", [])
         ]
-        return pd.DataFrame(rows)
+
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return df
+
+        if interval == "min":
+            df = df.set_index("datetime_utc")
+            df = (
+                df.resample("1min")
+                .agg({"price": "last", "flag": "last"})
+                .dropna()
+                .reset_index()
+            )
+
+        df["datetime_utc"] = df["datetime_utc"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        return df
 
 
 

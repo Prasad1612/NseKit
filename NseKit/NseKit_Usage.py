@@ -203,7 +203,8 @@ rich = Console()
 # print(get.fno_chart("TCS", "FUTSTK","30-06-2026"))
 # print(get.fno_chart("NIFTY", "OPTIDX","30-03-2026","PE25700"))
 
-# print(get.india_vix_chart())
+# print(get.india_vix_chart())                                                               # india_vix per-second data
+# print(get.india_vix_chart("min"))                                                          # india_vix per-minute data
 
 
 # #---------------------------------------------------------- Capital Market Live Data ----------------------------------------------------------

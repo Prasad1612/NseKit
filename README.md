@@ -164,7 +164,7 @@ rich = Console()
 # print(get.index_live_all_indices_data())                                                  # All Indices Live Snapshot
 
 # # 🔹 Specific Index Constituents
-# print(get.index_live_indices_stocks_data("NIFTY 50"))                                     # Nifty 50 Stocks DataFrame     (Raw)
+# print(get.index_live_indices_stocks_data("Nifty 50"))                                     # Nifty 50 Stocks DataFrame     (Raw)
 # print(get.index_live_indices_stocks_data("NIFTY 50", short=True))                         # Nifty 50 Stocks DataFrame     (Short)
 # print(get.index_live_indices_stocks_data("NIFTY IT", list_only=True))                     # Only Nifty 50 Symbols         (Raw)
 # print(get.index_live_indices_stocks_data("NIFTY IT", short=True, list_only=True))         # Only Nifty 50 Symbols         (Short)
@@ -219,7 +219,8 @@ rich = Console()
 # print(get.fno_chart("TCS", "FUTSTK","30-06-2026"))
 # print(get.fno_chart("NIFTY", "OPTIDX","30-03-2026","PE25700"))
 
-# print(get.india_vix_chart())
+# print(get.india_vix_chart())                                                               # india_vix per-second data
+# print(get.india_vix_chart("min"))                                                          # india_vix per-minute data
 
 
 # #---------------------------------------------------------- Capital Market Live Data ----------------------------------------------------------
@@ -459,13 +460,13 @@ rich = Console()
 
 # print(get.fno_live_option_chain("TCS", expiry_date="30-Jun-2026", oi_mode="compact"))     # Compact Option chain with specific expiry
 # print(get.fno_live_option_chain("ITC", "30-Jun-2026", "compact"))                         # Compact Option chain with specific expiry
-# print(get.fno_live_option_chain("ITC", strike_price="23500", oi_mode="compact"))          # Compact Option chain with specific strike price
+# print(get.fno_live_option_chain("ITC", strike_price="300", oi_mode="compact"))            # Compact Option chain with specific strike price
 # print(get.fno_live_option_chain("NIFTY", "23500", "compact"))                             # Compact Option chain with specific strike price
 
 # print(get.fno_live_option_chain_raw("M&M", expiry_date="30-Jun-2026"))                    # Raw Option chain with specific expiry           {JSON}
 # print(get.fno_live_option_chain_raw("M&M", "30-Jun-2026"))                                # Raw Option chain with specific expiry           {JSON}
-# print(get.fno_live_option_chain_raw("M&M", strike_price="23500"))                         # Raw Option chain with specific strike price     {JSON}
-# print(get.fno_live_option_chain_raw("M&M", "23500"))                                      # Raw Option chain with specific strike price     {JSON}
+# print(get.fno_live_option_chain_raw("M&M", strike_price="3500"))                          # Raw Option chain with specific strike price     {JSON}
+# print(get.fno_live_option_chain_raw("M&M", "3500"))                                       # Raw Option chain with specific strike price     {JSON}
 
 # # 🔹 Active Contracts
 # print(get.fno_live_active_contracts("NIFTY"))                                             # Active index option contracts
