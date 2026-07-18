@@ -2588,7 +2588,7 @@ class Nse:
         >>> nse.nse_eod_equity_full_list(list_only=True)
         """
         return self._nse_csv_list(
-            "https://archives.nseindia.com/content/equities/EQUITY_L.csv",
+            "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv",
             ["SYMBOL", "NAME OF COMPANY", "SERIES", "DATE OF LISTING", "FACE VALUE"],
             "SYMBOL", list_only,
         )
