@@ -158,6 +158,17 @@ rich = Console()
 # # 🔹 Pre-Open Market Derivatives
 # print(get.pre_market_derivatives_info("Stock Futures"))                                   # Derivatives Pre-Open data "Index Futures" | "Stock Futures"
 
+# #---------------------------------------------------------- Closing Auction Session (CAS) ----------------------------------------------------------
+
+# # 🔹 Closing Auction Session — all symbols reporting this tick
+# print(get.nse_closing_auction_session())                                                  # DataFrame, all CAS symbols
+
+# # 🔹 Closing Auction Session — single symbol
+# print(get.nse_closing_auction_session("RELIANCE"))                                        # DataFrame, filtered to one symbol
+
+# # 🔹 Just the session state
+# print(get.nse_closing_auction_session("status"))                                          # "Open — Closing Auction Session Market Open"
+
 # #---------------------------------------------------------- Index Live Data ----------------------------------------------------------
 
 # # 🔹 All NSE Indices Live Data

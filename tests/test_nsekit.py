@@ -373,6 +373,85 @@ class TestPreMarket:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 5b. CLOSING AUCTION SESSION (CAS)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.live
+class TestClosingAuctionSession:
+    """
+    CAS is only populated in the last few minutes of the trading day,
+    so an empty/None result outside that window is expected, not a
+    failure — tests here check shape/behaviour rather than hard-require
+    data, except for the offline-safe status-string checks.
+    """
+
+    SYM = "RELIANCE"
+
+    EXPECTED_COLS = {
+        "symbol", "refrencePrice", "prevClose",
+        "lowerBand","upperBand", "IEP", "change", "perChange",
+        "finalPrice", "finalQuantity", "finalValue", "iiqAtEP", "iiqAtMO",
+        "totTradedQty", "lastTradedPrice", "avgTrdPrice",
+        "openPrice", "highPrice", "lowPrice",
+        "totalBuyQuantity", "totalSellQuantity",
+        "atoBuyQuantity", "atoSellQuantity",
+        "lastUpdateTime", 
+    }
+
+
+    def test_all_symbols_shape(self, nse):
+        """Outside the CAS window this returns None — only assert shape when live."""
+        df = nse.nse_closing_auction_session()
+        if df is not None:
+            _has_df(df, min_rows=1, cols=self.EXPECTED_COLS, label="cas_all")
+
+    def test_single_symbol_filter(self, nse):
+        df = nse.nse_closing_auction_session(self.SYM)
+        if df is not None:
+            _has_df(df, min_rows=1, label="cas_symbol")
+            assert set(df["symbol"].str.upper()) == {self.SYM}
+
+    def test_single_symbol_case_insensitive(self, nse):
+        df_lower = nse.nse_closing_auction_session(self.SYM.lower())
+        df_upper = nse.nse_closing_auction_session(self.SYM.upper())
+        if df_lower is not None and df_upper is not None:
+            assert len(df_lower) == len(df_upper)
+
+    def test_unknown_symbol_empty_but_not_none(self, nse):
+        """A real fetch with a bogus symbol should filter down to zero rows, not fail."""
+        df = nse.nse_closing_auction_session("ZZZZZNOTREAL")
+        if df is not None:
+            assert isinstance(df, pd.DataFrame)
+            assert df.empty
+
+    def test_orderbook_column_dropped(self, nse):
+        df = nse.nse_closing_auction_session()
+        if df is not None:
+            assert "orderBook" not in df.columns
+
+    def test_sorted_by_perchange_descending(self, nse):
+        df = nse.nse_closing_auction_session()
+        if df is not None and len(df) > 1:
+            vals = df["perChange"].tolist()
+            assert vals == sorted(vals, reverse=True), \
+                "Expected perChange sorted largest → smallest"
+
+    def test_status_returns_combined_string(self, nse):
+        """This hits the network (to build status) but doesn't depend on the CAS window."""
+        result = nse.nse_closing_auction_session("status")
+        if result is not None:
+            assert isinstance(result, str)
+            assert "—" in result
+            assert result.split(" — ")[0] in ("Open", "Closed")
+
+    def test_status_case_insensitive(self, nse):
+        r1 = nse.nse_closing_auction_session("status")
+        r2 = nse.nse_closing_auction_session("STATUS")
+        if r1 is not None and r2 is not None:
+            assert r1 == r2
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 6. EQUITY LIVE DATA
 # ══════════════════════════════════════════════════════════════════════════════
 

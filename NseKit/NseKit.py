@@ -2959,6 +2959,90 @@ class Nse:
 
         return pd.DataFrame(rows).set_index("symbol", drop=False)
 
+    def nse_closing_auction_session(self, symbol: str | None = None) -> pd.DataFrame | str | None:
+        """
+        Return live Closing Auction Session (CAS) data.
+
+        CAS runs in the last minutes of the trading session (a second,
+        smaller call-auction window analogous to the pre-open session)
+        during which NSE periodically publishes indicative equilibrium
+        price, order-book depth, and match status for the CAS-eligible
+        universe of symbols.
+
+        Parameters
+        ----------
+        symbol : str, optional
+            If given, restrict the returned frame to this symbol only
+            (case-insensitive). Default ``None`` returns every symbol
+            currently reporting CAS data.
+
+            Special value ``"status"`` returns a single combined
+            string instead of a frame: ``"Open — Closing Auction
+            Session Market Open"`` (i.e. ``status`` and ``statusMsg``
+            joined together).
+
+        Returns
+        -------
+        pd.DataFrame or str or None
+            Indexed by symbol, sorted by ``perChange`` descending
+            (largest gainers first), with columns ``,
+            refrencePrice, prevClose, upperBand,
+            lowerBand, IEP, change, perChange, finalPrice, finalValue,
+            finalQuantity, totTradedQty, lastTradedPrice, avgTrdPrice,
+            openPrice, highPrice, lowPrice, totalBuyQuantity,
+            totalSellQuantity, atoBuyQuantity, atoSellQuantity,
+            lastUpdateTime``.
+
+            ``finalPrice``/``finalValue``/``finalQuantity`` stay ``0``
+            until the auction actually matches (mid-session they're 0;
+            once matched, the final* fields fill in).
+
+            If *symbol* is ``"status"``, returns ``"<status> —
+            <statusMsg>"`` as a single plain ``str`` instead.
+
+            Returns ``None`` on persistent fetch failure.
+
+        Examples
+        --------
+        >>> nse.nse_closing_auction_session()                   # every symbol reporting this tick
+        >>> nse.nse_closing_auction_session("RELIANCE")         # single symbol
+        >>> nse.nse_closing_auction_session("status")           # "Open — Closing Auction Session Market Open"
+        """
+        data = self._get_json(
+            "https://www.nseindia.com/market-data/closing-auction-session",
+            "https://www.nseindia.com/api/NextApi/apiClient/casApi?functionName=getCASData",
+        )
+        if not data:
+            return None
+
+        if symbol and symbol.strip().lower() == "status":
+            status    = data.get("status", "")
+            statusMsg = data.get("statusMsg", "")
+            return f"{status} — {statusMsg}" if status or statusMsg else None
+
+        items = data.get("data", []) or []
+        if symbol:
+            sym = symbol.strip().upper()
+            items = [i for i in items if i.get("symbol", "").upper() == sym]
+
+        cols = [
+            "symbol", "refrencePrice", "prevClose",
+            "lowerBand","upperBand", "IEP", "change", "perChange",
+            "finalPrice", "finalQuantity", "finalValue", "iiqAtEP", "iiqAtMO",
+            "totTradedQty", "lastTradedPrice", "avgTrdPrice",
+            "openPrice", "highPrice", "lowPrice",
+            "totalBuyQuantity", "totalSellQuantity",
+            "atoBuyQuantity", "atoSellQuantity",
+            "lastUpdateTime",
+        ]
+        rows = [{c: i.get(c) for c in cols} for i in items]
+        df = pd.DataFrame(rows, columns=cols)
+        if not df.empty:
+            df = df.sort_values("perChange", ascending=False)
+            df = df.set_index("symbol", drop=False)
+
+        return df
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3424,42 +3508,6 @@ class Nse:
             for r in (data.get("data") or {}).get("grapthData", [])
         ]
         return pd.DataFrame(rows)
-
-    # def india_vix_chart(self) -> pd.DataFrame | None:
-    #     """Return live intraday chart data for the India VIX index.
-
-    #     Returns
-    #     -------
-    #     pd.DataFrame or None
-    #         Columns: datetime_utc, price, flag.
-
-    #     Examples
-    #     --------
-    #     >>> nse.india_vix_chart()
-    #     """
-
-    #     try:
-    #         obj = self._get_json(
-    #             "https://www.nseindia.com/market-data/live-market-indices",
-    #             "https://www.nseindia.com/api/chart-databyindex-dynamic?index=INDIA%20VIX&type=index"
-    #         )
-    #     except Exception as exc:
-    #         self._log_error("india_vix_chart", exc)
-    #         return None
-
-    #     if obj is None:
-    #         return None
-
-    #     rows = [
-    #         {
-    #             "datetime_utc": pd.to_datetime(ts, unit="ms", utc=True).strftime("%Y-%m-%d %H:%M:%S"),
-    #             "price": price,
-    #             "flag":  flag,
-    #         }
-    #         for ts, price, flag in obj.get("grapthData", [])
-    #     ]
-    #     return pd.DataFrame(rows)
-
 
     def india_vix_chart(self, interval: str = "sec") -> pd.DataFrame | None:
         """Return live intraday chart data for the India VIX index.
@@ -4201,62 +4249,6 @@ class Nse:
     # ════════════════════════════════════════════════════════════════════════
     # ── CM — Corporate Filings (Live) ───────────────────────────────────────
 
-    ## ── insider_trading (Old)  ────────  
-
-    # def cm_live_hist_insider_trading(
-    #     self,
-    #     *args,
-    #     from_date: str | None = None,
-    #     to_date:   str | None = None,
-    #     period:    str | None = None,
-    #     symbol:    str | None = None,
-    # ) -> pd.DataFrame | None:
-    #     """
-    #     Return historical insider-trading (PIT) disclosures.
-
-    #     Parameters
-    #     ----------
-    #     *args : str
-    #         Positional shorthand — pass a symbol, date range, or period.
-    #     from_date : str, optional
-    #         Start date in ``DD-MM-YYYY``.
-    #     to_date : str, optional
-    #         End date in ``DD-MM-YYYY``.
-    #     period : str, optional
-    #         Shorthand: ``"1D"``, ``"1W"``, ``"1M"``, ``"3M"``, ``"6M"``,
-    #         ``"1Y"``.
-    #     symbol : str, optional
-    #         NSE equity symbol to filter, e.g. ``"RELIANCE"``.
-
-    #     Returns
-    #     -------
-    #     pd.DataFrame or None
-
-    #     Examples
-    #     --------
-    #     >>> nse.cm_live_hist_insider_trading()
-    #     >>> nse.cm_live_hist_insider_trading("1M")
-    #     >>> nse.cm_live_hist_insider_trading("01-01-2025", "15-10-2025")
-    #     >>> nse.cm_live_hist_insider_trading("RELIANCE")
-    #     >>> nse.cm_live_hist_insider_trading("RELIANCE", "1M")
-    #     >>> nse.cm_live_hist_insider_trading("RELIANCE", "01-01-2025", "15-10-2025")
-    #     """
-    #     cols = [
-    #         "symbol", "company", "acqName", "personCategory", "secType",
-    #         "befAcqSharesNo", "befAcqSharesPer", "remarks", "secAcq", "secVal",
-    #         "tdpTransactionType", "securitiesTypePost", "afterAcqSharesNo",
-    #         "afterAcqSharesPer", "acqfromDt", "acqtoDt", "intimDt", "acqMode",
-    #         "derivativeType", "tdpDerivativeContractType", "buyValue",
-    #         "buyQuantity", "sellValue", "sellquantity", "exchange", "date", "xbrl",
-    #     ]
-    #     return self._corp_filing(
-    #         "https://www.nseindia.com/companies-listing/corporate-filings-insider-trading",
-    #         "https://www.nseindia.com/api/corporates-pit",
-    #         *args,
-    #         from_date=from_date, to_date=to_date, symbol=symbol, period=period,
-    #         keep_cols=cols,
-    #     )
-
     def cm_live_hist_insider_trading(
         self,
         *args,
@@ -4800,51 +4792,6 @@ class Nse:
             *args, **kw,
         )
 
-    # def cm_live_voting_results(self) -> pd.DataFrame | None:
-    #     """Return corporate voting results with per-agenda breakdown.
-
-    #     Returns
-    #     -------
-    #     pd.DataFrame or None
-    #         One row per agenda item, flattened from the nested JSON.
-
-    #     Examples
-    #     --------
-    #     >>> nse.cm_live_voting_results()
-    #     """
-    #     ref_url = "https://www.nseindia.com/companies-listing/corporate-filings-voting-results"
-    #     data    = self._get_json(
-    #         ref_url, "https://www.nseindia.com/api/corporate-voting-results?"
-    #     )
-    #     if not data:
-    #         return None
-
-    #     rows = []
-    #     for item in data:
-    #         meta    = item.get("metadata", {})
-    #         agendas = meta.get("agendas", []) or item.get("agendas", [])
-    #         if agendas:
-    #             for ag in agendas:
-    #                 rows.append({**meta, **ag})
-    #         else:
-    #             rows.append(meta)
-
-    #     if not rows:
-    #         return None
-
-    #     df = pd.DataFrame(rows)
-    #     df.replace({np.inf: None, -np.inf: None}, inplace=True)
-    #     df.fillna("", inplace=True)
-
-    #     def _flatten(v):
-    #         if isinstance(v, (list, dict)):
-    #             return json.dumps(v, ensure_ascii=False)
-    #         return "" if v is None else str(v)
-
-    #     for col in df.columns:
-    #         df[col] = df[col].map(_flatten)
-    #     return df.reset_index(drop=True)
-
     def cm_live_voting_results(self) -> pd.DataFrame | None:
         """Return corporate voting results with per-agenda breakdown.
 
@@ -5028,41 +4975,6 @@ class Nse:
 
     # ════════════════════════════════════════════════════════════════════════
     # ── CM — EOD ────────────────────────────────────────────────────────────
-
-    # def cm_eod_fii_dii_activity(self, exchange: str = "All") -> pd.DataFrame | None:
-    #     """
-    #     Return the latest FII and DII activity data.
-
-    #     Parameters
-    #     ----------
-    #     exchange : str, optional
-    #         ``"Nse"`` for NSE-only data, or ``"All"`` (default) for combined.
-
-    #     Returns
-    #     -------
-    #     pd.DataFrame or None
-
-    #     Examples
-    #     --------
-    #     >>> nse.cm_eod_fii_dii_activity()
-    #     >>> nse.cm_eod_fii_dii_activity("Nse")
-    #     """
-    #     self.rotate_user_agent()
-    #     ep = {
-    #         "Nse": "https://www.nseindia.com/api/fiidiiTradeNse",
-    #         "All": "https://www.nseindia.com/api/fiidiiTradeReact",
-    #     }
-    #     try:
-    #         resp = self._warm_and_fetch(
-    #             "https://www.nseindia.com/reports/fii-dii",
-    #             ep.get(exchange, ep["All"]),
-    #             timeout=10
-    #         )
-    #         return pd.DataFrame(resp.json())
-    #     except Exception as exc:
-    #         self._log_error("cm_eod_fii_dii_activity", exc)
-    #         return None
-
 
     def cm_eod_fii_dii_activity(self, exchange: str = "All") -> pd.DataFrame | None:
         """
@@ -6579,267 +6491,6 @@ class Nse:
             "https://www.nseindia.com/option-chain",
             f"{base}&params={params_str}",
         )
-
-    # def fno_live_option_chain(
-    #     self,
-    #     symbol:       str,
-    #     expiry_date:  str | None = None,
-    #     oi_mode:      str        = "full",
-    #     strike_price: str | None = None,
-    # ) -> pd.DataFrame:
-    #     """
-    #     Return a structured option chain table for a symbol.
-
-    #     Parameters
-    #     ----------
-    #     symbol : str
-    #         Underlying ticker, e.g. ``"NIFTY"``, ``"RELIANCE"``.
-    #     expiry_date : str, optional
-    #         Target expiry in any pandas-parseable format. Defaults to
-    #         the nearest available expiry.
-    #         When supplied as a bare positional argument, a purely numeric
-    #         value (e.g. ``"23500"``) is treated as *strike_price* instead,
-    #         and ``"compact"`` / ``"full"`` is treated as *oi_mode*.
-    #     oi_mode : str, optional
-    #         ``"full"`` (default) includes bid/ask columns.
-    #         ``"compact"`` returns only the core OI/volume/LTP columns.
-    #     strike_price : str | int, optional
-    #         Fetch data for a specific strike price across all available
-    #         expiries instead of a single-expiry full chain.
-    #         When *strike_price* is provided, *expiry_date* is ignored and
-    #         the ``Expiry_Date`` column reflects each row's own expiry.
-
-    #     Returns
-    #     -------
-    #     pd.DataFrame
-    #         Columns: Fetch_Time, Symbol, Expiry_Date, CALLS_OI, CALLS_Volume,
-    #         CALLS_LTP, Strike_Price, PUTS_OI, PUTS_Volume, PUTS_LTP,
-    #         Underlying_Value (and bid/ask columns in full mode).
-
-    #     Examples
-    #     --------
-    #     >>> nse.fno_live_option_chain("RELIANCE")
-    #     >>> nse.fno_live_option_chain("NIFTY")
-    #     >>> nse.fno_live_option_chain("RELIANCE", expiry_date="27-Jan-2026")
-    #     >>> nse.fno_live_option_chain("RELIANCE", "27-Jan-2026")
-    #     >>> nse.fno_live_option_chain("RELIANCE", strike_price="23500")
-    #     >>> nse.fno_live_option_chain("RELIANCE", "23500")
-    #     >>> nse.fno_live_option_chain("RELIANCE", oi_mode="compact")
-    #     >>> nse.fno_live_option_chain("RELIANCE", "compact")
-    #     >>> nse.fno_live_option_chain("RELIANCE", expiry_date="27-Jan-2026", oi_mode="compact")
-    #     >>> nse.fno_live_option_chain("RELIANCE", "27-Jan-2026", "compact")
-    #     >>> nse.fno_live_option_chain("RELIANCE", strike_price="23500", oi_mode="compact")
-    #     >>> nse.fno_live_option_chain("RELIANCE", "23500", "compact")
-    #     """
-    #     # ── Positional-arg disambiguation ─────────────────────────────────────
-    #     # expiry_date slot can receive a strike_price (pure number) or oi_mode
-    #     # ("compact"/"full") when called without keyword arguments.
-    #     if expiry_date is not None:
-    #         val = str(expiry_date).strip()
-    #         if val.lower() in ("full", "compact"):
-    #             # e.g. fno_live_option_chain("NIFTY", "compact")
-    #             oi_mode    = val.lower()
-    #             expiry_date = None
-    #         elif val.lstrip("-").replace(".", "", 1).isdigit() and strike_price is None:
-    #             # e.g. fno_live_option_chain("NIFTY", "23500")
-    #             strike_price = val
-    #             expiry_date  = None
-
-    #     # oi_mode slot may also receive "compact"/"full" when positional args shift
-    #     if isinstance(oi_mode, str) and oi_mode.strip().lower() not in ("full", "compact"):
-    #         oi_mode = "full"
-
-    #     self.rotate_user_agent()
-    #     base_url = "https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
-
-    #     full_cols = [
-    #         "Fetch_Time", "Symbol", "Expiry_Date",
-    #         "CALLS_OI", "CALLS_Chng_in_OI", "CALLS_Volume", "CALLS_IV",
-    #         "CALLS_LTP", "CALLS_Net_Chng",
-    #         "CALLS_Bid_Qty", "CALLS_Bid_Price", "CALLS_Ask_Price", "CALLS_Ask_Qty",
-    #         "Strike_Price",
-    #         "PUTS_Bid_Qty", "PUTS_Bid_Price", "PUTS_Ask_Price", "PUTS_Ask_Qty",
-    #         "PUTS_Net_Chng", "PUTS_LTP", "PUTS_IV",
-    #         "PUTS_Volume", "PUTS_Chng_in_OI", "PUTS_OI",
-    #         "Underlying_Value"
-    #     ]
-
-    #     compact_cols = [
-    #         "Fetch_Time", "Symbol", "Expiry_Date",
-    #         "CALLS_OI", "CALLS_Chng_in_OI", "CALLS_Volume", "CALLS_IV",
-    #         "CALLS_LTP", "CALLS_Net_Chng",
-    #         "Strike_Price",
-    #         "PUTS_Net_Chng", "PUTS_LTP", "PUTS_IV",
-    #         "PUTS_Volume", "PUTS_Chng_in_OI", "PUTS_OI",
-    #         "Underlying_Value"
-    #     ]
-
-    #     col_names = compact_cols if oi_mode == "compact" else full_cols
-
-    #     dtypes = {
-    #         c: "float64"
-    #         for c in col_names
-    #         if any(x in c for x in ("Price", "IV", "Value", "OI", "Volume", "Chng", "Qty"))
-    #     }
-    #     dtypes.update({"Fetch_Time": "object", "Symbol": "object",
-    #                    "Expiry_Date": "object", "Strike_Price": "float64"})
-
-    #     # ── Strike-price mode ──────────────────────────────────────────────────
-    #     if strike_price is not None:
-    #         def _call_strike():
-    #             r = self._warm_and_fetch(
-    #                 "https://www.nseindia.com/option-chain",
-    #                 base_url,
-    #                 params={
-    #                     "functionName": "getOptionChainData",
-    #                     "symbol":       symbol,
-    #                     "params":       f"strikePrice={strike_price}",
-    #                 },
-    #                 timeout=15,
-    #             )
-    #             return r.json()
-
-    #         try:
-    #             payload = self._retry(_call_strike)
-    #         except Exception as exc:
-    #             self._log_error("fno_live_option_chain", exc)
-    #             return pd.DataFrame(columns=col_names).astype(dtypes)
-
-    #         ts      = payload.get("timestamp", datetime.now().strftime("%d-%b-%Y %H:%M:%S"))
-    #         uv      = payload.get("underlyingValue", 0)
-    #         records = payload.get("data", [])
-
-    #         if not records:
-    #             return pd.DataFrame(columns=col_names).astype(dtypes)
-
-    #         rows = []
-    #         for item in records:
-    #             ce          = item.get("CE", {})
-    #             pe          = item.get("PE", {})
-    #             row_expiry  = (
-    #                 ce.get("expiryDate") or pe.get("expiryDate")
-    #                 or item.get("expiryDates", "")
-    #             )
-    #             row = {
-    #                 "Fetch_Time":       ts,
-    #                 "Symbol":           symbol,
-    #                 "Expiry_Date":      row_expiry,
-    #                 "Strike_Price":     item.get("strikePrice"),
-    #                 "CALLS_OI":         ce.get("openInterest",          0),
-    #                 "CALLS_Chng_in_OI": ce.get("changeinOpenInterest",  0),
-    #                 "CALLS_Volume":     ce.get("totalTradedVolume",      0),
-    #                 "CALLS_IV":         ce.get("impliedVolatility",      0),
-    #                 "CALLS_LTP":        ce.get("lastPrice",              0),
-    #                 "CALLS_Net_Chng":   ce.get("change",                 0),
-    #                 "PUTS_OI":          pe.get("openInterest",           0),
-    #                 "PUTS_Chng_in_OI":  pe.get("changeinOpenInterest",   0),
-    #                 "PUTS_Volume":      pe.get("totalTradedVolume",       0),
-    #                 "PUTS_IV":          pe.get("impliedVolatility",       0),
-    #                 "PUTS_LTP":         pe.get("lastPrice",               0),
-    #                 "PUTS_Net_Chng":    pe.get("change",                  0),
-    #                 "Underlying_Value": uv,
-    #             }
-    #             if oi_mode == "full":
-    #                 row.update({
-    #                     "CALLS_Bid_Qty":   ce.get("totalBuyQuantity",  0) or ce.get("buyQuantity1",  0),
-    #                     "CALLS_Bid_Price": ce.get("buyPrice1",          0),
-    #                     "CALLS_Ask_Price": ce.get("sellPrice1",         0),
-    #                     "CALLS_Ask_Qty":   ce.get("totalSellQuantity",  0) or ce.get("sellQuantity1", 0),
-    #                     "PUTS_Bid_Qty":    pe.get("totalBuyQuantity",   0) or pe.get("buyQuantity1",  0),
-    #                     "PUTS_Bid_Price":  pe.get("buyPrice1",           0),
-    #                     "PUTS_Ask_Price":  pe.get("sellPrice1",          0),
-    #                     "PUTS_Ask_Qty":    pe.get("totalSellQuantity",   0) or pe.get("sellQuantity1", 0),
-    #                 })
-    #             rows.append(row)
-
-    #         return pd.DataFrame(rows, columns=col_names).astype(dtypes)
-
-    #     # ── Expiry-date mode (original behaviour) ─────────────────────────────
-    #     def _call():
-    #         r = self._warm_and_fetch(
-    #             "https://www.nseindia.com/option-chain",
-    #             base_url,
-    #             params={"functionName": "getOptionChainDropdown", "symbol": symbol},
-    #             timeout=10
-    #         )
-    #         dd    = r.json()
-    #         avail = dd.get("expiryDates", [])
-    #         if not avail:
-    #             raise ValueError("No expiry dates found")
-
-    #         if expiry_date:
-    #             try:
-    #                 t = pd.to_datetime(expiry_date, dayfirst=True).strftime("%d-%b-%Y")
-    #             except Exception:
-    #                 t = expiry_date.strip()
-    #             target = t if t in avail else avail[0]
-    #         else:
-    #             target = avail[0]
-
-    #         r2 = self._warm_and_fetch(
-    #             "https://www.nseindia.com/option-chain",
-    #             base_url,
-    #             params={
-    #                 "functionName": "getOptionChainData",
-    #                 "symbol": symbol,
-    #                 "params": f"expiryDate={target}",
-    #             },
-    #             timeout=15
-    #         )
-    #         return r2.json(), target
-
-    #     try:
-    #         res = self._retry(_call)
-    #         payload, target = res
-    #     except Exception as exc:
-    #         self._log_error("fno_live_option_chain", exc)
-    #         return pd.DataFrame(columns=col_names).astype(dtypes)
-
-    #     ts      = payload.get("timestamp", datetime.now().strftime("%d-%b-%Y %H:%M:%S"))
-    #     uv      = payload.get("underlyingValue", 0)
-    #     records = payload.get("data", [])
-
-    #     if not records:
-    #         return pd.DataFrame(columns=col_names).astype(dtypes)
-
-    #     rows = []
-    #     for item in records:
-    #         ce  = item.get("CE", {})
-    #         pe  = item.get("PE", {})
-    #         row = {
-    #             "Fetch_Time":       ts,
-    #             "Symbol":           symbol,
-    #             "Expiry_Date":      target,
-    #             "Strike_Price":     item.get("strikePrice"),
-    #             "CALLS_OI":         ce.get("openInterest",          0),
-    #             "CALLS_Chng_in_OI": ce.get("changeinOpenInterest",  0),
-    #             "CALLS_Volume":     ce.get("totalTradedVolume",      0),
-    #             "CALLS_IV":         ce.get("impliedVolatility",      0),
-    #             "CALLS_LTP":        ce.get("lastPrice",              0),
-    #             "CALLS_Net_Chng":   ce.get("change",                 0),
-    #             "PUTS_OI":          pe.get("openInterest",           0),
-    #             "PUTS_Chng_in_OI":  pe.get("changeinOpenInterest",   0),
-    #             "PUTS_Volume":      pe.get("totalTradedVolume",       0),
-    #             "PUTS_IV":          pe.get("impliedVolatility",       0),
-    #             "PUTS_LTP":         pe.get("lastPrice",               0),
-    #             "PUTS_Net_Chng":    pe.get("change",                  0),
-    #             "Underlying_Value": uv,
-    #         }
-    #         if oi_mode == "full":
-    #             row.update({
-    #                 "CALLS_Bid_Qty":   ce.get("totalBuyQuantity",  0) or ce.get("buyQuantity1",  0),
-    #                 "CALLS_Bid_Price": ce.get("buyPrice1",          0),
-    #                 "CALLS_Ask_Price": ce.get("sellPrice1",         0),
-    #                 "CALLS_Ask_Qty":   ce.get("totalSellQuantity",  0) or ce.get("sellQuantity1", 0),
-    #                 "PUTS_Bid_Qty":    pe.get("totalBuyQuantity",   0) or pe.get("buyQuantity1",  0),
-    #                 "PUTS_Bid_Price":  pe.get("buyPrice1",           0),
-    #                 "PUTS_Ask_Price":  pe.get("sellPrice1",          0),
-    #                 "PUTS_Ask_Qty":    pe.get("totalSellQuantity",   0) or pe.get("sellQuantity1", 0),
-    #             })
-    #         rows.append(row)
-
-    #     return pd.DataFrame(rows, columns=col_names).astype(dtypes)
-
 
     def fno_live_option_chain(
         self,
