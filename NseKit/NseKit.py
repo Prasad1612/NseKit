@@ -2861,7 +2861,6 @@ class Nse:
             "timestamp": data.get("timestamp", ""),
         }])
 
-
     def pre_market_info(self, category: str = "All") -> pd.DataFrame | None:
         """
         Return detailed per-stock pre-open data for *category*.
@@ -2875,7 +2874,8 @@ class Nse:
         Returns
         -------
         pd.DataFrame or None
-            Indexed by symbol; includes IEP, turnover, 52-week range,
+            Indexed by symbol, sorted by pChange descending (largest
+            gainers first); includes IEP, turnover, 52-week range,
             and order-book buy/sell quantities.
 
         Examples
@@ -2907,7 +2907,11 @@ class Nse:
             "lastUpdateTime":    i.get("lastUpdateTime"),
         } for i in data.get("data", [])]
 
-        return pd.DataFrame(rows).set_index("symbol", drop=False)
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            df = df.sort_values("pChange", ascending=False)
+            df = df.set_index("symbol", drop=False)
+        return df
 
 
     def pre_market_derivatives_info(self, category: str = "Index Futures") -> pd.DataFrame | None:
@@ -2922,6 +2926,8 @@ class Nse:
         Returns
         -------
         pd.DataFrame or None
+            Indexed by symbol, sorted by pChange descending (largest
+            gainers first).
 
         Examples
         --------
@@ -2963,8 +2969,11 @@ class Nse:
             "lastUpdateTime":    i.get("lastUpdateTime"),
         } for i in items]
 
-        return pd.DataFrame(rows).set_index("symbol", drop=False)
-
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            df = df.sort_values("pChange", ascending=False)
+            df = df.set_index("symbol", drop=False)
+        return df
 
     def nse_closing_auction_session(self, symbol: str | None = None) -> pd.DataFrame | str | None:
         """
