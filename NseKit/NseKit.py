@@ -24,6 +24,7 @@ import warnings
 import zipfile
 from datetime import datetime, timedelta
 from io import BytesIO, StringIO
+from urllib.parse import quote
 
 import feedparser
 import numpy as np
@@ -1841,7 +1842,7 @@ class Nse:
         ``"Securities in F&O"``, ``"Others"``, or ``"All"``.
         """
         xref = {
-            "NIFTY 50": "NIFTY", "Nifty Bank": "BANKNIFTY",
+            "NIFTY 50": "NIFTY 50", "Nifty Bank": "NIFTY BANK",
             "Emerge": "SME", "Securities in F&O": "FO",
             "Others": "OTHERS", "All": "ALL",
         }
@@ -1849,9 +1850,10 @@ class Nse:
         ref_url = "https://www.nseindia.com/market-data/pre-open-market-cm-and-emerge-market"
 
         def _call():
+            cat = quote(xref.get(category, "ALL"))
             api = (
-                f"https://www.nseindia.com/api/market-data-pre-open"
-                f"?key={xref.get(category, 'ALL')}"
+                f"https://www.nseindia.com/api/NextApi/apiClient/cmPreOpenApi"
+                f"?functionName=getPreOpenData&category={cat}&symbol="
             )
             return self._warm_and_fetch(ref_url, api, timeout=10).json()
 
@@ -2821,16 +2823,17 @@ class Nse:
         data = self._pre_open(category)
         if not data:
             return None
-        ns = data.get("niftyPreopenStatus", {})
+        idx = data.get("index", {})
         return pd.DataFrame([{
-            "lastPrice": ns.get("lastPrice"),
-            "change":    ns.get("change"),
-            "pChange":   ns.get("pChange"),
+            "lastPrice": idx.get("ltp"),
+            "change":    idx.get("change"),
+            "pChange":   idx.get("perChange"),
             "advances":  data.get("advances",  0),
             "declines":  data.get("declines",  0),
             "unchanged": data.get("unchanged", 0),
             "timestamp": data.get("timestamp", ""),
         }])
+
 
     def pre_market_all_nse_adv_dec_info(self, category: str = "All") -> pd.DataFrame | None:
         """Return aggregate advances/declines for the pre-open session.
@@ -2857,6 +2860,7 @@ class Nse:
             "unchanged": data.get("unchanged", 0),
             "timestamp": data.get("timestamp", ""),
         }])
+
 
     def pre_market_info(self, category: str = "All") -> pd.DataFrame | None:
         """
@@ -2885,25 +2889,26 @@ class Nse:
             return None
 
         rows = [{
-            "symbol":           i["metadata"]["symbol"],
-            "previousClose":    i["metadata"]["previousClose"],
-            "iep":              i["metadata"]["iep"],
-            "change":           i["metadata"]["change"],
-            "pChange":          i["metadata"]["pChange"],
-            "lastPrice":        i["metadata"]["lastPrice"],
-            "finalQuantity":    i["metadata"]["finalQuantity"],
-            "totalTurnover":    i["metadata"]["totalTurnover"],
-            "marketCap":        i["metadata"]["marketCap"],
-            "yearHigh":         i["metadata"]["yearHigh"],
-            "yearLow":          i["metadata"]["yearLow"],
-            "totalBuyQuantity": i["detail"]["preOpenMarket"]["totalBuyQuantity"],
-            "totalSellQuantity":i["detail"]["preOpenMarket"]["totalSellQuantity"],
-            "atoBuyQty":        i["detail"]["preOpenMarket"]["atoBuyQty"],
-            "atoSellQty":       i["detail"]["preOpenMarket"]["atoSellQty"],
-            "lastUpdateTime":   i["detail"]["preOpenMarket"]["lastUpdateTime"],
+            "symbol":            i.get("symbol"),
+            "previousClose":     i.get("prevClose"),
+            "iep":               i.get("iepOrderBook"),
+            "change":            i.get("change"),
+            "pChange":           i.get("perChange"),
+            "lastPrice":         i.get("finalPrice"),
+            "finalQuantity":     i.get("finalQuantity"),
+            "totalTurnover":     i.get("finalValue"),
+            "marketCap":         i.get("ffmMarketCap"),
+            "yearHigh":          i.get("yearHigh"),
+            "yearLow":           i.get("yearLow"),
+            "totalBuyQuantity":  i.get("totalBuyQuantity"),
+            "totalSellQuantity": i.get("totalSellQuantity"),
+            "atoBuyQty":         i.get("atoBuyQuantity"),
+            "atoSellQty":        i.get("atoSellQuantity"),
+            "lastUpdateTime":    i.get("lastUpdateTime"),
         } for i in data.get("data", [])]
 
         return pd.DataFrame(rows).set_index("symbol", drop=False)
+
 
     def pre_market_derivatives_info(self, category: str = "Index Futures") -> pd.DataFrame | None:
         """
@@ -2929,7 +2934,8 @@ class Nse:
         def _call():
             resp = self._warm_and_fetch(
                 "https://www.nseindia.com/market-data/pre-open-market-fno",
-                f"https://www.nseindia.com/api/market-data-pre-open-fno?key={xref[category]}",
+                f"https://www.nseindia.com/api/NextApi/apiClient/cmPreOpenApi"
+                f"?functionName=getPreOpenDataFNO&category={xref[category]}&symbol=",
                 timeout=10
             )
             return resp.json().get("data", [])
@@ -2941,23 +2947,24 @@ class Nse:
             return None
 
         rows = [{
-            "symbol":              i["metadata"]["symbol"],
-            "expiryDate":          i["metadata"]["expiryDate"],
-            "previousClose":       i["metadata"]["previousClose"],
-            "iep":                 i["metadata"]["iep"],
-            "change":              i["metadata"]["change"],
-            "pChange":             i["metadata"]["pChange"],
-            "lastPrice":           i["metadata"]["lastPrice"],
-            "finalQuantity":       i["metadata"]["finalQuantity"],
-            "totalTurnover":       i["metadata"]["totalTurnover"],
-            "totalBuyQuantity":    i["detail"]["preOpenMarket"]["totalBuyQuantity"],
-            "totalSellQuantity":   i["detail"]["preOpenMarket"]["totalSellQuantity"],
-            "atoBuyQty":           i["detail"]["preOpenMarket"]["atoBuyQty"],
-            "atoSellQty":          i["detail"]["preOpenMarket"]["atoSellQty"],
-            "lastUpdateTime":      i["detail"]["preOpenMarket"]["lastUpdateTime"],
+            "symbol":            i.get("symbol"),
+            "expiryDate":        i.get("expiryDate"),
+            "previousClose":     i.get("prevClose"),
+            "iep":               i.get("iepOrderBook"),
+            "change":            i.get("change"),
+            "pChange":           i.get("perChange"),
+            "lastPrice":         i.get("finalPrice"),
+            "finalQuantity":     i.get("finalQuantity"),
+            "totalTurnover":     i.get("finalValue"),
+            "totalBuyQuantity":  i.get("totalBuyQuantity"),
+            "totalSellQuantity": i.get("totalSellQuantity"),
+            "atoBuyQty":         i.get("atoBuyQuantity"),
+            "atoSellQty":        i.get("atoSellQuantity"),
+            "lastUpdateTime":    i.get("lastUpdateTime"),
         } for i in items]
 
         return pd.DataFrame(rows).set_index("symbol", drop=False)
+
 
     def nse_closing_auction_session(self, symbol: str | None = None) -> pd.DataFrame | str | None:
         """
