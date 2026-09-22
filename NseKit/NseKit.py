@@ -4094,37 +4094,66 @@ class Nse:
     # VI. Capital Market (Equities)
     # ══════════════════════════════════════════════════════════════════════════════
 
-    def cm_live_most_active_equity_by_value(self) -> pd.DataFrame | None:
-        """Return today's most actively traded equities ranked by traded value.
+    # def cm_live_most_active_equity_by_value(self) -> pd.DataFrame | None:
+    #     """Return today's most actively traded equities ranked by traded value.
 
-        Returns
-        -------
-        pd.DataFrame or None
+    #     Returns
+    #     -------
+    #     pd.DataFrame or None
 
-        Examples
-        --------
-        >>> nse.cm_live_most_active_equity_by_value()
-        """
-        return self._cm_live_simple(
-            "https://www.nseindia.com/market-data/most-active-equities",
-            "https://www.nseindia.com/api/live-analysis-most-active-securities?index=value",
-        )
+    #     Examples
+    #     --------
+    #     >>> nse.cm_live_most_active_equity_by_value()
+    #     """
+    #     return self._cm_live_simple(
+    #         "https://www.nseindia.com/market-data/most-active-equities",
+    #         "https://www.nseindia.com/api/live-analysis-most-active-securities?index=value",
+    #     )
 
-    def cm_live_most_active_equity_by_vol(self) -> pd.DataFrame | None:
-        """Return today's most actively traded equities ranked by traded volume.
+    # def cm_live_most_active_equity_by_vol(self) -> pd.DataFrame | None:
+    #     """Return today's most actively traded equities ranked by traded volume.
 
-        Returns
-        -------
-        pd.DataFrame or None
+    #     Returns
+    #     -------
+    #     pd.DataFrame or None
 
-        Examples
-        --------
-        >>> nse.cm_live_most_active_equity_by_vol()
-        """
-        return self._cm_live_simple(
-            "https://www.nseindia.com/market-data/most-active-equities",
-            "https://www.nseindia.com/api/live-analysis-most-active-securities?index=volume",
-        )
+    #     Examples
+    #     --------
+    #     >>> nse.cm_live_most_active_equity_by_vol()
+    #     """
+    #     return self._cm_live_simple(
+    #         "https://www.nseindia.com/market-data/most-active-equities",
+    #         "https://www.nseindia.com/api/live-analysis-most-active-securities?index=volume",
+    #     )
+
+    def cm_live_most_active_equity(
+            self,
+            index: str = "value",
+        ) -> pd.DataFrame | None:
+            """Return today's most actively traded equities ranked by traded value or volume.
+
+            Parameters
+            ----------
+            index : str, default "value"
+                Ranking criterion — either ``"value"`` or ``"volume"``.
+
+            Returns
+            -------
+            pd.DataFrame or None
+
+            Examples
+            --------
+            >>> nse.cm_live_most_active_equity("value")
+            >>> nse.cm_live_most_active_equity("volume")
+            """
+            if index not in ("value", "volume"):
+                raise ValueError(f"index must be 'value' or 'volume', got {index!r}")
+
+            return self._cm_live_simple(
+                "https://www.nseindia.com/market-data/most-active-equities",
+                f"https://www.nseindia.com/api/live-analysis-most-active-securities?index={index}",
+            )
+
 
     def cm_live_volume_spurts(self) -> pd.DataFrame | None:
         """

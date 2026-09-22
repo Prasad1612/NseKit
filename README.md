@@ -21,6 +21,10 @@ pip install -U NseKit
 #=============================================================================================================================#
 #                                                            NseKit
 #=============================================================================================================================#
+'''
+pip install -U NseKit
+
+'''
 
 # import NseKit, Moneycontrol
 
@@ -264,11 +268,10 @@ rich = Console()
 # print(get.cm_live_price_band_hitters("upper", series="EQ", turnover_gte=1))               # Combined — upper + EQ + turnover ≥ ₹1 Cr
 # print(get.cm_live_price_band_hitters("lower", "SecGtr20", turnover_gte=0.5, turnover_lte=50)) # Full combo
 
-# # 🔹 Most Active Equities by Value
-# print(get.cm_live_most_active_equity_by_value())                                          # Most active equities by traded value
-
-# # 🔹 Most Active Equities by Volume
-# print(get.cm_live_most_active_equity_by_vol())                                            # Most active equities by traded volume
+# # 🔹 Most Active Equities
+# print(get.cm_live_most_active_equity())                                                   # Most active equities by traded value
+# print(get.cm_live_most_active_equity("value"))                                            # Most active equities by traded value
+# print(get.cm_live_most_active_equity("volume"))                                           # Most active equities by traded volume
 
 # # 🔹 Volume Spurts
 # print(get.cm_live_volume_spurts())                                                        # Volume Spurts

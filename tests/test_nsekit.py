@@ -398,7 +398,6 @@ class TestClosingAuctionSession:
         "lastUpdateTime", 
     }
 
-
     def test_all_symbols_shape(self, nse):
         """Outside the CAS window this returns None — only assert shape when live."""
         df = nse.nse_closing_auction_session()
@@ -463,10 +462,10 @@ class TestEquityLive:
         _has_dict(nse.cm_live_equity_info(self.SYM), keys={"Symbol", "MarketCap"})
 
     def test_most_active_by_value(self, nse):
-        _has_data(nse.cm_live_most_active_equity_by_value(), label="active_value")
+        _has_data(nse.cm_live_most_active_equity("value"), label="active_value")
 
     def test_most_active_by_vol(self, nse):
-        _has_data(nse.cm_live_most_active_equity_by_vol(), label="active_vol")
+        _has_data(nse.cm_live_most_active_equity("volume"), label="active_vol")
 
     def test_volume_spurts(self, nse):
         _has_data(nse.cm_live_volume_spurts(), label="vol_spurts")
