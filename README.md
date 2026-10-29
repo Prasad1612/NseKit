@@ -180,7 +180,7 @@ rich = Console()
 
 # # 🔹 Specific Index Constituents
 # print(get.index_live_indices_stocks_data("Nifty 50"))                                     # Nifty 50 Stocks DataFrame     (Raw)
-# print(get.index_live_indices_stocks_data("NIFTY 50", short=True))                         # Nifty 50 Stocks DataFrame     (Short)
+# print(get.index_live_indices_stocks_data("Securities in F&O", short=True))                # F&O Stocks DataFrame          (Short)
 # print(get.index_live_indices_stocks_data("NIFTY IT", list_only=True))                     # Only Nifty 50 Symbols         (Raw)
 # print(get.index_live_indices_stocks_data("NIFTY IT", short=True, list_only=True))         # Only Nifty 50 Symbols         (Short)
 

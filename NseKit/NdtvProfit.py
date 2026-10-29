@@ -1,4 +1,8 @@
 import requests
+try:
+    from curl_cffi import requests as cffi_requests   # pip install curl_cffi
+except ImportError:
+    cffi_requests = None
 import pandas as pd
 import time
 from typing import Union, Optional
@@ -112,31 +116,43 @@ class NdtvProfit:
         self.base_url = "https://www.ndtvprofit.com/api/v2"
         self.convert_to_cr = convert_to_cr
         self.filter_old_expiry = filter_old_expiry
-        self.session = requests.Session()
+        self._new_session()
+
+    def _new_session(self):
+        """Create a fresh session (Chrome TLS impersonation if curl_cffi is available)."""
+        if cffi_requests is not None:
+            self.session = cffi_requests.Session(impersonate="chrome")
+        else:
+            self.session = requests.Session()
         self._initialize_session()
 
     def _initialize_session(self):
-        """Initialize session with browser-like headers to avoid blocking."""
-        self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        """Initialize session with browser-like headers and warm up cookies."""
+        headers = {
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": "https://www.ndtvprofit.com/markets/option-chain",
-            "Origin": "https://www.ndtvprofit.com/markets",
-            "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-            "Sec-Ch-Ua-Mobile": "?0",
-            "Sec-Ch-Ua-Platform": '"Windows"',
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-            "X-Requested-With": "XMLHttpRequest"
-        })
+        }
+        if cffi_requests is None:
+            # Only needed for plain requests; curl_cffi sets a matching UA / sec-ch-* itself
+            headers["User-Agent"] = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        self.session.headers.update(headers)
         try:
             self.session.get("https://www.ndtvprofit.com/markets", timeout=10)
             time.sleep(0.5)
             self.session.get("https://www.ndtvprofit.com/markets/option-chain", timeout=10)
-        except:
+        except Exception:
             pass
+
+    def _get(self, url: str, params: dict = None, timeout: int = 10):
+        """GET with one automatic retry on 403 using a freshly warmed session."""
+        response = self.session.get(url, params=params, timeout=timeout)
+        if response.status_code == 403:
+            time.sleep(1)
+            self._new_session()
+            response = self.session.get(url, params=params, timeout=timeout)
+        return response
 
     def _get_params(self, type_str: str = None, instrument_str: str = None, order_str: str = None) -> dict:
         """Helper to convert string arguments to API parameter values."""
@@ -168,7 +184,7 @@ class NdtvProfit:
         Eliminates the repeated try/get/raise/json/_ok/_format_output/except/return pattern.
         """
         try:
-            response = self.session.get(url, params=params, timeout=10)
+            response = self._get(url, params=params, timeout=10)
             response.raise_for_status()
             json_data = response.json()
             if self._ok(json_data):
@@ -243,7 +259,7 @@ class NdtvProfit:
         """
         col_order = ["Symbol", "Spot Price", "Basis", "1M Future", "2M Future", "Roll Spread", "Rollover %", "OI", "OI Chg %", "PCR"]
         try:
-            response = self.session.get(f"{self.base_url}/stock-summary", params={"symbol": index_symbol}, timeout=10)
+            response = self._get(f"{self.base_url}/stock-summary", params={"symbol": index_symbol}, timeout=10)
             response.raise_for_status()
             json_data = response.json()
             if self._ok(json_data):
@@ -261,7 +277,7 @@ class NdtvProfit:
         mode: "All" → full dataset | "Nse" → only rows where nsecode is not blank
         """
         try:
-            response = self.session.get(f"{self.base_url}/stock-search", timeout=10)
+            response = self._get(f"{self.base_url}/stock-search", timeout=10)
             response.raise_for_status()
             df = pd.DataFrame(response.json())
 
@@ -487,7 +503,7 @@ class NdtvProfit:
         col_order = ["Sector", "Futures Count", "Price Up", "Price Down", "Price Unchg", "OI Up", "OI Down", "OI Unchg", "Vol Up", "Vol Down", "Vol Unchg"]
         exclude   = ["Price Chg", "Price Chg %", "OI Chg", "OI Chg %", "Vol Chg", "Vol Chg %","Type"]            
         try:
-            response = self.session.get(url, timeout=10)
+            response = self._get(url, timeout=10)
             response.raise_for_status()
             json_data = response.json()
             if json_data.get("status") and "data" in json_data:

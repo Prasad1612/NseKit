@@ -62,7 +62,7 @@ _USER_AGENTS: list[str] = [
 #
 # Usage (decorator-style, all at the module level):
 #
-#   from NseKit_antigravity import NseConfig
+#   from NseKit import NseConfig
 #
 #   NseConfig.max_rps        = 2.0    # ≤ 2 requests per second
 #   NseConfig.retries        = 4      # up to 5 total attempts per call
@@ -5852,7 +5852,8 @@ class Nse:
         Parameters
         ----------
         symbol : str
-            NSE equity or index ticker, e.g. ``"TCS"``.
+            NSE equity or index ticker, e.g. ``"TCS"``, ``"M&M"``, ``"GVT&D"``.
+            Special characters such as ``&`` are URL-encoded automatically.
 
         Returns
         -------
@@ -5862,11 +5863,13 @@ class Nse:
         Examples
         --------
         >>> nse.symbol_full_fno_live_data("TCS")
+        >>> nse.symbol_full_fno_live_data("M&M")
         """
+        encoded = quote(symbol, safe="")
         return self._get_json(
             "https://www.nseindia.com/option-chain",
             f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
-            f"?functionName=getSymbolDerivativesData&symbol={symbol}",
+            f"?functionName=getSymbolDerivativesData&symbol={encoded}",
         )
 
     def symbol_specific_most_active_Calls_or_Puts_or_Contracts_by_OI(
@@ -6361,10 +6364,11 @@ class Nse:
         >>> nse.fno_expiry_dates_raw()
         >>> nse.fno_expiry_dates_raw("TCS")
         """
+        encoded = quote(symbol, safe="")
         return self._get_json(
             "https://www.nseindia.com/option-chain",
             f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
-            f"?functionName=getOptionChainDropdown&symbol={symbol}",
+            f"?functionName=getOptionChainDropdown&symbol={encoded}",
         )
 
     def fno_expiry_dates(
@@ -6404,11 +6408,11 @@ class Nse:
         """
         from datetime import time as dtime
 
-
+        encoded = quote(symbol, safe="")
         try:
             resp = self._warm_and_fetch(
                 "https://www.nseindia.com/option-chain",
-                f"https://www.nseindia.com/api/option-chain-contract-info?symbol={symbol}",
+                f"https://www.nseindia.com/api/option-chain-contract-info?symbol={encoded}",
                 timeout=10
             )
             data = resp.json()
