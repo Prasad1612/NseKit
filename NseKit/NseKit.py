@@ -3582,7 +3582,119 @@ class Nse:
         df["datetime_utc"] = df["datetime_utc"].dt.strftime("%Y-%m-%d %H:%M:%S")
         return df
 
+    # def gift_nifty_chart(self, interval: str = "sec") -> pd.DataFrame | None:
+    #     """Return live intraday chart data from NSE IX (deep-intraday-graph).
 
+    #     Parameters
+    #     ----------
+    #     interval : {"sec", "min"}, default "sec"
+    #         "sec" returns raw ticks (duplicate timestamps collapsed to the last tick).
+    #         "min" resamples to one row per minute (last price in the minute).
+
+    #     Returns
+    #     -------
+    #     pd.DataFrame or None
+    #         Columns: datetime_utc, price, session.
+    #     """
+
+    #     try:
+    #         obj = self._get_json(
+    #             "https://www.nseix.com/",
+    #             "https://www.nseix.com/api/deep-intraday-graph",
+    #         )
+    #     except Exception as exc:
+    #         self._log_error("gift_nifty_chart", exc)
+    #         return None
+
+    #     if obj is None:
+    #         return None
+
+    #     rows = [
+    #         {
+    #             "datetime_utc": pd.to_datetime(ts, unit="ms", utc=True),
+    #             "price": price,
+    #             "session": series.get("name"),
+    #         }
+    #         for series in obj.get("data", [])
+    #         for ts, price in series.get("data", [])   # pre-open series may be empty
+    #     ]
+
+    #     df = pd.DataFrame(rows)
+    #     if df.empty:
+    #         return df
+
+    #     # The feed repeats the same timestamp many times; keep the last tick per timestamp.
+    #     df = (
+    #         df.sort_values("datetime_utc")
+    #         .drop_duplicates("datetime_utc", keep="last")
+    #     )
+
+    #     if interval == "min":
+    #         df = (
+    #             df.set_index("datetime_utc")
+    #             .resample("1min")
+    #             .agg({"price": "last", "session": "last"})
+    #             .dropna(subset=["price"])
+    #             .reset_index()
+    #         )
+
+    #     df["datetime_utc"] = df["datetime_utc"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    #     return df.reset_index(drop=True)
+
+
+    def gift_nifty_chart(self, interval: str = "sec") -> pd.DataFrame | None:
+        """Intraday chart data from NSE IX (deep-intraday-graph).
+
+        interval : {"sec", "min"}
+            "sec": raw ticks (duplicate timestamps collapsed to the last tick).
+            "min": one row per minute, value = last price at or before HH:MM:00,
+                which is what the NSE IX chart tooltip shows.
+
+        Note: timestamps are shown exactly as the chart shows them (no tz conversion).
+        """
+        try:
+            obj = self._get_json(
+                "https://www.nseix.com/",
+                "https://www.nseix.com/api/deep-intraday-graph",
+            )
+        except Exception as exc:
+            self._log_error("gift_nifty_chart", exc)
+            return None
+
+        if obj is None:
+            return None
+
+        rows = [
+            {
+                "datetime": pd.to_datetime(ts, unit="ms"),   # raw, same as chart axis
+                "price": price,
+                "session": series.get("name"),
+            }
+            for series in obj.get("data", [])
+            for ts, price in series.get("data", [])
+        ]
+
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return df
+
+        df = (
+            df.sort_values("datetime", kind="stable")
+            .drop_duplicates("datetime", keep="last")
+            .set_index("datetime")
+        )
+
+        if interval == "min":
+            df = (
+                df.resample("1min", closed="right", label="right")
+                .agg({"price": "last", "session": "last"})
+                .ffill()                      # keep continuous line if a minute has no tick
+                .dropna(subset=["price"])
+            )
+
+        df = df.reset_index()
+        df["datetime"] = df["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        return df
 
 # ══════════════════════════════════════════════════════════════════════════════
 # V. Capital Market (Equities)
@@ -4272,9 +4384,10 @@ class Nse:
         >>> nse.stock_chart("RELIANCE", "1D")
         >>> nse.stock_chart("INFY", "1W")
         """
+        encoded = quote(symbol, safe="")
         data = self._chart_fetch(
             f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
-            f"?functionName=getSymbolChartData&symbol={symbol}EQN&days={timeframe}"
+            f"?functionName=getSymbolChartData&symbol={encoded}EQN&days={timeframe}"
         )
         if not data or "grapthData" not in data:
             return None

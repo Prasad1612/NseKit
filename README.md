@@ -237,6 +237,8 @@ rich = Console()
 # print(get.india_vix_chart())                                                               # india_vix per-second data
 # print(get.india_vix_chart("min"))                                                          # india_vix per-minute data
 
+# print(get.gift_nifty_chart())                                                               # gift_nifty per-second data
+# print(get.gift_nifty_chart("min"))                                                          # gift_nifty per-minute data
 
 # #---------------------------------------------------------- Capital Market Live Data ----------------------------------------------------------
 
